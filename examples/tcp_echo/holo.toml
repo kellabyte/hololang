@@ -1,0 +1,9 @@
+# Package for the one-byte checked TCP echo example.
+[package]
+name = "tcp_echo"
+version = "0.1.0"
+source = "."
+entry = "main.holo"
+
+[dependencies]
+holo = { path = "../../lib/holo", version = "^0.1" }

@@ -1,0 +1,90 @@
+// Echo a checked TCP stream until its input half closes. One bounded region
+// supplies the receive and send backing. The worker retains an unsent suffix
+// through short writes and waits, then lets its lexical owner close on return.
+
+// The same initialized field serves as the receive destination and send source.
+struct EchoSlot {
+    // A fixed window bounds the amount of echo data held by the worker.
+    wire Bytes
+}
+
+// Initialize the window in the checked destination slot once per entry.
+func echo_slot
+    with noblock
+    returns EchoSlot
+{
+    return EchoSlot {
+        wire: core.bytes(16384, 0)
+    }
+}
+
+// Read the fresh receive extent without retaining or copying its bytes.
+func fresh_count
+    with noalloc, noblock
+    arg fresh Bytes as readonly reference
+    returns u64
+{
+    return core.len(fresh)
+}
+
+// Borrow each admitted stream for synchronous attempts. Return after draining
+// any outstanding output and observing EOF. Other native failures trap so a
+// failed connection cannot yield a successful benchmark sample.
+func main
+    returns u64
+{
+    with core.tcp_stream() as stream {
+        let memory = core.region(32768) else {
+            core.assert(false)
+            return 0
+        }
+        let slots = core.batch(memory, EchoSlot)
+        let added = core.append(slots, echo_slot())
+        core.assert(added == 0)
+        let slot = core.borrow_readwrite(slots, 0)
+        var pending = 0
+        var cursor = 0
+
+        // Drain each confirmed prefix before a refill can overwrite its backing.
+        loop {
+            if cursor == pending {
+                let readable = core.wait_input(stream)
+                // An interrupted wait leaves the prefix and owner unchanged.
+                if readable != 18446744073709551615 {
+                    core.assert(readable == 0)
+                    refill slot.wire, 16384 from stream as fresh {
+                        pending = fresh_count(fresh)
+                        cursor = 0
+                    } else status {
+                        // A zero receive after the suffix drains ends this owner.
+                        if status == 0 {
+                            return 0
+                        }
+                        // Readiness may race or be interrupted. Both retry from
+                        // the unchanged owner and wait state.
+                        if status != 18446744073709551615 {
+                            core.assert(status == 18446744073709551614)
+                        }
+                    }
+                }
+            } else {
+                let remaining = core.sub_wrapping(pending, cursor)
+                let sent = core.send(stream, slot.wire, cursor, remaining)
+                // Wait only when the kernel made no progress. A short positive
+                // count commits exactly that prefix, and interruption commits none.
+                if sent == 18446744073709551614 {
+                    let writable = core.wait_output(stream)
+                    if writable != 18446744073709551615 {
+                        core.assert(writable == 0)
+                    }
+                } else {
+                    if sent != 18446744073709551615 {
+                        core.assert(sent > 0)
+                        core.assert(sent <= remaining)
+                        cursor = core.add_wrapping(cursor, sent)
+                    }
+                }
+            }
+        }
+    }
+}

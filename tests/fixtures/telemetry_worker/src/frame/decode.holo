@@ -1,0 +1,26 @@
+// Field decoding and fixed identifiers for telemetry frames. The wire helper
+// consumes copied scalars, so decoding never retains a read-buffer reference.
+
+namespace telemetry.frame
+
+using telemetry.wire
+
+// Decode the payload length from the low and high wire octets. Returns the
+// declared unsigned extent, which the caller can check before accepting a frame.
+public func payload_length
+    with noalloc, noblock
+    arg low u64 as readonly copy
+    arg high u64 as readonly copy
+    returns u64
+{
+    return wire.little_endian_u16(low, high)
+}
+
+// Return the canonical one-octet frame signature. This constant is available
+// to the validation file in the same namespace and requires no backing.
+func magic_octet
+    with noalloc, noblock
+    returns u64
+{
+    return 0xA5
+}

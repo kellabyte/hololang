@@ -1,0 +1,6 @@
+# Local package for the bounded RESP2 preview. The host supplies the socket.
+[package]
+name = "redis_server"
+version = "0.1.0"
+source = "src"
+entry = "main.holo"

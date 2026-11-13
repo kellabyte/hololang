@@ -1,0 +1,40 @@
+// These small UI adapters return values observable by the CLI demo.
+// Real page rendering, redirects, and network effects stay outside the fixture.
+namespace app.ui
+
+// Display the admitted count.
+public func show_count
+    arg count u64 as readonly copy
+    returns u64
+{
+    return count
+}
+
+// Select the sign-in screen.
+public func sign_in
+    returns u64
+{
+    return 1
+}
+
+// Pass the database's suggested delay through to the retry screen.
+public func try_again
+    arg delay u64 as readonly copy
+    returns u64
+{
+    return delay
+}
+
+// Indicate that the query completed but the cache write failed.
+public func cache_unavailable
+    returns u64
+{
+    return 3
+}
+
+// Display a generic failure for the remaining declared cases.
+public func query_failed
+    returns u64
+{
+    return 4
+}

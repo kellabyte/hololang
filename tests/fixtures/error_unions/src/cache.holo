@@ -1,0 +1,19 @@
+// Stand-in for saving a count to a cache. This deterministic service returns
+// the copied count on success and needs no backing allocation.
+namespace app.cache
+
+// The cache cannot accept this write.
+public error CacheError {
+    Unavailable
+}
+
+// Count 43 simulates an unavailable cache. Other counts pass through unchanged.
+public func save_count
+    arg count u64 as readonly copy
+    returns Result<u64, CacheError>
+{
+    if count == 43 {
+        return error CacheError.Unavailable
+    }
+    return ok count
+}

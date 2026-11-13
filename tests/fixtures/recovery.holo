@@ -1,0 +1,42 @@
+// Recover from a failed backing acquisition and continue outside its owner block.
+// The handler has no failed owner to release. Normal batch cleanup still resets
+// one marker, then releases backing once; no per-record cleanup is introduced.
+
+// An inline task with no external resource or independently allocated fields.
+struct Task {
+    // Application identity used to validate successful construction.
+    id u64
+}
+
+// Copy one scalar into the final receiving slot; append owns capacity failure.
+// Construction acquires dynamic region storage and therefore omits noalloc.
+func task
+    with noblock
+    arg id u64 as readonly copy
+    returns Task
+{
+    return Task { id: id }
+}
+
+// Report zero on ordinary success or one after acquisition recovery.
+// Actual acquisition failure is injected only by separate native test wrappers.
+func main
+    returns u64
+{
+    var outcome = 0
+    {
+        // Failure skips this owner's remaining block, then rejoins below it.
+        let memory = core.region(256) else {
+            outcome = 1
+        }
+        let tasks = core.batch(memory, Task)
+        let status = core.append(tasks, task(42))
+        core.assert(status == 0)
+        let first = core.borrow_readonly(tasks, 0)
+        core.assert(first.id == 42)
+    }
+    // This continuation is reached after either acquisition outcome. The failed
+    // owner and its success-only batch/reference are unavailable in this scope.
+    core.print(outcome)
+    return 0
+}

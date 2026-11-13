@@ -1,0 +1,91 @@
+// Read initialized byte input through synchronous checked borrows and construct
+// owned nested results directly in region destinations. Finite backing failures
+// preserve published data; no external I/O or throughput claim is part of this example.
+
+// Payload bytes remain inline in their owning record.
+struct Payload {
+    // Frozen length and initialized data; borrowing does not transfer ownership.
+    data Bytes
+}
+
+// A record owns its scalar and nested variable-sized payload.
+struct Entry {
+    // Application identity, separate from representation metadata.
+    id u64
+    // Destination-constructed inline child, with no per-child heap allocation.
+    payload Payload
+}
+
+// Produce length bytes from id+index using copied scalars; append may fail to fit.
+func seed
+    with noblock
+    arg id u64 as readonly copy
+    arg length u64 as readonly copy
+    returns Entry
+{
+    return Entry {
+        id: id
+        payload: Payload {
+            data: core.bytes(length, core.add_wrapping(id, core.index()))
+        }
+    }
+}
+
+// Read input for this call and initialize a fresh owned Payload in its final slot.
+func copy_payload
+    with noblock
+    arg input Bytes as readonly reference
+    returns Payload
+{
+    return Payload {
+        data: core.bytes(core.len(input), input[core.index()])
+    }
+}
+
+// Copy the scalar id; forward the byte borrow without an intermediate record.
+func from_bytes
+    with noblock
+    arg id u64 as readonly copy
+    arg input Bytes as readonly reference
+    returns Entry
+{
+    return Entry {
+        id: id
+        payload: copy_payload(input)
+    }
+}
+
+// Bounded example: observe success, rollback, source preservation, and same-root append.
+func main
+    returns u64
+{
+    // Backing acquisition failure ends this demonstration before its expected output.
+    let source_memory = core.region(256) else { return 0 }
+    let sources = core.batch(source_memory, Entry)
+    let seeded = core.append(sources, seed(10, 64))
+    core.assert(seeded == 0)
+    let source = core.borrow_readonly(sources, 0)
+    {
+        let output_memory = core.region(128) else { return 0 }
+        let entries = core.batch(output_memory, Entry)
+        let first = core.append(entries, from_bytes(7, source.payload.data))
+        core.print(first)
+        // One copy fits every layout; two exceed this region's finite capacity.
+        let failed = core.append(entries, from_bytes(9, source.payload.data))
+        core.print(failed)
+        core.print(core.len(entries))
+        let output = core.borrow_readonly(entries, 0)
+        var sum = output.id
+        // Validate every owned output byte, independently of metadata widths.
+        for index in core.range(core.len(output.payload.data)) {
+            sum = core.add_wrapping(sum, output.payload.data[index])
+        }
+        core.print(sum)
+        core.print(source.payload.data[63])
+    }
+    // A published prefix can supply input while this same batch grows a new suffix.
+    let appended = core.append(sources, from_bytes(9, source.payload.data))
+    core.print(appended)
+    core.print(core.len(sources))
+    return 0
+}

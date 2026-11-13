@@ -1,0 +1,102 @@
+// Supply a finite checked TCP response to a paced reader. Each owner reserves
+// one region and keeps its initialized payload stable across short sends and
+// readiness waits. The wire receipt and the host counters identify the owner.
+
+// Receive the client's marker and send a separate deterministic body.
+struct ReplySlot {
+    // One initialized byte for the request and admission receipt.
+    marker Bytes
+    // Four MiB shared by successive send attempts within this owner.
+    body Bytes
+}
+
+// Construct both fields in the checked destination. Each body byte is the low
+// byte of its index, so an independent client can verify every received byte.
+func reply_slot
+    with noblock
+    returns ReplySlot
+{
+    return ReplySlot {
+        marker: core.bytes(1, 0),
+        body: core.bytes(4194304, core.index())
+    }
+}
+
+// Read the borrowed fresh extent without retaining the receive capability.
+func fresh_count
+    with noalloc, noblock
+    arg fresh Bytes as readonly reference
+    returns u64
+{
+    return core.len(fresh)
+}
+
+// Receive one tagged request, acknowledge admission and advance each accepted
+// output prefix once. Native failures trap. The client checks both the complete
+// response and each owner's exact positive-short and would-block counts.
+func main
+    returns u64
+{
+    with core.tcp_stream() as stream {
+        let memory = core.region(4198400) else {
+            // A failed reservation must invalidate the connection.
+            core.assert(false)
+            return 0
+        }
+        let slots = core.batch(memory, ReplySlot)
+        let appended = core.append(slots, reply_slot())
+        core.assert(appended == 0)
+        let slot = core.borrow_readwrite(slots, 0)
+
+        let readable = core.wait_input(stream)
+        core.assert(readable == 0)
+        refill slot.marker, 1 from stream as fresh {
+            core.assert(fresh_count(fresh) == 1)
+        } else status {
+            // Neither EOF nor a native failure supplies the required marker.
+            core.assert(false)
+        }
+        let marker = slot.marker[0]
+        core.assert(marker > 0)
+        let acknowledged = core.send(stream, slot.marker, 0, 1)
+        core.assert(acknowledged == 1)
+
+        var cursor = 0
+        var short_sends = 0
+        var blocked_sends = 0
+        // The cursor counts bytes accepted by the kernel. Keep the unsent
+        // suffix live until it is accepted, including across interrupted waits.
+        loop {
+            if cursor == 4194304 {
+                // Publish one complete line per owner so concurrent workers
+                // cannot interleave the marker and its two 16-bit counters.
+                core.assert(short_sends < 65536)
+                core.assert(blocked_sends < 65536)
+                let tag = core.mul_wrapping(marker, 4294967296)
+                let counts = core.add_wrapping(core.mul_wrapping(short_sends, 65536), blocked_sends)
+                core.print(core.add_wrapping(tag, counts))
+                return 0
+            }
+            let remaining = core.sub_wrapping(4194304, cursor)
+            let sent = core.send(stream, slot.body, cursor, remaining)
+            // Would-block has no accepted prefix. Interruptions also leave the
+            // cursor unchanged, while positive writes advance exactly once.
+            if sent == 18446744073709551614 {
+                blocked_sends = core.add_wrapping(blocked_sends, 1)
+                let writable = core.wait_output(stream)
+                if writable != 18446744073709551615 {
+                    core.assert(writable == 0)
+                }
+            } else {
+                if sent != 18446744073709551615 {
+                    core.assert(sent > 0)
+                    core.assert(sent <= remaining)
+                    if sent < remaining {
+                        short_sends = core.add_wrapping(short_sends, 1)
+                    }
+                    cursor = core.add_wrapping(cursor, sent)
+                }
+            }
+        }
+    }
+}

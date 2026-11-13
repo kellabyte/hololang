@@ -1,0 +1,87 @@
+// Bounded RESP2 key/value slot representation and binary key comparison.
+// The caller preallocates a fixed table of these slots. Their byte fields keep
+// physical extents for the lifetime of the table. Logical lengths and the
+// occupied bit describe the currently published value without allocating.
+
+namespace redis_server.store
+
+// One stable slot in the request handler's bounded table.
+public struct Slot {
+    // Zero denotes a free slot. A present empty value still has occupied set.
+    occupied u64
+    // Number of live bytes in the key field.
+    key_length u64
+    // Number of live bytes in the value field.
+    value_length u64
+    // Inline capacity for a binary key. Only the logical prefix is exposed.
+    key Bytes
+    // Inline capacity for a binary value. Updates replace the logical prefix.
+    value Bytes
+}
+
+// Construct a free, fully initialized slot in the caller's final table.
+// The caller handles bounded destination reservation failure at append.
+public func empty_slot
+    with noblock
+    arg key_capacity u64 as readonly copy
+    arg value_capacity u64 as readonly copy
+    returns Slot
+{
+    return Slot {
+        occupied: 0,
+        key_length: 0,
+        value_length: 0,
+        key: core.bytes(key_capacity, 0),
+        value: core.bytes(value_capacity, 0)
+    }
+}
+
+// Return 1 if the half-open range is contained in the available extent.
+// The check observes only the input descriptor, and avoids adding potentially
+// overflowing operands. An empty range at the end is valid.
+public func range_fits
+    with noalloc, noblock
+    arg input Bytes as readonly reference
+    arg offset u64 as readonly copy
+    arg length u64 as readonly copy
+    returns u64
+{
+    let extent = core.len(input)
+    // Subtract only when the offset is already inside or at the end.
+    if offset > extent {
+        return 0
+    }
+    // A valid offset can still leave too few bytes for the range.
+    if length > core.sub_wrapping(extent, offset) {
+        return 0
+    }
+    return 1
+}
+
+// Compare a stored key prefix with a checked range in the request.
+// Return 1 for exact binary equality or 0 for mismatch or an invalid extent.
+// Neither borrow escapes. At most length pairs of bytes are compared.
+public func key_matches
+    with noalloc, noblock
+    arg stored_key Bytes as readonly reference
+    arg input Bytes as readonly reference
+    arg offset u64 as readonly copy
+    arg length u64 as readonly copy
+    returns u64
+{
+    // The caller has matched the logical lengths. Physical lengths independently
+    // protect both indexed inputs even for an invalid caller.
+    if length > core.len(stored_key) {
+        return 0
+    }
+    if range_fits(input, offset, length) == 0 {
+        return 0
+    }
+    // Each iteration stays inside both proven ranges and compares raw bytes.
+    for index in core.range(length) {
+        if stored_key[index] != input[core.add_wrapping(offset, index)] {
+            return 0
+        }
+    }
+    return 1
+}

@@ -1,0 +1,145 @@
+// Serve one tagged fast or slow reply on a checked stream. The worker reserves
+// a body sized to the request and keeps the unsent suffix live through readiness
+// waits. Slow workers publish their first would-block and final status counts.
+
+// Keep the admission byte independent from the sized body reservation.
+struct HeaderSlot {
+    // Initialized receive destination and acknowledgement source.
+    marker Bytes
+}
+
+// Hold one response body until the kernel accepts its complete extent.
+struct BodySlot {
+    // Stable checked send backing for all attempts.
+    wire Bytes
+}
+
+// Initialize the marker in its checked destination without external work.
+func header_slot
+    with noblock
+    returns HeaderSlot
+{
+    return HeaderSlot {
+        marker: core.bytes(1, 0)
+    }
+}
+
+// Initialize the requested body in its destination. XOR tags identify fast
+// bodies, and mask zero gives the repeating low index byte for slow bodies.
+func body_slot
+    with noblock
+    arg length u64 as readonly copy
+    arg mask u64 as readonly copy
+    returns BodySlot
+{
+    return BodySlot {
+        wire: core.bytes(length, core.xor(core.index(), mask))
+    }
+}
+
+// Inspect the fresh receive extent without retaining or copying the view.
+func fresh_count
+    with noalloc, noblock
+    arg fresh Bytes as readonly reference
+    returns u64
+{
+    return core.len(fresh)
+}
+
+// Accept one byte, acknowledge worker admission, and send one exact response.
+// Unexpected readiness, I/O, or allocation failures invalidate the host sample.
+func main
+    returns u64
+{
+    with core.tcp_stream() as stream {
+        let header_memory = core.region(4096) else {
+            // An exhausted owner cannot acknowledge the request.
+            core.assert(false)
+            return 0
+        }
+        let headers = core.batch(header_memory, HeaderSlot)
+        let header_added = core.append(headers, header_slot())
+        core.assert(header_added == 0)
+        let header = core.borrow_readwrite(headers, 0)
+        let readable = core.wait_input(stream)
+        core.assert(readable == 0)
+        refill header.marker, 1 from stream as fresh {
+            core.assert(fresh_count(fresh) == 1)
+        } else status {
+            // Neither EOF nor an I/O error provides a valid marker.
+            core.assert(false)
+        }
+        let marker = header.marker[0]
+        var slow = 0
+        var length = 1024
+        var capacity = 4096
+        var mask = marker
+        // Distinct marker ranges identify the two measured request classes.
+        if marker < 128 {
+            core.assert(marker > 0)
+            core.assert(marker <= 64)
+            slow = 1
+            length = 4194304
+            capacity = 4198400
+            mask = 0
+        } else {
+            core.assert(marker >= 129)
+            core.assert(marker <= 192)
+        }
+        let acknowledged = core.send(stream, header.marker, 0, 1)
+        core.assert(acknowledged == 1)
+
+        let body_memory = core.region(capacity) else {
+            // Never emit a partial response after exhaustion.
+            core.assert(false)
+            return 0
+        }
+        let bodies = core.batch(body_memory, BodySlot)
+        let body_added = core.append(bodies, body_slot(length, mask))
+        core.assert(body_added == 0)
+        let body = core.borrow_readonly(bodies, 0)
+        var cursor = 0
+        var short_sends = 0
+        var blocked_sends = 0
+        // Advance the cursor only by the prefix accepted by the kernel.
+        loop {
+            if cursor == length {
+                // One decimal line tags both counters without interleaving
+                // fields across concurrent workers. Fast owners stay silent.
+                if slow == 1 {
+                    core.assert(short_sends < 65536)
+                    core.assert(blocked_sends < 65536)
+                    let tag = core.mul_wrapping(marker, 4294967296)
+                    let counts = core.add_wrapping(core.mul_wrapping(short_sends, 65536), blocked_sends)
+                    core.print(core.add_wrapping(tag, counts))
+                }
+                return 0
+            }
+            let remaining = core.sub_wrapping(length, cursor)
+            let sent = core.send(stream, body.wire, cursor, remaining)
+            // On would-block, the first slow event publishes before waiting.
+            // An interruption leaves the same live backing and cursor.
+            if sent == 18446744073709551614 {
+                if slow == 1 {
+                    if blocked_sends == 0 {
+                        core.print(marker)
+                    }
+                }
+                blocked_sends = core.add_wrapping(blocked_sends, 1)
+                let writable = core.wait_output(stream)
+                if writable != 18446744073709551615 {
+                    core.assert(writable == 0)
+                }
+            } else {
+                if sent != 18446744073709551615 {
+                    core.assert(sent > 0)
+                    core.assert(sent <= remaining)
+                    if sent < remaining {
+                        short_sends = core.add_wrapping(short_sends, 1)
+                    }
+                    cursor = core.add_wrapping(cursor, sent)
+                }
+            }
+        }
+    }
+}

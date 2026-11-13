@@ -1,0 +1,18 @@
+# Coordinate the compiler library and CLI without a redundant crates/ directory.
+# Shared integration targets are explicitly registered by cli/Cargo.toml; compiler
+# API examples remain conventional examples of the compiler package.
+[workspace]
+members = ["compiler", "cli"]
+default-members = ["compiler", "cli"]
+# Generated and preserved source snapshots remain standalone packages.
+exclude = ["build", "evidence"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+
+[profile.release]
+lto = "thin"
+

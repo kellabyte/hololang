@@ -1,0 +1,22 @@
+// Header checks for telemetry frames. These helpers use scalar values only
+// and leave admission decisions and rejected-body draining to the caller.
+
+namespace telemetry.frame
+
+// Return the signature required for admission. The private wire constant is
+// declared in the decoding file within this namespace.
+public func expected_magic
+    with noalloc, noblock
+    returns u64
+{
+    return magic_octet()
+}
+
+// Return the maximum accepted payload length in bytes. The decoder can still
+// drain any larger declared length in bounded chunks.
+public func payload_limit
+    with noalloc, noblock
+    returns u64
+{
+    return 4096
+}

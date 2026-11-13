@@ -1,0 +1,62 @@
+// Echo one byte over a checked TCP stream, then release it. The host owns
+// admission, the Holo scope owns close, and the byte stays in one initialized slot.
+
+using holo.net
+using holo.net.tcp
+
+// One initialized byte is enough for the protocol.
+struct Slot {
+    // Reused for the exact received byte and the one-byte reply.
+    wire Bytes
+}
+
+// Initialize the byte directly in its destination.
+func slot
+    with noblock
+    returns Slot
+{
+    return Slot {
+        wire: core.bytes(1, 0)
+    }
+}
+
+// Wait for a byte, echo it, and report the terminal close result on stdout.
+func main
+    returns u64
+{
+    with core.tcp_stream() as stream {
+        // End the backing's scope before the direct consuming close.
+        {
+            let memory = core.region(128) else {
+                return 0
+            }
+            let slots = core.batch(memory, Slot)
+            let added = core.append(slots, slot())
+            core.assert(added == 0)
+            let buffer = core.borrow_readwrite(slots, 0)
+
+            let readiness = core.wait_input(stream)
+            if readiness == 0 {
+                refill buffer.wire, 1 from stream as received {
+                    // A positive result is exactly one byte for this request.
+                    let sent = core.send(stream, buffer.wire, 0, 1)
+                    let accepted = net.send_result(sent)
+                        on ok(count) then count
+                        on error then 0
+                    core.print(accepted)
+                } else status {
+                    // EOF and transient outcomes supply no byte to echo.
+                    core.print(0)
+                }
+            }
+        }
+
+        let closed = core.close(stream)
+        let report = tcp.close_result(closed)
+            on ok then 0
+            on tcp.CloseError.Native(code) then code
+            on error then 1
+        core.print(report)
+        return 0
+    }
+}

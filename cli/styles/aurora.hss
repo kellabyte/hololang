@@ -1,0 +1,20 @@
+/* Holo terminal palette. Styles compile once before rendering source ranges.
+   This is a finite CSS-like subset, not a browser stylesheet or language rule. */
+.plain       { color: default; }
+.identifier  { color: #dce6f0; }
+.keyword     { color: #c4a1ff; font-weight: bold; }
+.type        { color: #60dec9; }
+.function    { color: #8cc8ff; }
+.parameter   { color: #e5c890; }
+.property    { color: #a7d8ee; }
+.number      { color: #ffbd87; }
+.text        { color: #b9df99; }
+.comment     { color: #78909e; font-style: italic; }
+.operator    { color: #b6c4d4; }
+.punctuation { color: #8b9bb0; }
+.invalid     { color: #ff7c91; text-decoration: underline; }
+.builtin     { color: #77dce8; }
+.contract    { color: #c4df8b; }
+.header      { color: #e4eef8; font-weight: bold; }
+.gutter      { color: #78909e; dim: true; }
+.border      { color: #50677d; }

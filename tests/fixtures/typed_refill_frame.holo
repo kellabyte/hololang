@@ -1,0 +1,140 @@
+// Decode a frame directly from the initialized prefix of a hosted refill.
+// The slot is reused across attempts. Published frames own their payloads,
+// and a short read rolls back the private destination while keeping its error.
+
+// A domain error reports the required wire extent or invalid header magic.
+error FrameError {
+    Truncated(required u64)
+    BadMagic
+}
+
+// The host writes into this initialized inline slot without acquiring new backing.
+struct Slot {
+    wire Bytes
+}
+
+// The decoded sequence and owned payload occupy the final frame slot.
+struct Frame {
+    sequence u64
+    payload Bytes
+}
+
+// The outer channel is constructed before the nested frame can reject.
+struct Received {
+    channel u64
+    frame Frame
+}
+
+// Prepare the fixed six-byte slot once. Only the native count can lend its prefix.
+func wire_slot
+    with noblock
+    returns Slot
+{
+    return Slot {
+        wire: core.bytes(6, 0xEE)
+    }
+}
+
+// Read only the checked input extent. Copy the valid payload into its final slot.
+func decode_frame
+    with noblock
+    arg input Bytes as readonly reference
+    returns Result<Frame, FrameError>
+{
+    // Establish the header extent before any byte read.
+    if core.len(input) < 3 {
+        return error FrameError.Truncated(3)
+    }
+    // A complete malformed header is rejected before considering the payload.
+    if input[0] != 0x48 {
+        return error FrameError.BadMagic
+    }
+    // Adding the header size to an octet fits in u64. A stale tail cannot satisfy this guard.
+    if core.len(input) < core.add_wrapping(3, input[2]) {
+        return error FrameError.Truncated(core.add_wrapping(3, input[2]))
+    }
+    return ok Frame:
+        sequence = input[1]
+        payload  = core.bytes(input[2], input[core.add_wrapping(3, core.index())])
+}
+
+// Forward the same readonly input to the nested producer. The owning append
+// restores the shared destination marker if decoding the frame fails.
+func receive
+    with noblock
+    arg channel u64 as readonly copy
+    arg input Bytes as readonly reference
+    returns Result<Received, FrameError>
+{
+    return ok Received:
+        channel = channel
+        frame   = try decode_frame(input)
+}
+
+// Demonstrate a complete six-byte frame, a four-byte final attempt, then EOF.
+// The demonstration uses one refill per attempt. Published records outlive the
+// borrowed prefix, and the host closes the admitted input when entry finishes.
+func main
+    returns u64
+{
+    // Acquisition failure cannot execute the refill or the append.
+    let slot_memory = core.region(64) else { core.assert(false); return 0 }
+    let slots = core.batch(slot_memory, Slot)
+    let initialized = core.append(slots, wire_slot())
+    core.assert(initialized == 0)
+    let slot = core.borrow_readwrite(slots, 0)
+
+    let frame_memory = core.region(256) else { core.assert(false); return 0 }
+    let frames = core.batch(frame_memory, Received)
+    // Positive input passes directly to the typed append. Nondata has no view.
+    refill slot.wire, 6 as input {
+        let accepted = core.append(frames, receive(1, input))
+            on ok    then true
+            on error then false
+        core.assert(accepted)
+    } else status {
+        core.assert(core.len(frames) == 0)
+        core.print(status)
+        return 0
+    }
+
+    let first = core.borrow_readonly(frames, 0)
+    let address = core.address(first)
+    let saved = core.used(frame_memory)
+    core.assert(first.channel == 1)
+    core.assert(first.frame.sequence == 7)
+    core.assert(core.len(first.frame.payload) == 3)
+    core.print(first.frame.sequence)
+
+    // The next attempt reuses the slot and leaves the old tail initialized.
+    // Only four fresh bytes are visible to the nested producer.
+    refill slot.wire, 6 as input {
+        let needed = core.append(frames, receive(1, input))
+            on ok                          then 0
+            on Rejected Truncated(required) then required
+            on error                       then 1
+        core.assert(needed == 6)
+        core.print(needed)
+    } else status {
+        core.print(status)
+        return 0
+    }
+    core.assert(core.len(frames) == 1)
+    core.assert(core.used(frame_memory) == saved)
+    core.assert(core.address(first) == address)
+    core.assert(first.frame.sequence == 7)
+    // The second read overwrote the first payload position in the wire slot.
+    core.assert(first.frame.payload[0] == 0xAA)
+    core.assert(first.frame.payload[1] == 0xBB)
+    core.assert(first.frame.payload[2] == 0xCC)
+
+    // The last attempt reaches the original native End branch without decoding.
+    refill slot.wire, 6 as input {
+        core.assert(false)
+    } else status {
+        core.assert(status == 0)
+        core.print(status)
+    }
+    core.print(first.frame.payload[2])
+    return 0
+}
