@@ -345,8 +345,7 @@ func add
 }
 ```
 
-The arithmetic overflow rule for `+` remains open; this example selects the
-header spelling, not an overflow policy.
+For `u64`, `+` traps if the sum exceeds the type's range.
 
 Function calls use familiar argument lists in the current examples:
 
@@ -637,7 +636,7 @@ policies can become usable. Most choices below remain open.
 |---|---|
 | Numeric types | Fixed-width integers and floats; define literals, conversion, overflow, shifts, division, and SIMD correspondence. |
 | Floating point | Define NaNs, signed zero, rounding, fusion, exception behavior, reproducibility, and explicit relaxation permissions. |
-| Structs | Named fields, initialization, alignment, representation, and evolution boundaries. The [public-type proposal](packages.md#public-types-across-packages) includes an executable experimental slice for fixed `u64` records and destination constructors across local packages. |
+| Structs | Named fields, initialization, alignment, representation, and evolution boundaries. The [public-type proposal](packages.md#public-types-across-packages) includes an executable experimental slice for fixed records and destination constructors across local packages. |
 | Sum and optional types | Tagged alternatives and absence without magic sentinel rules; final vocabulary and layout rules open. |
 | References and slices | Bounds, provenance, lifetimes, access rights, and escape rules. |
 | Text and bytes | Encoding, indexing, ownership, allocation, borrowed views, and raw byte interfaces. |
@@ -648,16 +647,64 @@ policies can become usable. Most choices below remain open.
 | Modules | Local packages have checked namespaces, file-scoped `using` directives, `public func` interfaces, and locked source dependencies. The [package design](packages.md) tracks the remaining namespace, visibility, type, and distribution decisions. |
 | Compile-time code | Evaluation phases, resource limits, hygiene, determinism, and diagnostics. |
 
+In the experimental compiler, `break` leaves the innermost `loop`, `for` over
+a range, or `for` over a batch. `continue` starts that loop's next iteration,
+advancing the index or batch cursor for a finite traversal. Both run the
+cleanup for scopes they leave, from the innermost scope outward. Owners in
+scopes outside the loop remain live. A `break` from a bare `loop` can reach
+the code after it, so an entry using one must account for that path.
+
+### Payload-free enums
+
+An `enum` declares a nominal type whose cases carry no payload. Qualify each
+case with its type name. The experimental compiler supports enum locals and
+record fields, including assignment and `==` or `!=` between values of the
+same enum type.
+
+```holo
+enum Command { Unset Get Set }
+
+func main returns u64 {
+    var command = Command.Unset
+    command = Command.Get
+    if command == Command.Get {
+        core.print("read")
+    }
+    return 0
+}
+```
+
+Enum fields occupy one byte in the supported layouts. A declaration lists
+one to 256 distinct cases. Each field must be initialized with a value of
+its own enum type. Integer expressions cannot supply or read enum values.
+
+In a manifest package, `public enum` exposes the type to other namespaces.
+An importing file uses its namespace qualifier, as in `protocol.Command.Get`.
+The current calling conventions support enums through record fields.
+
+### Checked unsigned arithmetic
+
+The `u64` operators `+`, `-`, and `*` trap if the mathematical result is
+outside `0` through `18446744073709551615`. `/` returns the unsigned integer
+quotient and `%` returns the remainder. Both trap on a zero divisor. These
+rules apply in every optimization mode. Each operand runs once, left to
+right. `*`, `/`, and `%` bind more tightly than `+` and `-`, and arithmetic
+binds more tightly than comparisons. Operators at the same precedence group
+from the left. Use `core.add_wrapping`, `core.sub_wrapping`, or
+`core.mul_wrapping` for arithmetic modulo 2⁶⁴.
+
+### Typed results
+
 **Working error direction:** an ordinary typed `Result` can hold a success value
 or an error tag without requiring a heap allocation. The full language must
 specify payloads, representation, propagation, and cleanup. An error with owned
 text or a backtrace has additional costs that the contracts must describe.
 The [error-handling proposal](error-handling.md) specifies `return ok value`,
 `return error Family.Case`, visible propagation with `try`, and exhaustive
-`on … then` clauses. The experimental compiler implements copied `u64`
-successes, [closed nominal error families](packages.md#typed-error-families)
-with optional `u64` payloads, exact forwarding, scalar `let` propagation with
-`try`, and `on` expression or statement arms for ordinary calls. A family may
+`on … then` clauses. The experimental compiler supports ordinary results
+with a copied `u64` or Unit success and [closed nominal error families](packages.md#typed-error-families)
+with optional `u64` payloads. Results support exact forwarding, `try`, and
+`on` expression or statement arms. A family may
 include another through `from ChildFamily as Alias`. `try` propagates the same
 family or a direct child, and `on Alias.Case` selects an included leaf. The
 destination slice implements `return ok Record:` and the same propagation rule
@@ -879,9 +926,9 @@ rejected under this narrow proposal, rather than silently adding an undo log.
 ##### Fresh aggregate locals
 
 **Implemented experimental M1 slice.** A scoped local constructs into one
-explicitly selected bounded region in entry code. A typed destination
-constructor supplies the record schema. The experimental `core.construct`
-statement handles the outcome in lexical blocks.
+explicitly selected bounded region in entry code. A destination constructor
+supplies the record schema. The experimental `core.construct` statement
+handles the outcome in lexical blocks.
 
 ```holo
 let memory = core.region(512) else { return 0 }
@@ -906,20 +953,24 @@ core.construct(memory, decode_frame(input))
   finite backing supplies the bytes. There is no second record or backing
   acquisition per attempt.
 - **Lifetime.** Success introduces `frame` as a readonly reference whose root
-  is the scoped local. Projections and aliases share that lexical lifetime.
-  The success name cannot be reassigned. A bare `on ok` or `on ok(_)`
+  is the scoped local. Write `on ok(readwrite frame)` to allow updating the
+  record's fields and bytes or lending it to a writable parameter. Projections
+  and aliases share the same lexical lifetime. The success name cannot be
+  reassigned. A bare `on ok` or `on ok(_)`
   discards the name and holds the tail through the end of the arm.
   A copied scalar may leave the arm. A reference, a captured byte view, or the
   aggregate itself may not escape. Readonly limits this access path. It grants
   no optimizer alias promise.
-- **Failure and release.** A producer's named rejection, `Full`, and
-  `SizeOverflow` remain distinct outcomes. Failure restores the checkpoint
+- **Failure and release.** A typed producer's named rejection, `Full`, and
+  `SizeOverflow` remain distinct outcomes. A producer that returns a plain
+  record requires an unbound `on error` fallback. Failure restores the checkpoint
   and releases the attempted tail before the selected handler runs. Only the
   success arm can see the record. Cursor-based producers leave the marker
   unchanged on failure. A failure arm can explicitly retry in the
   same region. Success-arm exit restores the checkpoint exactly once, including
-  early exit. It takes no walk through fields or payloads. Ordinary caller
-  effects, including evaluation of actual arguments, are outside rollback.
+  early return or a transfer to an enclosing loop. It takes no walk through
+  fields or payloads. Ordinary caller effects, including evaluation of actual
+  arguments, are outside rollback.
 - **Costs and propagation.** A fresh bump reservation counts toward `noalloc`
   even with pre-acquired backing. Ordinary storage checks and their existing
   failure order stay in the producer. A catch-all `on error` can cover remaining
@@ -1039,13 +1090,14 @@ func main returns u64 {
   visible. Either body may fall through to the statement after `else` or
   return through normal entry cleanup. Their local bindings do not reach
   that continuation.
-- **Construction.** The one-operand form takes a statically resolved typed
+- **Construction.** The one-operand form takes a statically resolved
   destination constructor. It keeps the existing exhaustive block
   handlers, destination-before-arguments order, and lexical success
   reference. `Full` means a reservation exceeded the live backing's
   capacity. `SizeOverflow` means size arithmetic or layout width failed.
   Named rejections keep their family and payload. A final `on error`
-  handles remaining construction outcomes. Acquisition failure reaches
+  handles remaining construction outcomes and is required for plain record
+  producers. Acquisition failure reaches
   the enclosing `else` alone. The selected layout retains its existing
   reservation order. A retained header can hit `Full` before a later
   rejection guard. [Failure order](#borrow-sequencing-and-failure-rules)
@@ -1172,7 +1224,8 @@ Future changes that weaken the selected guarantees still require review.
 parsing, lowering, checking, and native execution for this experimental subset.
 The preferred vertical headers and brace bodies are preserved.
 The temporary `core.*` calls let us exercise approved M1 storage rules while
-permanent collection/error APIs, numeric defaults, and broader functions remain open.
+permanent collection and error APIs, numeric types beyond `u64`, and broader
+function support remain open.
 See the [maintained source example](../tests/fixtures/region.holo) and
 [frontend components](../compiler/src/frontend/README.md).
 
@@ -1218,14 +1271,14 @@ func main
 Experimental grammar/semantics and implementation boundaries:
 
 - Struct fields use `name Type`; literals use `name: value` in declaration order.
-  Types are `u64`, `Bytes`, and acyclic record names. Decimal/hex literals are
+  Types are `u64`, `bool`, `Bytes`, and acyclic record names. Decimal/hex literals are
   checked u64 values. Newlines/semicolons separate complete statements; lists may
   continue across lines. Indentation is formatting. Comments use `//` or nested
   `/* ... */`; identifiers are ASCII in this initial adapter.
 - Copied scalar arguments require `u64 as readonly copy`. Record constructors
   also admit `Bytes as readonly reference` from complete live published byte fields
   or forwarded byte parameters. The [ordinary borrowed subset](#synchronous-borrowed-buffer-functions)
-  supports scalar or typed scalar results, bounded readonly or writable byte
+  supports scalar or typed results, bounded readonly or writable byte
   views, and writable fixed scalar record state.
   Pure scalar templates have
   one pure return, with statically resolved nonrecursive calls; they are boundedly
@@ -1268,9 +1321,9 @@ Experimental grammar/semantics and implementation boundaries:
   suffix appends do not extend that pass. `core.len` observes batch count or byte
   length. Scalar/byte fields support reads and authorized fixed-shape writes.
   Byte stores check the destination index before evaluating the replacement.
-- Infix comparisons have unsigned semantics. Infix scalar arithmetic is rejected
-  while defaults remain open; explicit `core.add_wrapping`, `sub_wrapping`,
-  `mul_wrapping`, `and`, and `xor` name implemented policies. `core.assert` traps
+- Numeric comparisons have unsigned semantics. Infix `u64` arithmetic traps
+  on overflow, underflow, and a zero divisor. The explicit wrapping and bitwise
+  operations remain available. `core.assert` traps
   on false. In the entry body, `core.print` prints a decimal scalar or a
   double-quoted UTF-8 literal, followed by a newline. A literal occupies one
   source line and accepts `\"`, `\\`, `\n`, `\r`, and `\t` escapes.
@@ -1496,7 +1549,8 @@ The experimental subset has these rules and scope boundaries.
 1. Admit fixed scalar-only record state by `readwrite reference` and initialized
    byte views by `readonly reference` or `readwrite reference`. The state is
    already owned by the caller. Calls update that storage directly. Ordinary
-   helpers can return `u64`, `bool`, `Option<u64>`, or `Result<u64, E>`.
+   helpers can return `u64`, `bool`, `Option<u64>`, `Result<u64, E>`, or
+   `Result<Unit, E>`.
    Plain copied scalars keep their current
    capture rules. General aggregate locals and aggregate returns from this new
    mutable-call category, reference-containing state, recursive calls, callbacks,
@@ -1638,6 +1692,24 @@ saved result. The saved form uses the captured case and payload after any
 intervening work.
 [Result example](error-handling.md#compose-a-result-from-several-services)
 
+#### Results without a success value
+
+Use `Result<Unit, E>` for an ordinary helper that can fail and whose
+successful operation has no value to return. Write `return ok` for success
+and `return error E.Case` for a named failure. A success handler uses bare
+`on ok`, and error arms follow the same coverage and payload rules as a
+scalar result. The caller can save the result with `let` and handle it
+later. A helper with the exact same result type can forward a call or
+saved result with `return`.
+
+In an ordinary `Result` function, `try call(...)` or `try saved` as a
+statement continues on Unit success and returns a failure in the caller's
+error family. The callee's family must be the caller's family or one of its
+declared direct children.
+
+`Unit` is a built-in type name. Struct and error family declarations cannot
+reuse it.
+
 #### Optional scalar returns
 
 An ordinary helper can declare `returns Option<u64>` when a value may be
@@ -1665,8 +1737,14 @@ match_index
 An ordinary function can declare `returns bool`. It can return `true`,
 `false`, a comparison of `u64` values, a boolean local, or another boolean
 call. A caller can test a boolean call directly in `if` or `core.assert`, or
-save its value with immutable `let`. The initializer runs once. Conditions
-require booleans, and numeric expressions require `u64`.
+save its value with `let` or `var`. The initializer runs once. A boolean
+`var` can be reassigned with a boolean expression, as in `has_cr = false`.
+Conditions require booleans, and numeric expressions require `u64`. Assignment
+preserves the binding's type.
+
+An ordinary `Result` or `Option` handler with literal boolean arms can also
+initialize a `let` or `var` boolean local. Its selected arm supplies the
+initial value.
 
 An ordinary function can take a boolean with `arg enabled bool as readonly copy`.
 The caller evaluates the argument in written order with the other arguments.
@@ -1691,8 +1769,8 @@ func starts_with_cr
 ```
 
 Use `if starts_with_cr(input) { ... }` to branch immediately, or bind
-`let has_cr = starts_with_cr(input)` and test `has_cr` later. An empty view
-returns false without reading a byte.
+`var has_cr = starts_with_cr(input)` to track the decision across later
+assignments. An empty view returns false without reading a byte.
 
 ```holo
 func should_skip_cr
@@ -1703,6 +1781,21 @@ func should_skip_cr
     return skip_cr and starts_with_cr(input)
 }
 ```
+
+#### Boolean record fields
+
+A record field declared `occupied bool` holds `true` or `false`. A
+constructor initializes the field in declaration order with a boolean
+expression allowed in a constructor, such as `occupied: false`. Read
+`entry.occupied` wherever a boolean expression is allowed. A writable
+reference permits `entry.occupied = true`, and another compatible alias
+observes the updated value. A boolean field can also be part of a fixed
+record passed as writable state.
+
+Each experimental physical layout stores a `bool` field in one byte, using
+`0` for `false` and `1` for `true`. The field adds no padding. These bytes
+are compiler representation. Holo source reads and writes boolean values.
+[Redis table](../examples/redis_server/src/store.holo)
 
 #### Synchronous borrowed batches
 

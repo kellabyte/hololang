@@ -62,24 +62,32 @@ no callers. Imported dependency namespaces retain normal reachability. Both
 entry and library checks validate the same declaration IR. A library check
 returns a diagnostic or success and never supplies an executable entry.
 
-Both package and standalone source support experimental `Result<u64, E>` with
-nominal families whose cases can carry one named `u64` field. A family can
-include child families with `from Child as Alias`. Scalar `let value = try call()`
-binds a success value and returns a failure under the enclosing result family.
+Both package and standalone source support experimental `Result<u64, E>` and
+`Result<Unit, E>` with nominal families whose cases can carry one named `u64`
+field. A family can include child families with `from Child as Alias`.
+Scalar `let value = try call()` binds a success value and returns a failure
+under the enclosing result family.
 `on Alias.Case(value) then …` selects a child case, including its payload when
 present. `on … then` checks all cases or an explicit fallback and evaluates
 just the selected arm. Public families can cross manifest package imports.
 [Runnable dashboard union](../../../tests/fixtures/error_unions/README.md)
+
+Use bare `return ok` for a Unit success and bare `on ok` to handle it.
+`try call()` and `try saved` statements continue on Unit success and
+propagate failure under the enclosing result family.
 
 An ordinary function can return `Option<u64>` using `Some(value)` or `None`.
 Expression and block handlers cover both cases. [Optional scalar returns](../../../docs/spec.md#optional-scalar-returns)
 
 An ordinary function, including a public library function, can declare
 `returns bool`. A boolean call can be used directly in `if` or `core.assert`,
-captured with immutable `let`, or forwarded by another `returns bool` function.
+captured with `let` or `var`, or forwarded by another `returns bool` function.
 Boolean returns and bindings also accept literals and comparisons of `u64`
-values. Ordinary helpers can accept `arg flag bool as readonly copy` and use
-the copied value in conditions, forward it, or save it in an immutable local.
+values. Assignments to a boolean `var` require a boolean expression. Ordinary
+helpers can accept `arg flag bool as readonly copy` and use the copied value
+in conditions, forward it, or initialize a local with it. Record fields
+declared `bool` initialize from checked boolean expressions and accept
+boolean assignments through writable references.
 `and` and `or` evaluate their right operand only when it can change the answer.
 `not` negates its operand. Comparisons bind tighter than `not`, then `and`,
 then `or`. Write `not (expression)` to negate a grouped expression.
@@ -107,10 +115,11 @@ record must be public in that namespace.
 
 Entry can also construct a scoped aggregate local with
 `core.construct(region, producer(...))` followed by block `on` arms. The
-call resolves the region tail before evaluating its actuals. A readonly
-record reference is available only in the success block. Failures retain
-the typed constructor or storage outcome, and the region tail is available
-for retry in a failure block.
+call resolves the region tail before evaluating its actuals. `on ok(record)`
+binds a readonly reference and `on ok(readwrite record)` binds a writable one.
+Both are lexical to the success block. Plain record constructors require an
+unbound `on error` fallback. The region tail is available for retry in a
+failure block.
 
 One `with core.region(bytes) { … } else { … }` statement directly in
 `main` supplies a private backing to one `core.construct(producer(...))`
@@ -126,16 +135,18 @@ stream as their first operand. The existing checked byte ranges and
 refill outcomes remain the transfer boundary. The checker handles owner
 consumption and entry cleanup. [Hosted lowering](lower/README.md)
 
-The current subset admits `u64`, inline `Bytes`, acyclic named records, readonly
-copied scalar helper arguments, pure scalar returns, and fresh record returns into
-append and scoped-local destinations. Record producers additionally admit `Bytes as readonly
+The current subset admits `u64` and `bool` fields, inline `Bytes`, acyclic named
+records, readonly copied scalar helper arguments, pure scalar returns, and
+fresh record returns into append and scoped-local destinations. Record
+producers additionally admit `Bytes as readonly
 reference` inputs from published byte-field projections, live refill
 data bindings, local byte views, or forwarded producer parameters. A constructor argument can
 narrow any of these with `core.prefix` or `core.subrange`. `core.len(input)` and
 `input[index]` observe these bounded borrows. Explicit `core.bytes` construction
 initializes owned output. Ordinary borrowed functions return `u64`, `bool`,
-`Option<u64>`, or `Result<u64, E>` and accept readonly or writable byte views, writable fixed
-scalar-record state, and published batch views. `Batch<Record> as readonly reference`
+`Option<u64>`, `Result<u64, E>`, or `Result<Unit, E>` and accept readonly or
+writable byte views, writable fixed scalar-record state, and published batch
+views. `Batch<Record> as readonly reference`
 or `as readwrite reference` lends existing records for the duration of the call.
 Length, cursor iteration, and indexed element borrows use that published prefix.
 Append and reset require the owner. `core.prefix(field, count)` and
@@ -152,9 +163,10 @@ template substitution. Producer byte descriptors retain rooted locations/extents
 without payload snapshots. Their metadata loads can occur at append because the
 restricted argument effects cannot change those facts. Producers can read their
 explicit initialized byte inputs but cannot write published data or invoke unknown
-effects. Default infix arithmetic is rejected while
-numeric policy remains open. Byte initialization and writes explicitly use
-low-eight-bit narrowing. `let` prevents rebinding; `var` permits scalar or same-root
+effects. Infix `u64` arithmetic traps on overflow, underflow, or division
+by zero. Explicit wrapping operations use modulo 2⁶⁴. Byte initialization
+and writes explicitly use low-eight-bit narrowing. `let` prevents rebinding;
+`var` permits scalar or same-root
 reference rebinding. Neither changes path permissions or makes a reference unique.
 Same-batch published-prefix inputs are legal during suffix append. Reference
 returns and user-owned input handles remain outside this subset. Pure scalar

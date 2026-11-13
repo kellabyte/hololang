@@ -212,6 +212,16 @@ impl State<'_> {
                     self.reserve(region, 8)?;
                     (field.clone(), Value::Scalar(value))
                 }
+                Build::Bool { field, value } => {
+                    let value = self.boolean_context(value, args, None)?;
+                    self.reserve(region, 1)?;
+                    (field.clone(), Value::Boolean(value))
+                }
+                Build::Enum { field, value } => {
+                    let value = self.enumeration(value)?;
+                    self.reserve(region, 1)?;
+                    (field.clone(), Value::Enum(value))
+                }
                 Build::Bytes { field, len, value } => {
                     let len = self.expression(len, args, None)?;
                     // Explicit compact width rejects unrepresentable lengths before narrowing
@@ -275,6 +285,8 @@ impl State<'_> {
             // be hidden by the oracle accepting an incompatible initializer.
             let kind_matches = match (&expected.kind, &value, step) {
                 (FieldKind::U64, Value::Scalar(_), _) => true,
+                (FieldKind::Bool, Value::Boolean(_), _) => true,
+                (FieldKind::Enum(kind), Value::Enum(value), _) => kind == &value.kind,
                 (FieldKind::Bytes, Value::Bytes(_), _) => true,
                 (FieldKind::Record(expected), Value::Record(_), Build::Record { producer, .. }) => {
                     self.program.producers.iter().any(|candidate| {

@@ -255,7 +255,7 @@ executable. Commands that emit or run a native application require an entry.
 
 ## Public types across packages
 
-**Working proposal.** Give each declared record or error type a nominal
+**Working proposal.** Give each declared record, enum, or error type a nominal
 identity. Within one build, the identity consists of its resolved package
 instance, declaring namespace, and type name. A package instance is the
 provider selected by the package resolver. The current local resolver admits
@@ -278,11 +278,13 @@ profile. A plain `struct` is visible across files of its declaring namespace.
 A file names a public type through the qualifier bound by `using`. The compiler
 rejects a public constructor that returns a private record, including
 when the constructor is unused. A public record can name only public
-structs in its inline fields. Checking each such field also prevents a
+types in its inline fields. Checking each such field also prevents a
 private type from being exposed through a chain of public structs.
 
-The experiment admits transparent records with `u64`, owned `Bytes`, and
-acyclic inline fields naming a struct in the same namespace. The compiler
+The experiment admits transparent records with `u64`, `bool`, owned `Bytes`,
+and fields naming enums or acyclic inline structs in the same namespace.
+`public enum` exposes a nominal enum. For example, `protocol.Command.Get`
+names a case of `Command` from the namespace imported as `protocol`. The compiler
 checks every field even if the record has no constructor or caller. Callers
 can read public record fields through a checked readonly reference and
 write through a checked readwrite reference. Public visibility grants a
@@ -370,12 +372,14 @@ the inner constructor. Its public signature follows the same visibility rules.
 
 ### Typed error families
 
-**Implemented experimental scalar slice.** An ordinary call returning
+**Implemented experimental ordinary result slice.** An ordinary call returning
 `Result<u64, FrameError>` produces either a copied scalar or one named
 failure. The header example below uses tag-only cases. An error case can also
 carry one named `u64` field. Use `error`, `return error`,
 `return ok value`, and `on … then` from the [error proposal](error-handling.md).
-General enums and results with other payload types remain open.
+Use `Result<Unit, E>` with bare `return ok` and `on ok` for an operation
+with no success value. General enums and additional ordinary result payload
+types remain open.
 
 ```holo
 namespace telemetry.frame
@@ -517,8 +521,9 @@ aggregate values remain outside this experiment.
   Ordinary result functions can take copied `u64` and `bool` arguments
   and use the existing borrowed argument modes.
 - The function header declares the exact result type. A returning branch uses
-  `return ok value` for a `u64`, `return error Family.Case` for a declared
-  case, or `return call(...)` to forward an identical checked result. Forwarding
+  `return ok value` for a `u64`, `return ok` for Unit,
+  `return error Family.Case` for a declared case, or `return call(...)` to
+  forward an identical checked result. Forwarding
   a different family requires explicit handling and mapping. Two families
   with the same cases and physical tags remain distinct. Each reachable
   returning path must produce a result or take an existing nonreturning edge.
@@ -528,19 +533,20 @@ aggregate values remain outside this experiment.
   Missing, duplicate, unknown, and wrong-family arms are compile errors.
   Adding a public case requires updating downstream handlers that name every
   failure explicitly. `on ok(value)` binds the immutable copied scalar in
-  its arm. `on ok` and `on ok(_)` handle success without binding it. Each
-  arm's value must agree with the type of the handling expression.
+  its arm. `on ok` and `on ok(_)` handle scalar success without binding it.
+  Unit success uses bare `on ok`. Each arm's value must agree with the type
+  of the handling expression.
 - An ordinary result call can also be handled as a statement with an
   `on … then { ... }` block for every arm. The selected block may act on
   caller state and return from its enclosing function. Its payload binding
   stays within the arm. The same coverage and package visibility rules apply.
-- The experiment permits direct `on` handling, exact-result forwarding, and
-  `let value = try call(...)` for the same error family or a declared direct
-  child. Defer
-  stored results, independently constructed error values, general patterns,
-  implicit propagation, and implicit conversions to or from integers.
-  `Result<u64, E>` is a checked source form for this experiment. User-defined
-  generics and ABI or wire encodings need separate rules.
+- Ordinary results support direct `on` handling, immutable `let` bindings,
+  and exact-result forwarding. `let value = try call(...)` binds a `u64`
+  success. `try call(...)` as a statement continues on Unit success. Both
+  forms also accept a saved result and can propagate the same error family
+  or a declared direct child. Independently constructed error values,
+  general patterns, implicit propagation, and integer conversions remain
+  open. User-defined generics and ABI or wire encodings need separate rules.
 
 #### Effects and construction
 
@@ -638,8 +644,7 @@ sets the cost boundaries for these experiments.
 
 **Implemented experimental module.** Manifest packages can select
 [`holo.net`](../lib/holo/net.holo) with `using holo.net`. Its first functions
-interpret the experimental hosted socket statuses as typed results. This
-uses the existing public error and scalar result representation.
+interpret the experimental hosted socket statuses as typed results.
 
 ```holo
 let ready = core.prefix(reply.bytes, reply_length)
@@ -656,11 +661,12 @@ The example assumes the reporting functions return a scalar and shows
 one possible outcome mapping. A caller that needs to distinguish waiting
 from an interrupted retry can assign separate handler results. Send progress
 is the accepted count, which can be shorter than the request. Receive
-status zero means EOF for a positive-size request. Readiness status zero
-permits another attempt. A native errno preserves its positive numeric value
-on its own platform. `net.next_session_result` decodes a host-owned session
-transition. Success admits a client, `End` marks the end of a file or
-inherited stream, and `Interrupted` permits another accept attempt. The
+status zero means EOF for a positive-size request. `net.wait_result` reports
+readiness with a Unit success, which permits another attempt. A native errno
+preserves its positive numeric value on its own platform.
+`net.next_session_result` decodes a host-owned session transition. Its Unit
+success admits a client, `End` marks the end of a file or inherited stream,
+and `Interrupted` permits another accept attempt. The
 pure adapters acquire no descriptor, storage, or
 event queue. The existing [hosted runtime](../runtime/refill/README.md) owns
 descriptors and checks each actual byte range.
@@ -765,8 +771,8 @@ conditional close must check owner state at each join and loop backedge.
 
 Explicit close consumes the live binding before asking the host to release
 it. Both success and a reported close error leave the binding consumed.
-The terminal failure family is `tcp.CloseError`, available through
-`using holo.net.tcp` and `tcp.close_result(status)`. Its native errno
+With `using holo.net.tcp`, `tcp.close_result(status)` returns
+`Result<Unit, CloseError>`. Its native errno
 includes interruption and leaves the binding consumed. On normal exit and
 early `return 0`, implicit cleanup closes a still-live owner once.
 A caller that needs the close status closes explicitly. Fatal traps follow the existing

@@ -22,6 +22,59 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Enum fields retain their named cases through packed construction and writes.
+#[test]
+fn enum_record_fields_match_independent_model() {
+    let source = r#"
+enum Command { Unset; Get; Set }
+struct Request { count u64; command Command; payload u64 }
+
+func request returns Request {
+    return Request { count: 17, command: Command.Unset, payload: 12345 }
+}
+
+func update arg request Request as readwrite reference returns bool {
+    var next = Command.Get
+    if request.command != Command.Unset { next = Command.Set }
+    request.command = next
+    let saved = request.command
+    next = Command.Unset
+    return saved == Command.Set and next != saved
+}
+
+func main returns u64 {
+    let memory = core.region(64) else { return 0 }
+    let rows = core.batch(memory, Request)
+    let added = core.append(rows, request())
+    core.assert(added == 0)
+    let row = core.borrow_readwrite(rows, 0)
+    core.assert(row.command == Command.Unset)
+    core.assert(not update(row))
+    core.assert(row.command == Command.Get)
+    core.assert(update(row))
+    core.assert(row.command == Command.Set)
+    core.print(row.count)
+    core.print(row.payload)
+    return 0
+}
+"#;
+    let parsed = holo::frontend::parse_experimental(source)
+        .unwrap_or_else(|error| panic!("{}", error.render("enum-record.holo", source)));
+    let program = parsed.program();
+    assert_eq!(model::run(program).unwrap(), [17, 12345]);
+    let checked = parsed.check().unwrap();
+    for (mode, expected) in [
+        (LayoutMode::Wide, 25),
+        (LayoutMode::Derived64, 17),
+        (LayoutMode::Compact32, 17),
+    ] {
+        let plan = holo::layout::LayoutPlan::new(&checked, mode).unwrap();
+        assert_eq!(plan.record("Request").fixed_size, Some(expected));
+    }
+    let toolchain = NativeToolchain::discover().expect("enum tests require LLVM tools");
+    compare(&toolchain, "enum-record", program);
+}
+
 /// Compare multiple complete generated inputs/layouts at both optimization levels.
 #[test]
 fn generated_programs_match_independent_model_in_native_builds() {
@@ -47,6 +100,128 @@ fn construction_boundaries_match_independent_model() {
         "construction-boundaries",
         &generator::boundaries(),
     );
+}
+
+/// Unit successes carry no value, and failure propagation preserves payloads.
+#[test]
+fn unit_results_match_independent_model() {
+    let source = r#"
+error ReadError { Invalid(code u64) }
+error TaskError { Busy; from ReadError as Read }
+
+func validate arg code u64 as readonly copy returns Result<Unit, ReadError> {
+    if code != 0 { return error ReadError.Invalid(code) }
+    return ok
+}
+
+func saved_forward arg code u64 as readonly copy returns Result<Unit, ReadError> {
+    let ok = validate(code)
+    return ok
+}
+
+func run_task arg code u64 as readonly copy returns Result<u64, TaskError> {
+    try saved_forward(0)
+    let checked = saved_forward(code)
+    try checked
+    return ok 17
+}
+
+func main returns u64 {
+    let direct = validate(0)
+        on ok then 5
+        on Invalid(code) then code
+    core.print(direct)
+    let direct_failure = validate(7)
+        on ok then 0
+        on Invalid(code) then code
+    core.print(direct_failure)
+    let status = saved_forward(0)
+    let ready = status
+        on ok then 11
+        on Invalid(code) then code
+    core.print(ready)
+    run_task(0)
+        on ok(value) then { core.print(value) }
+        on error then { core.assert(false) }
+    run_task(9)
+        on ok then { core.assert(false) }
+        on Read.Invalid(code) then { core.print(code) }
+        on Busy then { core.assert(false) }
+    return 0
+}
+"#;
+    let parsed = holo::frontend::parse_experimental(source)
+        .unwrap_or_else(|error| panic!("{}", error.render("unit-result.holo", source)));
+    let program = parsed.program();
+    assert_eq!(model::run(program).unwrap(), [5, 7, 11, 17, 9]);
+    let toolchain = NativeToolchain::discover().expect("Unit result tests require LLVM tools");
+    compare(&toolchain, "unit-result", program);
+}
+
+/// Scoped writes reach their final record, and both outcomes release the tail.
+#[test]
+fn writable_scoped_construction_matches_independent_model() {
+    let source = r#"
+struct Cursor { position u64 }
+struct Buffer { data Bytes }
+error BufferError { BadSize }
+
+func cursor arg position u64 as readonly copy returns Cursor {
+    core.reject_if(position == 9)
+    return Cursor { position: position }
+}
+
+func buffer returns Result<Buffer, BufferError> {
+    return ok Buffer:
+        data = core.bytes(4, 0)
+}
+
+func write_one
+    arg cursor Cursor as readwrite reference
+    arg destination Bytes as readwrite reference
+    returns u64
+{
+    destination[cursor.position] = 25
+    cursor.position = core.add_wrapping(cursor.position, 1)
+    return cursor.position
+}
+
+func main returns u64 {
+    let cursor_memory = core.region(64) else { return 0 }
+    let bytes_memory = core.region(128) else { return 0 }
+    core.construct(cursor_memory, cursor(1))
+        on ok(readwrite position) then {
+            core.construct(bytes_memory, buffer())
+                on ok(readwrite output) then {
+                    let written = write_one(position, output.data)
+                    core.print(written)
+                    core.print(output.data[1])
+                }
+                on error then { core.assert(false) }
+            core.print(position.position)
+        }
+        on error then { core.assert(false) }
+    core.construct(cursor_memory, cursor(9))
+        on ok then { core.assert(false) }
+        on Full then { core.assert(false) }
+        on SizeOverflow then { core.assert(false) }
+        on error then {
+            core.construct(cursor_memory, cursor(3))
+                on ok(readwrite retry) then {
+                    retry.position = 4
+                    core.print(retry.position)
+                }
+                on error then { core.assert(false) }
+        }
+    return 0
+}
+"#;
+    let parsed = holo::frontend::parse_experimental(source)
+        .unwrap_or_else(|error| panic!("{}", error.render("writable-construct.holo", source)));
+    let program = parsed.program();
+    assert_eq!(model::run(program).unwrap(), [2, 25, 2, 4]);
+    let toolchain = NativeToolchain::discover().expect("scoped construction requires LLVM tools");
+    compare(&toolchain, "writable-construct", program);
 }
 
 /// Empty values, exact capacities, cursor rebinding, and captured prefixes agree.
@@ -869,6 +1044,235 @@ func main returns u64 {
     let llvm = holo::llvm::emit(&checked, toolchain.target_triple());
     assert!(llvm.contains("(i1 %arg0, i64 %arg1, i1 %arg2)"));
     compare(&toolchain, "boolean-parameters", program);
+}
+
+/// Rebinding in branches and loops preserves boolean values and evaluates the
+/// right-hand side once, including short-circuit calls with observable effects.
+#[test]
+fn mutable_booleans_match_independent_model() {
+    let source = r#"
+struct State { calls u64 }
+func state returns State { return State { calls: 0 } }
+
+func next_is
+    arg state State as readwrite reference
+    arg expected u64 as readonly copy
+    returns bool
+{
+    state.calls = core.add_wrapping(state.calls, 1)
+    return state.calls == expected
+}
+
+func toggle arg initial bool as readonly copy returns bool {
+    var flag = initial
+    if flag {
+        flag = false
+    } else {
+        flag = true
+    }
+    return flag
+}
+
+func choice arg flag bool as readonly copy returns Option<u64> {
+    if flag { return Some(1) }
+    return None
+}
+
+func main returns u64 {
+    let memory = core.region(128) else { return 0 }
+    let records = core.batch(memory, State)
+    let status = core.append(records, state())
+    core.assert(status == 0)
+    let slot = core.borrow_readwrite(records, 0)
+    var pending = next_is(slot, 1)
+    let saved = pending
+    for index in core.range(3) {
+        if pending { core.print(index) }
+        pending = toggle(pending)
+    }
+    core.assert(not pending and saved)
+    pending = pending and next_is(slot, 0) or next_is(slot, 2)
+    core.assert(pending)
+    var answered = choice(pending)
+        on Some(_) then true
+        on None then false
+    core.assert(answered)
+    answered = toggle(answered)
+    core.assert(not answered)
+    core.print(slot.calls)
+    return 0
+}
+"#;
+    let parsed = holo::frontend::parse_experimental(source)
+        .unwrap_or_else(|error| panic!("{}", error.render("mutable-booleans.holo", source)));
+    let program = parsed.program();
+    assert_eq!(model::run(program).unwrap(), [0, 2, 2]);
+    let toolchain = NativeToolchain::discover().expect("mutable booleans require LLVM tools");
+    compare(&toolchain, "mutable-booleans", program);
+}
+
+/// Boolean fields use one byte and keep neighboring packed fields intact.
+#[test]
+fn boolean_record_fields_match_independent_model() {
+    let source = r#"
+struct State {
+    enabled bool
+    count u64
+}
+
+struct Row {
+    state State
+    marker bool
+    payload Bytes
+}
+
+func state arg count u64 as readonly copy returns State {
+    return State {
+        enabled: count > 0 and not false,
+        count: count
+    }
+}
+
+func row arg count u64 as readonly copy returns Row {
+    return Row {
+        state: state(count),
+        marker: true,
+        payload: core.bytes(2, 42)
+    }
+}
+
+func toggle arg state State as readwrite reference returns bool {
+    state.enabled = not state.enabled
+    return state.enabled
+}
+
+func main returns u64 {
+    let memory = core.region(128) else { return 0 }
+    let rows = core.batch(memory, Row)
+    for count in core.range(2) {
+        let status = core.append(rows, row(count))
+        core.assert(status == 0)
+    }
+    let first = core.borrow_readwrite(rows, 0)
+    let second = core.borrow_readonly(rows, 1)
+    let initially_enabled = first.state.enabled
+    core.assert(not initially_enabled and second.state.enabled)
+    first.state.enabled = second.state.enabled
+    first.marker = not second.marker
+    core.assert(first.state.enabled and not first.marker)
+    core.print(core.used(memory))
+    for readonly item in rows {
+        core.print(item.state.count)
+        core.print(item.payload[0])
+    }
+    let scratch = core.region(32) else { return 0 }
+    core.construct(scratch, state(5))
+        on ok(readwrite item) then {
+            core.assert(not toggle(item))
+            core.print(item.count)
+        }
+        on error then { core.assert(false) }
+    return 0
+}
+"#;
+    let parsed = holo::frontend::parse_experimental(source)
+        .unwrap_or_else(|error| panic!("{}", error.render("boolean-fields.holo", source)));
+    let program = parsed.program();
+    let toolchain = NativeToolchain::discover().expect("boolean fields require LLVM tools");
+    // Two rows include one nested bool and one top-level bool per row.
+    for (mode, used) in [
+        (LayoutMode::Wide, 72),
+        (LayoutMode::Derived64, 40),
+        (LayoutMode::Compact32, 32),
+    ] {
+        assert_eq!(
+            model::run_with_layout(program, mode).unwrap(),
+            [used, 0, 42, 1, 42, 5]
+        );
+        compare_layout(
+            &toolchain,
+            &format!("boolean-fields-{mode:?}"),
+            program,
+            mode,
+        );
+    }
+}
+
+/// Each transfer targets the nearest loop and restores the storage it leaves.
+#[test]
+fn loop_transfers_restore_scoped_storage() {
+    let source = r#"
+struct Row { value u64 }
+error RowError { Invalid }
+
+func row arg value u64 as readonly copy returns Row {
+    return Row { value: value }
+}
+
+func scoped_row arg value u64 as readonly copy returns Result<Row, RowError> {
+    return ok Row:
+        value = value
+}
+
+func counted arg stop u64 as readonly copy returns bool {
+    var total = 0
+    var visits = 0
+    for index in core.range(6) {
+        visits = core.add_wrapping(visits, 1)
+        core.assert(visits <= 6)
+        if index == 1 { continue }
+        if index == stop { break }
+        total = core.add_wrapping(total, index)
+    }
+    return total == 5
+}
+
+func main returns u64 {
+    core.assert(counted(4))
+    let batch_memory = core.region(64) else { return 0 }
+    let record_memory = core.region(64) else { return 0 }
+    var iteration = 0
+    loop {
+        iteration = core.add_wrapping(iteration, 1)
+        core.assert(iteration <= 2)
+        core.assert(core.used(batch_memory) == 0)
+        core.assert(core.used(record_memory) == 0)
+        let scratch = core.region(16) else { break }
+        core.assert(core.used(scratch) == 0)
+        let rows = core.batch(batch_memory, Row)
+        for index in core.range(4) {
+            let status = core.append(rows, row(index))
+            core.assert(status == 0)
+        }
+        var visits = 0
+        for readonly entry in rows {
+            visits = core.add_wrapping(visits, 1)
+            core.assert(visits <= 4)
+            if entry.value == 1 { continue }
+            if entry.value == 3 { break }
+            core.print(entry.value)
+        }
+        core.construct(record_memory, scoped_row(iteration))
+            on ok(record) then {
+                core.print(record.value)
+                if iteration == 1 { continue }
+                break
+            }
+            on error then { core.assert(false) }
+        core.assert(false)
+    }
+    core.assert(iteration == 2)
+    core.assert(core.used(batch_memory) == 0)
+    core.assert(core.used(record_memory) == 0)
+    return 0
+}
+"#;
+    let parsed = holo::frontend::parse_experimental(source)
+        .unwrap_or_else(|error| panic!("{}", error.render("loop-transfers.holo", source)));
+    let program = parsed.program();
+    assert_eq!(model::run(program).unwrap(), [0, 2, 1, 0, 2, 2]);
+    let toolchain = NativeToolchain::discover().expect("loop transfers require LLVM tools");
+    compare(&toolchain, "loop-transfers", program);
 }
 
 /// Compare one explicit layout at both optimization levels without sharing its plan.

@@ -4,7 +4,7 @@
 //! use separate checked reservation helpers. Reference observations load actual
 //! memory on each evaluation and carry no immutability or uniqueness annotation.
 
-use crate::ir::{Binary, BoolExpr, Compare, Condition, Expr};
+use crate::ir::{Binary, BoolExpr, Compare, Condition, EnumExpr, Expr};
 
 use super::{
     context::{Binding, Lowering},
@@ -76,6 +76,18 @@ impl Lowering<'_> {
                 let left = self.expression(left);
                 let right = self.expression(right);
                 let opcode = match op {
+                    Binary::AddChecked => return self.checked_arithmetic("uadd", &left, &right),
+                    Binary::SubChecked => return self.checked_arithmetic("usub", &left, &right),
+                    Binary::MulChecked => return self.checked_arithmetic("umul", &left, &right),
+                    Binary::DivChecked | Binary::RemChecked => {
+                        let nonzero = self.f.value(format!("icmp ne i64 {right}, 0"));
+                        self.f.line(format!("call void @holo.assert(i1 {nonzero})"));
+                        if matches!(op, Binary::DivChecked) {
+                            "udiv"
+                        } else {
+                            "urem"
+                        }
+                    }
                     Binary::AddWrapping => "add",
                     Binary::SubWrapping => "sub",
                     Binary::MulWrapping => "mul",
@@ -124,6 +136,20 @@ impl Lowering<'_> {
         }
     }
 
+    /// Emit one unsigned arithmetic intrinsic and trap before exposing an overflowed result.
+    fn checked_arithmetic(&mut self, intrinsic: &str, left: &str, right: &str) -> String {
+        let result = self.f.value(format!(
+            "call {{ i64, i1 }} @llvm.{intrinsic}.with.overflow.i64(i64 {left}, i64 {right})"
+        ));
+        let overflow = self
+            .f
+            .value(format!("extractvalue {{ i64, i1 }} {result}, 1"));
+        let valid = self.f.value(format!("xor i1 {overflow}, true"));
+        self.f.line(format!("call void @holo.assert(i1 {valid})"));
+        self.f
+            .value(format!("extractvalue {{ i64, i1 }} {result}, 0"))
+    }
+
     /// Read a byte through a captured descriptor after checking its logical extent.
     fn read_view_byte(&mut self, contents: &str, len: &str, index: &Expr) -> String {
         let pointer = self.view_byte_pointer(contents, len, index);
@@ -143,19 +169,48 @@ impl Lowering<'_> {
     pub(super) fn boolean(&mut self, expression: &BoolExpr) -> String {
         match expression {
             BoolExpr::Const(value) => value.to_string(),
-            BoolExpr::Local(name) => {
-                let Binding::Boolean(value) = self.binding(name) else {
-                    unreachable!("checked boolean local")
-                };
-                value
+            BoolExpr::Read { reference, path } => {
+                let pointer = self.field_pointer(reference, path);
+                storage::load_bool(&mut self.f, &pointer)
             }
+            BoolExpr::Local(name) => match self.binding(name) {
+                Binding::Boolean(value) => value,
+                Binding::BooleanSlot(slot) => self.f.value(format!("load i1, ptr {slot}")),
+                _ => unreachable!("checked boolean local"),
+            },
             BoolExpr::Call { function, args } => self.ordinary_call(function, args),
             BoolExpr::Compare(condition) => self.condition(condition),
+            BoolExpr::EnumEq { left, right } => {
+                let left = self.enumeration(left);
+                let right = self.enumeration(right);
+                self.f.value(format!("icmp eq i8 {left}, {right}"))
+            }
             BoolExpr::And(left, right) => self.short_circuit(left, right, false),
             BoolExpr::Or(left, right) => self.short_circuit(left, right, true),
             BoolExpr::Not(value) => {
                 let value = self.boolean(value);
                 self.f.value(format!("xor i1 {value}, true"))
+            }
+        }
+    }
+
+    /// Lower a checked enum value to a private i8 discriminant.
+    pub(super) fn enumeration(&mut self, expression: &EnumExpr) -> String {
+        match expression {
+            EnumExpr::Variant { kind, variant } => self.enums[kind.as_str()]
+                .variants
+                .iter()
+                .position(|case| case == variant)
+                .expect("checked enum case")
+                .to_string(),
+            EnumExpr::Local(name) => match self.binding(name) {
+                Binding::Enum(value) => value,
+                Binding::EnumSlot(slot) => self.f.value(format!("load i8, ptr {slot}, align 1")),
+                _ => unreachable!("checked enum local"),
+            },
+            EnumExpr::Read { reference, path } => {
+                let pointer = self.field_pointer(reference, path);
+                self.f.value(format!("load i8, ptr {pointer}, align 1"))
             }
         }
     }

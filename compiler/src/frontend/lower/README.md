@@ -12,7 +12,8 @@ bounds check precedes all later actuals. Pure helper calls nested in an actual
 use an eager scalar expression frame. The existing entry and producer paths keep
 their direct captures.
 
-Boolean calls, immutable `let` bindings, and returns use typed boolean IR.
+Boolean calls, local bindings, assignments, and returns use typed boolean IR.
+Only source `var` bindings can be reassigned.
 `if` and `core.assert` test boolean locals and calls directly. Comparisons
 capture the left operand before evaluating the right. Boolean calls reuse the
 same ordered actuals and byte-borrow checks as other ordinary calls.
@@ -37,10 +38,10 @@ each arm into a fresh scope with its own active payload and operation spans.
 
 `construction.rs` lowers entry's `core.construct(region, producer(...))`
 into one checked operation with ordered outcome blocks. Each block has its
-own lexical scope. Only `on ok(record)` introduces the readonly record
-reference. Named rejections use the existing nominal case and scalar
-payload resolver. The fallback covers storage and domain failures without
-a bound reason. Actuals stay in the operation for destination-first
+own lexical scope. `on ok(record)` introduces a readonly reference and
+`on ok(readwrite record)` introduces a writable one. Named rejections use the
+existing nominal case and scalar payload resolver. Plain record constructors
+require an unbound fallback. Actuals stay in the operation for destination-first
 evaluation. The verifier enforces the live region tail and reference lifetime.
 
 `with core.region` selects one constructor by its source span before explicit
@@ -56,21 +57,22 @@ immutably, and `on ok(_)` explicitly discards it. Named error arms can bind
 their payload or discard it with `_`. Actual arguments and arm expressions
 stay inside the checked result node, so selecting an arm cannot execute
 another arm's prelude. Boolean literal arms can initialize a boolean with
-`let` or form the return value of an ordinary boolean function.
+`let` or `var`, or form the return value of an ordinary boolean function.
 
 Optional scalar returns use the same checked tag and payload representation.
 Source lowering checks `Some` and `None` exhaustiveness and keeps optional
 returns distinct from named error families and `try`.
-An immutable `let` captures a direct `Result<u64, E>` or `Option<u64>` call.
-Expression and statement handlers on that local use its original nominal
-outcome identity and the same coverage rules as immediate handlers.
-Returning the local forwards the captured outcome when its nominal identity
-matches the enclosing function's return type.
+An immutable `let` captures a direct `Result<u64, E>`, `Result<Unit, E>`, or
+`Option<u64>` call. Expression and statement handlers on that local use its
+original result type and the same coverage rules as immediate handlers.
+Returning the local forwards the captured outcome when it matches the
+enclosing function's return type exactly.
 
-An immutable `let value = try call(...)` in a scalar-result function lowers to
+An immutable `let value = try call(...)` in an ordinary Result function lowers to
 one ordered call with a success binding and an ordinary failure return.
 `let value = try saved` reuses the outcome captured by an earlier binding.
-Both resolve their operand before introducing the success binding.
+Both resolve their operand before introducing the success binding. A `try`
+statement accepts a Unit result and continues without introducing a binding.
 Typed record constructors support a separate
 `try` in nested destination fields, including declared direct child families.
 

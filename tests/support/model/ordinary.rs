@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 use holo::ir::{
     Access, FunctionArgument, FunctionParameterKind, Op, ResultArm, ResultBlockArm, ResultPattern,
+    ResultSuccess,
 };
 
 use super::{
@@ -24,6 +25,8 @@ pub(super) enum Outcome {
     Boolean(bool),
     /// Success of a typed helper with the entire unsigned range available.
     Success(u64),
+    /// Success without an observable value.
+    SuccessUnit,
     /// Typed failure represented by its declared names, independently of LLVM tags.
     Failure {
         /// Nominal error family.
@@ -157,8 +160,11 @@ impl State<'_> {
 
         let outer_scopes = std::mem::replace(&mut self.scopes, vec![bindings]);
         let outer_bytes = std::mem::replace(&mut self.ordinary_bytes, bytes);
-        let outer_family =
-            std::mem::replace(&mut self.ordinary_result_family, function.result.as_deref());
+        let family = function
+            .result
+            .as_ref()
+            .map(|result| result.family.as_str());
+        let outer_family = std::mem::replace(&mut self.ordinary_result_family, family);
         let outer_return = self.returned.take();
         self.ordinary_stack.push(&function.name);
         let result = self.execute_ops(&function.body);
@@ -169,17 +175,25 @@ impl State<'_> {
         self.ordinary_bytes = outer_bytes;
         self.ordinary_result_family = outer_family;
         let returned = std::mem::replace(&mut self.returned, outer_return);
+        let transferred = self.loop_transfer.take();
         result?;
+        if transferred.is_some() {
+            return Err(ModelError::new(
+                "loop transfer escaped an ordinary model function",
+            ));
+        }
         let outcome = returned
             .ok_or_else(|| ModelError::new("ordinary model function completed without a return"))?;
         // The outcome must agree with the declared signature, including family identity.
-        match (function.returns_bool, &function.result, &outcome) {
+        let success = function.result.as_ref().map(|result| result.success);
+        match (function.returns_bool, success, &outcome) {
             (true, None, Outcome::Boolean(_))
             | (false, None, Outcome::Scalar(_))
-            | (false, Some(_), Outcome::Success(_)) => Ok(outcome),
-            (false, Some(expected), Outcome::Failure { family, case, payload }) if expected == family
+            | (false, Some(ResultSuccess::U64), Outcome::Success(_))
+            | (false, Some(ResultSuccess::Unit), Outcome::SuccessUnit) => Ok(outcome),
+            (false, Some(_), Outcome::Failure { family: actual, case, payload }) if family == Some(actual.as_str())
                 && program.body.iter().any(|operation| matches!(operation,
-                    Op::ErrorFamily(declared) if declared.name == *family
+                    Op::ErrorFamily(declared) if declared.name == *actual
                         && declared.cases.iter().any(|item| item.name == *case && item.payload == payload.is_some()))) => Ok(outcome),
             _ => Err(ModelError::new("ordinary model return disagrees with its signature")),
         }
@@ -251,6 +265,7 @@ fn select_result_arm<'a, A>(
     mut arms: impl Iterator<Item = (&'a ResultPattern, &'a A)>,
 ) -> Result<(&'a A, ArmBinding<'a>), ModelError> {
     arms.find_map(|(pattern, arm)| match (outcome, pattern) {
+        (Outcome::SuccessUnit, ResultPattern::Ok(None)) => Some((arm, None)),
         (Outcome::Success(value), ResultPattern::Ok(name)) => Some((
             arm,
             name.as_ref().map(|name| (name, Binding::Scalar(*value))),

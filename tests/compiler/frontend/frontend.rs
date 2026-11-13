@@ -60,6 +60,139 @@ fn rejected(source: &str) -> Diagnostic {
     diagnostic
 }
 
+/// Enum values preserve their nominal type and cannot enter the integer lane.
+#[test]
+fn enum_fields_and_locals_enforce_nominal_types() {
+    let fixture = |statement| {
+        format!(
+            r#"
+enum Command {{ Unset Get Set }}
+enum Direction {{ Get Set }}
+struct Request {{ command Command }}
+func request returns Request {{ return Request {{ command: Command.Unset }} }}
+func change arg state Request as readwrite reference returns bool {{
+    var command = Command.Get
+    let original = command
+    command = Command.Set
+    state.command = command
+    return original != state.command and state.command == Command.Set
+}}
+func main returns u64 {{
+    let storage = core.region(32) else {{ return 0 }}
+    core.construct(storage, request())
+        on ok(readwrite state) then {{
+            core.assert(change(state))
+            {statement}
+        }}
+        on error then {{}}
+    return 0
+}}
+"#
+        )
+    };
+    accepted(&fixture("core.assert(state.command != Command.Unset)"));
+    for (statement, expected) in [
+        (
+            "core.print(state.command)",
+            "enum value cannot be used as a u64",
+        ),
+        ("state.command = 0", "expected an enum `Command` value"),
+        (
+            "state.command = Direction.Get",
+            "expected enum `Command`, found `Direction`",
+        ),
+        (
+            "core.assert(state.command == Direction.Get)",
+            "same enum type",
+        ),
+        ("core.assert(state.command == 0)", "same enum type"),
+        (
+            "core.assert(state.command < Command.Set)",
+            "support only `==` and `!=`",
+        ),
+        (
+            "state.command = Command.Unknown",
+            "has no variant `Unknown`",
+        ),
+        (
+            "let command = Command.Get; command = Command.Set",
+            "cannot be reassigned",
+        ),
+    ] {
+        let source = fixture(statement);
+        let error = rejected(&source);
+        assert!(error.message.contains(expected), "{statement}: {error:?}");
+    }
+    let readonly = fixture("").replace("ok(readwrite state)", "ok(state)");
+    assert!(rejected(&readonly).message.contains("readwrite"));
+    let duplicate = fixture("").replace("Unset Get Set", "Unset Get Set Get");
+    assert!(
+        rejected(&duplicate)
+            .message
+            .contains("duplicate variant `Command.Get`")
+    );
+    let no_variants = fixture("").replace("Unset Get Set", "");
+    assert!(rejected(&no_variants).message.contains("1 to 256 variants"));
+}
+
+/// Unit successes cannot expose a scalar or substitute for a scalar result.
+#[test]
+fn unit_results_have_no_success_payload_and_keep_their_exact_type() {
+    let definitions = r#"
+error Failure { Invalid }
+func done returns Result<Unit, Failure> { return ok }
+func value returns Result<u64, Failure> { return ok 3 }
+"#;
+    for (function, main, diagnostic) in [
+        (
+            "struct Unit { value u64 }",
+            "",
+            "cannot redefine the builtin `Unit`",
+        ),
+        (
+            "func invalid returns Result<Unit, Failure> { return ok 3 }",
+            "",
+            "bare `return ok`",
+        ),
+        (
+            "func invalid returns Result<Unit, Failure> { return value() }",
+            "",
+            "exact Result success type",
+        ),
+        (
+            "func invalid returns Result<u64, Failure> { let saved = done(); return saved }",
+            "",
+            "exact Result success type",
+        ),
+        (
+            "func invalid returns Result<u64, Failure> { let number = try done(); return ok number }",
+            "",
+            "has no value to bind",
+        ),
+        (
+            "func invalid returns Result<Unit, Failure> { try value(); return ok }",
+            "",
+            "standalone `try` requires",
+        ),
+        (
+            "",
+            "done()\n        on ok(number) then {}\n        on error then {}",
+            "success has no payload",
+        ),
+        (
+            "",
+            "let saved = done()\n    let code = saved\n        on ok(_) then 1\n        on error then 0",
+            "success has no payload",
+        ),
+    ] {
+        let source = format!(
+            "{definitions}\n{function}\nfunc main returns u64 {{\n    {main}\n    return 0\n}}"
+        );
+        let actual = rejected(&source);
+        assert!(actual.message.contains(diagnostic), "{source}: {actual:?}");
+    }
+}
+
 /// Optional arms are exhaustive and the presence payload is scoped to its arm.
 #[test]
 fn optional_returns_reject_invalid_construction_and_handling() {
@@ -728,6 +861,7 @@ func payload returns Result<Payload, Broken> {
     return ok Payload:
         bytes = core.bytes(1, 42)
 }
+
 func first arg bytes Bytes as readonly reference returns u64 { return bytes[0] }
 func main returns u64 {
     let memory = core.region(64) else { return 0 }
@@ -744,6 +878,29 @@ func main returns u64 {
     );
     let diagnostic = rejected(&out_of_scope);
     assert!(diagnostic.message.contains("value"), "{diagnostic:?}");
+}
+
+/// A writable success name permits field mutation and still has a lexical lifetime.
+#[test]
+fn scoped_constructor_writable_reference_keeps_its_root() {
+    let success = r#"    core.construct(region, item(0))
+        on ok(readwrite value) then { value.value = 1 }
+        on error then {}"#;
+    accepted(&construct_fixture(success));
+    for (tail, expected) in [
+        (
+            success.replace("readwrite value", "readwrite _"),
+            "binding name",
+        ),
+        (
+            success.replace("value.value = 1", "value = value"),
+            "cannot be reassigned",
+        ),
+        (format!("{success}\n    core.print(value.value)"), "value"),
+    ] {
+        let diagnostic = rejected(&construct_fixture(&tail));
+        assert!(diagnostic.message.contains(expected), "{diagnostic:?}");
+    }
 }
 
 /// One repeated source site selects its owner while a named construction
@@ -1371,12 +1528,12 @@ fn inner_bindings_do_not_leak_into_the_outer_scope() {
 }
 
 #[test]
-/// Unknown APIs, dynamic targets, and unsettled arithmetic never acquire silent fallbacks.
+/// Unknown APIs, dynamic targets, and unsupported operators fail at their use sites.
 fn unavailable_operations_are_explicitly_rejected() {
     let cases = [
         ("core.mystery(1)", "mystery"),
         ("let value = missing(1)", "missing"),
-        ("let value = 1 + 2", "arithmetic"),
+        ("let value = 1 & 2", "infix bitwise"),
         ("let value = core.index()", "index"),
         ("let value = core.add_wrapping(1)", "argument"),
     ];
@@ -1675,7 +1832,7 @@ func main returns u64 {
 }
 
 #[test]
-fn boolean_returns_reject_integer_conversion_and_rebinding() {
+fn boolean_returns_reject_integer_conversion() {
     let predicate = "func predicate returns bool { return true }";
     for (source, message) in [
         ("func invalid returns bool { return 1 }", "expected a bool"),
@@ -1726,10 +1883,31 @@ fn boolean_returns_reject_integer_conversion_and_rebinding() {
             "let result = 1; if result {}",
             "expected a comparison or boolean condition",
         ),
-        ("var result = predicate()", "bind a bool with `let`"),
     ] {
         let source = format!("{predicate}\nfunc main returns u64 {{ {body}; return 0 }}");
         assert!(rejected(&source).message.contains(message), "{source}");
+    }
+}
+
+#[test]
+fn boolean_assignment_requires_a_mutable_binding_and_matching_type() {
+    for (body, expected) in [
+        (
+            "let flag = false; flag = true",
+            "binding cannot be reassigned",
+        ),
+        (
+            "var flag = false; var count = 1; flag = count",
+            "expected a bool expression",
+        ),
+        (
+            "var flag = true; var count = 0; count = flag",
+            "used as a u64",
+        ),
+    ] {
+        let source = format!("func main returns u64 {{ {body}; return 0 }}");
+        let error = rejected(&source);
+        assert!(error.message.contains(expected), "{body}: {error:?}");
     }
 }
 
@@ -1939,6 +2117,59 @@ fn hosted_views_reject_same_path_refill_reset_and_escape() {
     }
 }
 
+/// A break can reach the body suffix only when it exits the outermost loop there.
+#[test]
+fn loop_transfers_preserve_entry_fallthrough_rules() {
+    for body in [
+        "loop { break }; return 0",
+        "loop { loop { break } }",
+        "loop { continue; break }",
+        "loop { { continue }; break }",
+        "loop { if true { break } else { continue } }; return 0",
+        "loop { for index in core.range(1) { break }; continue }",
+        "loop { let memory = core.region(32) else { break } }; return 0",
+    ] {
+        accepted(&format!("func main returns u64 {{ {body} }}"));
+    }
+    for body in [
+        "loop { break }",
+        "loop { if true { break } else { continue } }",
+        "loop { { break }; continue }",
+        "loop { let memory = core.region(32) else { break } }",
+        "loop { if true { break }; return 0 }",
+    ] {
+        let source = format!("func main returns u64 {{ {body} }}");
+        assert!(rejected(&source).message.contains("cannot fall through"));
+    }
+}
+
+/// A loop outside the callee and an earlier loop in the same block cannot receive a transfer.
+#[test]
+fn loop_transfers_require_a_lexically_enclosing_loop() {
+    for (prefix, body) in [
+        ("", "break"),
+        (
+            "",
+            "for index in core.range(0) { continue }; continue; return 0",
+        ),
+        (
+            "func stop returns bool { break; return true }",
+            "loop { stop() }",
+        ),
+    ] {
+        let source = format!("{prefix}\nfunc main returns u64 {{ {body} }}");
+        let error = rejected(&source);
+        assert!(error.message.contains("requires an enclosing loop"));
+        let keyword = if body.starts_with("for") {
+            "continue"
+        } else {
+            "break"
+        };
+        assert_eq!(&source[error.span.start..error.span.end], keyword);
+        assert_eq!(error.span.start, source.rfind(keyword).unwrap());
+    }
+}
+
 /// A second receive after the first lexical view ends is allowed, as is lending
 /// the exact dynamic extent to an ordinary readonly byte formal.
 #[test]
@@ -2059,4 +2290,37 @@ fn hosted_input_requires_writable_slot_and_entry() {
         "func invalid with noblock arg bytes Bytes as readonly reference returns u64 { let status = core.wait_input(); return status }\nfunc main returns u64 { return 0 }",
     );
     assert!(error.message.contains("unavailable"), "{}", error.message);
+}
+
+/// Field access and initialization preserve the boolean type and permissions.
+#[test]
+fn boolean_fields_reject_numeric_values_and_readonly_writes() {
+    let source = |initial: &str, access: &str, body: &str| {
+        format!(
+            "struct Row {{ enabled bool; count u64 }}\n\
+             func row returns Row {{ return Row {{ enabled: {initial}, count: 9 }} }}\n\
+             func main returns u64 {{\n\
+                 let memory = core.region(32) else {{ return 0 }}\n\
+                 let rows = core.batch(memory, Row)\n\
+                 let status = core.append(rows, row())\n\
+                 let item = core.borrow_{access}(rows, 0)\n\
+                 {body}\n\
+                 return 0\n\
+             }}"
+        )
+    };
+    for (initial, access, body, expected) in [
+        ("0", "readwrite", "", "requires a comparison or boolean"),
+        ("false", "readwrite", "item.enabled = 1", "expected a bool"),
+        ("false", "readonly", "item.enabled = true", "readonly"),
+        (
+            "false",
+            "readwrite",
+            "item.count = item.enabled",
+            "bool field",
+        ),
+    ] {
+        let error = rejected(&source(initial, access, body));
+        assert!(error.message.contains(expected), "{error:?}");
+    }
 }

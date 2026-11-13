@@ -129,7 +129,17 @@ func main
         }
         if need_read == 0 {
             core.print(result)
-            core.print(request.command)
+            // Map named commands to the replay protocol's numeric observations.
+            if request.command == Command.Get {
+                core.print(1)
+            } else {
+                if request.command == Command.Set {
+                    core.print(2)
+                } else {
+                    core.assert(request.command == Command.Unset)
+                    core.print(0)
+                }
+            }
             core.print(request.consumed)
             core.print(request.key_offset)
             core.print(request.key_length)

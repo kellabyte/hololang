@@ -1,7 +1,7 @@
 //! Source lowering for named and compiler-selected scoped aggregate destinations.
 //!
 //! Construction schedules the actuals behind destination capture and introduces
-//! a readonly record reference only in its success block. The checked IR owns
+//! a readonly or writable reference in its success block. The checked IR owns
 //! tail exclusivity, rollback and lifetime validation. The frontend allocates
 //! only compiler data for the ordered operands, arms and source mappings.
 
@@ -110,7 +110,7 @@ impl Lowerer {
         Ok(())
     }
 
-    /// Lower one typed constructor into the selected region and its scoped arms.
+    /// Lower one constructor into the selected region and its scoped arms.
     ///
     /// The written operands and arm bodies are borrowed syntax. The output gains
     /// one structured operation followed by arm span maps in verifier order.
@@ -171,12 +171,7 @@ impl Lowerer {
                     format!("unknown destination constructor `{producer}`"),
                 )
             })?;
-        let family = definition.error.clone().ok_or_else(|| {
-            Diagnostic::new(
-                call.span,
-                "core.construct requires a typed destination constructor",
-            )
-        })?;
+        let family = definition.error.clone();
         let record = definition.record.clone();
         arity(args, definition.params.len(), call.span)?;
         let parameters = definition.params.clone();
@@ -200,7 +195,7 @@ impl Lowerer {
         // runtime dispatch labels. Keep each arm's lexical names private.
         for arm in arms {
             self.charge(arm.span)?;
-            let (lowered_arm, spans) = self.construct_arm(arm, &record, &family)?;
+            let (lowered_arm, spans) = self.construct_arm(arm, &record, family.as_deref())?;
             lowered.push(lowered_arm);
             children.push(spans);
         }
@@ -224,26 +219,33 @@ impl Lowerer {
         &mut self,
         arm: &ast::ResultBlockArm,
         record: &str,
-        family: &str,
+        family: Option<&str>,
     ) -> Result<(ir::ConstructArm, Vec<Span>), Diagnostic> {
         self.scopes.push(Default::default());
         let item = (|| {
-            let mut reference = None;
             // Only success gains the destination reference. The failure side
             // either exposes one declared scalar payload or introduces no name.
+            let binding = match &arm.pattern {
+                ast::ResultPattern::Ok(Some(name)) => Some((name, ir::Access::Readonly)),
+                ast::ResultPattern::ReadwriteOk(name) => Some((name, ir::Access::Readwrite)),
+                _ => None,
+            };
+            let reference = if let Some((name, access)) = binding {
+                self.result_binding(
+                    name,
+                    Kind::Reference {
+                        record: record.to_owned(),
+                        access,
+                        mutable: false,
+                    },
+                    arm.span,
+                )?
+                .map(|name| ir::ConstructReference { name, access })
+            } else {
+                None
+            };
             let pattern = match &arm.pattern {
-                ast::ResultPattern::Ok(name) => {
-                    if let Some(name) = name {
-                        reference = self.result_binding(
-                            name,
-                            Kind::Reference {
-                                record: record.to_owned(),
-                                access: ir::Access::Readonly,
-                                mutable: false,
-                            },
-                            arm.span,
-                        )?;
-                    }
+                ast::ResultPattern::Ok(_) | ast::ResultPattern::ReadwriteOk(_) => {
                     ir::AppendPattern::Ok
                 }
                 ast::ResultPattern::Error {
@@ -265,6 +267,12 @@ impl Lowerer {
                     ));
                 }
                 ast::ResultPattern::Rejected { case, binding } => {
+                    let family = family.ok_or_else(|| {
+                        Diagnostic::new(
+                            arm.span,
+                            "a named construct rejection requires a typed constructor",
+                        )
+                    })?;
                     let (family, case, has_payload) = self.error_case(case, family, false)?;
                     let binding = self.payload_binding(
                         &family,

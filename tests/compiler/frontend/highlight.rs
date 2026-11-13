@@ -139,6 +139,24 @@ fn local_categories_are_useful_without_semantic_checking() {
 }
 
 #[test]
+fn bare_loop_transfers_are_contextual_keywords() {
+    assert_eq!(category("loop { break }", "break"), HighlightKind::Keyword);
+    assert_eq!(
+        category("{\ncontinue\n}", "continue"),
+        HighlightKind::Keyword
+    );
+    assert_eq!(category("{ break() }", "break"), HighlightKind::Function);
+    assert_eq!(
+        category("return continue", "continue"),
+        HighlightKind::Identifier
+    );
+    assert_eq!(
+        category("loop { continue = 1 }", "continue"),
+        HighlightKind::Identifier
+    );
+}
+
+#[test]
 fn boolean_operators_preserve_contextual_function_hints() {
     let source = "return not (ready and found) or false";
     for operator in ["not", "and", "or"] {
@@ -167,6 +185,11 @@ fn public_visibility_is_a_contextual_hint() {
         category("public struct Header", "public"),
         HighlightKind::Keyword
     );
+    let enumeration = "public enum Command { Get Set }";
+    assert_eq!(category(enumeration, "public"), HighlightKind::Keyword);
+    assert_eq!(category(enumeration, "enum"), HighlightKind::Keyword);
+    assert_eq!(category(enumeration, "Command"), HighlightKind::Type);
+    assert_eq!(category("enum(1)", "enum"), HighlightKind::Function);
     assert_eq!(
         category("public\nstruct Header", "public"),
         HighlightKind::Identifier

@@ -40,6 +40,15 @@ fn boolean_operators_format_without_changing_contextual_calls() {
     );
 }
 
+/// Bare loop transfers and calls with the same spelling retain their syntax.
+#[test]
+fn loop_transfers_format_within_their_blocks() {
+    assert_format(
+        "func main returns u64{loop{break();if true {continue};break};return 0}",
+        "func main\n    returns u64\n{\n    loop {\n        break();\n        if true {\n            continue\n        };\n        break\n    };\n    return 0\n}\n",
+    );
+}
+
 #[test]
 fn byte_strings_preserve_the_prefix_and_exact_spelling() {
     assert_format(
@@ -62,6 +71,15 @@ fn package_records_keep_visibility_and_source_order() {
         format("namespace telemetry.frame\nstruct Header { kind u64 }\nnamespace telemetry.other")
             .unwrap_err();
     assert!(late_header.message.contains("before library declarations"));
+}
+
+/// Keep enum visibility and case order, and format the qualified case use.
+#[test]
+fn package_enums_keep_visibility_and_case_order() {
+    assert_format(
+        "namespace telemetry.frame\npublic enum Command{Get,Set}\nfunc get returns bool{return Command . Get==Command.Set}",
+        "namespace telemetry.frame\npublic enum Command {\n    Get,\n    Set\n}\nfunc get\n    returns bool\n{\n    return Command.Get == Command.Set\n}\n",
+    );
 }
 
 /// Preserve every namespace component and the separator before declarations.
@@ -179,8 +197,8 @@ fn multiline_control_flow_and_lists_are_stable() {
 #[test]
 fn scoped_region_formats_with_its_recovery_and_construct_arms() {
     assert_format(
-        "func main returns u64{with core . region (32) {\n core.construct(open_ticket(1))\n  on ok(ticket) then {core.print(ticket.id)}\n  on error then {return 0}\n}else {with(1002)}\nreturn 0}",
-        "func main\n    returns u64\n{\n    with core.region(32) {\n        core.construct(open_ticket(1))\n            on ok(ticket) then {\n                core.print(ticket.id)\n            }\n            on error then {\n                return 0\n            }\n    } else {\n        with(1002)\n    }\n    return 0\n}\n",
+        "func main returns u64{with core . region (32) {\n core.construct(open_ticket(1))\n  on ok( readwrite ticket ) then {ticket.id=2}\n  on error then {return 0}\n}else {with(1002)}\nreturn 0}",
+        "func main\n    returns u64\n{\n    with core.region(32) {\n        core.construct(open_ticket(1))\n            on ok(readwrite ticket) then {\n                ticket.id = 2\n            }\n            on error then {\n                return 0\n            }\n    } else {\n        with(1002)\n    }\n    return 0\n}\n",
     );
 }
 

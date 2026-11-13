@@ -8,7 +8,7 @@
 
 use super::{MAX_NESTING, NameKind, Parser};
 use crate::frontend::ast::{BinaryOp, Expr, ExprKind, FieldInit, ResultArm, ResultPattern};
-use crate::lex::TokenKind;
+use crate::lex::{Token, TokenKind};
 use crate::source::{Diagnostic, Span};
 
 /// Comparisons bind tighter than negation, and conjunction binds more loosely.
@@ -179,7 +179,7 @@ impl Parser<'_> {
         let mut column = None;
         // Each arm consumes its pattern, separator, and body before seeking another.
         while let Some((start, pattern)) =
-            self.result_arm_header(subject.span.start, &mut column)?
+            self.result_arm_header(subject.span.start, &mut column, false)?
         {
             let value = self.expression(true)?;
             let span = Span {
@@ -218,6 +218,7 @@ impl Parser<'_> {
         &mut self,
         subject: usize,
         column: &mut Option<usize>,
+        construct: bool,
     ) -> Result<Option<(usize, ResultPattern)>, Diagnostic> {
         // Only lists pay for a line-prefix lookup. Subsequent arms share the established column.
         if !self.take_result_arm() {
@@ -246,7 +247,7 @@ impl Parser<'_> {
         // name distinguishes a construction rejection from an ordinary case
         // called Rejected followed by `then` or a binding.
         let pattern = if self.take_word("ok") {
-            ResultPattern::Ok(self.result_binding()?)
+            self.success_pattern(construct)?
         } else if self.take_word("error") {
             ResultPattern::Fallback(self.result_binding()?)
         } else if self.at_word("Rejected")
@@ -268,6 +269,31 @@ impl Parser<'_> {
         };
         self.expect_word("then")?;
         Ok(Some((arm.start, pattern)))
+    }
+
+    /// Parse a success payload or an explicit writable scoped record binding.
+    fn success_pattern(&mut self, construct: bool) -> Result<ResultPattern, Diagnostic> {
+        // An existing `ok(readwrite)` still binds the readonly name `readwrite`.
+        let writable = construct
+            && matches!(self.tokens.get(self.position..self.position + 3), Some([
+                Token { kind: TokenKind::Symbol('('), .. },
+                Token { kind: TokenKind::Ident(access), .. },
+                Token { kind: TokenKind::Ident(_), .. },
+            ]) if access == "readwrite");
+        if !writable {
+            return Ok(ResultPattern::Ok(self.result_binding()?));
+        }
+        self.expect_symbol('(')?;
+        self.expect_word("readwrite")?;
+        let (name, span) = self.declared_identifier(NameKind::Binding)?;
+        if name == "_" {
+            return Err(Diagnostic::new(
+                span,
+                "a readwrite construct arm requires a binding name",
+            ));
+        }
+        self.expect_symbol(')')?;
+        Ok(ResultPattern::ReadwriteOk(name))
     }
 
     /// Look past a real line boundary for a contextual arm introducer.
@@ -602,6 +628,7 @@ fn infix(kind: &TokenKind) -> Option<(BinaryOp, u8)> {
         TokenKind::Symbol('-') => (BinaryOp::Sub, 7),
         TokenKind::Symbol('*') => (BinaryOp::Mul, 8),
         TokenKind::Symbol('/') => (BinaryOp::Div, 8),
+        TokenKind::Symbol('%') => (BinaryOp::Rem, 8),
         _ => return None,
     })
 }
@@ -659,6 +686,7 @@ fn validate_shape(expression: &Expr) -> Result<(), Diagnostic> {
             | ExprKind::Bytes(_)
             | ExprKind::Bool(_)
             | ExprKind::Name(_)
+            | ExprKind::EnumRoot { .. }
             | ExprKind::ErrorFamilyRoot { .. } => {}
         }
     }

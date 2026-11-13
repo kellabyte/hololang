@@ -30,7 +30,7 @@ impl Lowerer {
         self.scopes.push(HashMap::new());
         self.ordinary_body = true;
         self.returns_bool = self.definitions.bools.contains(&function.name);
-        self.result_family = self.definitions.results.get(&function.name).cloned();
+        self.result = self.definitions.results.get(&function.name).cloned();
         let result = (|| {
             let kinds = self.definitions.ordinary[&function.name].clone();
             let mut params = Vec::with_capacity(kinds.len());
@@ -38,7 +38,7 @@ impl Lowerer {
             for (param, (argument, kind)) in function.args.iter().zip(kinds).enumerate() {
                 let binding = match &kind {
                     ir::FunctionParameterKind::U64 => Kind::Scalar { mutable: false },
-                    ir::FunctionParameterKind::Bool => Kind::Bool,
+                    ir::FunctionParameterKind::Bool => Kind::Bool { mutable: false },
                     ir::FunctionParameterKind::Bytes => Kind::InputBytes {
                         param,
                         access: ir::Access::Readonly,
@@ -65,7 +65,7 @@ impl Lowerer {
                 ir::Function {
                     name: function.name.clone(),
                     params,
-                    result: self.result_family.clone(),
+                    result: self.result.clone(),
                     returns_bool: self.returns_bool,
                     body: body.ops,
                 },
@@ -75,7 +75,7 @@ impl Lowerer {
         // Even a rejected body must leave no formal binding in another function.
         self.ordinary_body = false;
         self.returns_bool = false;
-        self.result_family = None;
+        self.result = None;
         self.scopes.pop();
         result
     }
@@ -95,8 +95,8 @@ impl Lowerer {
             ));
         }
         // A tagged result must be handled before a scalar payload can be read.
-        if let Some(family) = self.definitions.results.get(name) {
-            if family == super::functions::OPTION_FAMILY {
+        if let Some(result) = self.definitions.results.get(name) {
+            if result.family == super::functions::OPTION_FAMILY {
                 return Err(Diagnostic::new(
                     span,
                     "save the `Option<u64>` call with `let`, handle it with `on Some` and `on None`, or return it from an optional function",

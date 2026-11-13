@@ -35,6 +35,9 @@ at O0/O3 and under ASan for Wide, Derived64, and Compact32. Nested marker cleanu
 remains generated compiler behavior; the guards observe backing ownership only and
 perform no data-processing kernel.
 
+The same harness verifies that `break` and `continue` release the regions
+inside an iteration in reverse order while retaining its enclosing owner.
+
 ## Owner lifecycle and recovery
 
 [`owner_lifecycle.rs`](owner_lifecycle.rs) checks ten actual parsed-source paths against

@@ -7,7 +7,7 @@
 use super::ModelError;
 use super::layout::Encoding;
 use super::ordinary::Outcome;
-use super::value::Record;
+use super::value::{EnumValue, Record};
 use holo::ir::{Access, Op, Program};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -17,8 +17,10 @@ use std::sync::Arc;
 pub(super) enum Binding {
     /// An unsigned scalar, including copied status/address observations.
     Scalar(u64),
-    /// An immutable boolean value.
+    /// A boolean value, distinct from an unsigned scalar.
     Boolean(bool),
+    /// Enum local with its nominal case and mutability.
+    Enum { value: EnumValue, mutable: bool },
     /// A saved ordinary outcome, retaining its semantic alternative and payload.
     SavedResult(Outcome),
     /// An arm-local named error cannot supply a scalar or a storage reference.
@@ -130,6 +132,14 @@ pub(super) struct Batch {
     pub active: bool,
 }
 
+/// Transfer to the nearest active loop within this frame.
+pub(super) enum LoopTransfer {
+    /// End the loop.
+    Break,
+    /// Skip to the next iteration.
+    Continue,
+}
+
 /// All test-model state, including immutable input and independent owned values.
 pub(super) struct State<'a> {
     /// Shared input descriptions only; compiler checking/lowering is never called.
@@ -158,6 +168,8 @@ pub(super) struct State<'a> {
     pub ordinary_bytes: Vec<Option<ByteInput>>,
     /// Ordinary or typed return of the current function, if complete.
     pub returned: Option<Outcome>,
+    /// Pending transfer while structured bodies restore their lexical state.
+    pub loop_transfer: Option<LoopTransfer>,
 }
 
 impl<'a> State<'a> {
@@ -179,6 +191,7 @@ impl<'a> State<'a> {
             ordinary_result_family: None,
             ordinary_bytes: Vec::new(),
             returned: None,
+            loop_transfer: None,
         }
     }
 

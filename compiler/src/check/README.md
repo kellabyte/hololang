@@ -58,10 +58,15 @@ runtime ownership object. Multiple arguments can borrow the same compatible
 state. The checker uses root identities to prevent lifetime escape and assigns no
 alias attributes to those arguments.
 
-An ordinary boolean call or unsigned comparison can initialize an immutable
-boolean, supply a boolean return, or lend its value to a copied boolean formal.
-Conditions can test these values directly. Call actuals check in written order.
+An ordinary boolean call or unsigned comparison can initialize or update a
+boolean local, supply a boolean return, or pass its value to a copied boolean
+formal. Conditions can test these values directly. Call actuals check in written
+order.
 The checker keeps booleans separate from unsigned scalars and tagged results.
+Record fields declared `bool` check their initializers, reads, and writes
+as booleans. A field store requires a writable reference.
+Enum fields and locals retain their nominal type, including for equality and
+assignment. Their case values are distinct from numeric operands.
 Both operands of a short-circuit operation must check, and both contribute
 any ordinary call edges. Producer guards can compose pure scalar comparisons
 and literals under the same constructor observation rules.
@@ -86,8 +91,8 @@ Each included family's leaves occupy one exact block in declaration order.
 Within the block they preserve the child's tag order and payload shapes. The
 checker can derive a constant tag offset with no runtime type registry.
 
-A scalar-result helper returns a `u64` success, a declared error with its declared
-payload shape, or an exact-family forwarded result on every path. Immediate
+A result helper returns a `u64` or Unit success, a declared error with its declared
+payload shape, or a forwarded result of the exact declared type on every path. Immediate
 handlers evaluate one checked call and cover success plus every named or
 residual error. The iterative expression walk establishes arm-local payload
 scope, prevents error tags from entering scalar operations, and registers every
@@ -98,16 +103,17 @@ gets a fresh operation scope and the checker visits all arms in source order.
 of a live saved result. Both accept the same Result family or a declared direct
 child. Their success continuation introduces an immutable scalar and still
 requires a structurally valid return. Failure exits the owner-free ordinary
-frame with the caller's declared family.
+frame with the caller's declared family. A `try` statement propagates failure
+in the same way for a Unit result and introduces no local on success.
 
-`BindResult` checks a scalar `Result` or `Option<u64>` call and records its
-nominal family in a lexical, immutable binding. Its copied payload holds no
+`BindResult` checks a `Result` or `Option<u64>` call and records its
+result type in a lexical, immutable binding. Its copied payload holds no
 reference to the arguments. Both saved handler forms require the binding to
 be live and use its family for the same partition and payload checks as an
 immediate handler. Options require explicit `Some` and `None` arms.
 
 A typed destination producer uses the existing checked record schema and
-ordered `u64`, Bytes, and nested field operations. Its named rejection
+ordered `u64`, `bool`, Bytes, and nested field operations. Its named rejection
 prefixes precede its first field initializer and
 must provide the payload declared by its family. Typed nested producers accept
 the same family or a declared direct child. A child failure reaches the owning
@@ -121,11 +127,11 @@ named fallback is opaque, and the immutable handler result is introduced only
 after checking the arms.
 
 `ConstructHandled` verifies the same outcome partition for a typed direct
-producer. Its success body holds a region tail claim independent of source
-names and exposes at most one immutable readonly record reference. The same
-root-depth rules cover its aliases, byte projections, and attempted escape.
-All failure bodies run without that claim, so they can retry in the same
-region. The direct success name has no mutable reference slot.
+producer and requires a failure fallback for a plain record producer. Its
+success body holds a region tail claim and can bind a readonly or writable
+record reference. The root-depth rules cover its aliases, byte projections,
+and attempted escape. Failure bodies can retry in the same region. The
+direct success name has no mutable reference slot.
 
 A `Build::Forward` body must contain exactly that one operation. Checking
 resolves the named producer and requires the same nominal schema and error

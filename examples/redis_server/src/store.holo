@@ -9,8 +9,8 @@ using holo.bytes
 
 // One stable slot in the request handler's bounded table.
 public struct Slot {
-    // Zero denotes a free slot. A present empty value still has occupied set.
-    occupied u64
+    // A present empty value still occupies its slot.
+    occupied bool
     // Number of live bytes in the key field.
     key_length u64
     // Number of live bytes in the value field.
@@ -30,7 +30,7 @@ public func empty_slot
     returns Slot
 {
     return Slot {
-        occupied: 0,
+        occupied: false,
         key_length: 0,
         value_length: 0,
         key: core.bytes(key_capacity, 0),
@@ -51,7 +51,7 @@ public func find
     arg key Bytes as readonly reference
     returns Option<u64>
 {
-    return find_slot(entries, key, 0)
+    return find_slot(entries, key, false)
 }
 
 // Find a matching slot, or the first free slot when inserting. A full table
@@ -60,17 +60,17 @@ func find_slot
     with noalloc, noblock
     arg entries Batch<Slot> as readonly reference
     arg key Bytes as readonly reference
-    arg inserting u64 as readonly copy
+    arg inserting bool as readonly copy
     returns Option<u64>
 {
     var first_free = 0
-    var found_free = 0
+    var found_free = false
     var index = 0
     for readonly entry in entries {
-        if entry.occupied == 0 {
-            if found_free == 0 {
+        if not entry.occupied {
+            if not found_free {
                 first_free = index
-                found_free = 1
+                found_free = true
             }
         } else {
             if entry.key_length == core.len(key) {
@@ -81,10 +81,8 @@ func find_slot
         }
         index = core.add_wrapping(index, 1)
     }
-    if inserting == 1 {
-        if found_free == 1 {
-            return Some(first_free)
-        }
+    if inserting and found_free {
+        return Some(first_free)
     }
     return None
 }
@@ -99,7 +97,7 @@ public func put
     arg value Bytes as readonly reference
     returns Result<u64, PutError>
 {
-    find_slot(entries, key, 1)
+    find_slot(entries, key, true)
         on Some(index) then {
             let destination = core.borrow_readwrite(entries, index)
             if core.len(key) > core.len(destination.key) {
@@ -108,11 +106,11 @@ public func put
             if core.len(value) > core.len(destination.value) {
                 return error PutError.OverLimit
             }
-            if destination.occupied == 0 {
+            if not destination.occupied {
                 destination.key_length = bytes.move(destination.key, key)
             }
             destination.value_length = bytes.move(destination.value, value)
-            destination.occupied = 1
+            destination.occupied = true
             return ok index
         }
         on None then {

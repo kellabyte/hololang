@@ -67,5 +67,8 @@ pub fn run_with_layout(program: &Program, mode: LayoutMode) -> Result<Vec<u64>, 
     };
     let mut state = State::new(program, encoding);
     state.execute_ops(&program.body)?;
+    if state.loop_transfer.is_some() {
+        return Err(ModelError::new("loop transfer escaped model entry"));
+    }
     Ok(state.output)
 }

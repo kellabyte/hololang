@@ -99,7 +99,7 @@ fn direct_result_cost(outcome: &ResultValue, budget: &mut usize) -> Option<()> {
             payload: Some(value),
             ..
         } => direct_scalar_cost(value, budget),
-        ResultValue::Error { payload: None, .. } => Some(()),
+        ResultValue::OkUnit | ResultValue::Error { payload: None, .. } => Some(()),
         ResultValue::Call { .. } | ResultValue::Saved(_) => None,
     }
 }
@@ -112,7 +112,7 @@ fn direct_scalar_cost(value: &Expr, budget: &mut usize) -> Option<()> {
     *budget = budget.checked_sub(1)?;
     match value {
         Expr::Const(_) | Expr::Local(_) | Expr::Param(_) => Some(()),
-        Expr::Binary { left, right, .. } => {
+        Expr::Binary { op, left, right } if !op.is_checked() => {
             direct_scalar_cost(left, budget)?;
             direct_scalar_cost(right, budget)
         }
@@ -135,6 +135,7 @@ impl Lowering<'_> {
     /// The fresh dead continuation lets the structured emitter visit siblings.
     pub(super) fn return_result(&mut self, value: &ResultValue) {
         let result = match value {
+            ResultValue::OkUnit => "zeroinitializer".to_owned(),
             ResultValue::Ok(value) => {
                 let value = self.expression(value);
                 self.f.value(format!(
@@ -415,7 +416,7 @@ impl Lowering<'_> {
         let target = arms
             .iter()
             .position(|arm| match (&arm.pattern, outcome) {
-                (ResultPattern::Ok(_), ResultValue::Ok(_))
+                (ResultPattern::Ok(_), ResultValue::Ok(_) | ResultValue::OkUnit)
                 | (ResultPattern::Fallback(_), ResultValue::Error { .. }) => true,
                 (
                     ResultPattern::Error { family, case, .. },
@@ -434,7 +435,7 @@ impl Lowering<'_> {
                 payload: Some(value),
                 ..
             } => Some(self.expression(value)),
-            ResultValue::Error { payload: None, .. } => None,
+            ResultValue::OkUnit | ResultValue::Error { payload: None, .. } => None,
             ResultValue::Call { .. } | ResultValue::Saved(_) => {
                 unreachable!("forwarded results use the tagged path")
             }
@@ -464,22 +465,27 @@ impl Lowering<'_> {
         self.f.value(format!("phi i64 {}", incoming.join(", ")))
     }
 
-    /// Evaluate the actuals and call once. Bind success or return its typed failure.
+    /// Evaluate the actuals and call once, returning on failure and optionally binding success.
     /// The checker establishes the family relation and rules out active cleanup.
     /// Success uses an immutable SSA value, and a child lift replaces only the
     /// failure tag. Neither operation needs a separate return slot.
-    pub(super) fn try_binding(&mut self, name: &str, function: &str, args: &[FunctionArgument]) {
+    pub(super) fn try_binding(
+        &mut self,
+        name: Option<&str>,
+        function: &str,
+        args: &[FunctionArgument],
+    ) {
         let (index, callee) = self.ordinary_definition(function);
         let source = callee
             .result
-            .as_deref()
+            .as_ref()
             .expect("checked try calls a result function");
         let result = self.ordinary_call_resolved(index, callee, args);
-        self.try_result(name, source, &result);
+        self.try_result(name, &source.family, &result);
     }
 
     /// Propagate the captured tag and payload of a checked lexical result.
-    pub(super) fn try_saved_binding(&mut self, name: &str, source: &str) {
+    pub(super) fn try_saved_binding(&mut self, name: Option<&str>, source: &str) {
         let Binding::SavedResult { value, family } = self.binding(source) else {
             unreachable!("checked try operand is a saved result");
         };
@@ -487,7 +493,7 @@ impl Lowering<'_> {
     }
 
     /// Split success from failure and apply a checked child lift when needed.
-    fn try_result(&mut self, name: &str, source: &str, result: &str) {
+    fn try_result(&mut self, name: Option<&str>, source: &str, result: &str) {
         let target = self
             .result_family
             .expect("checked try returns a typed result");
@@ -513,10 +519,12 @@ impl Lowering<'_> {
         let failed = adjusted.as_deref().unwrap_or(result);
         self.f.line(format!("ret {RESULT_TYPE} {failed}"));
         self.f.label(&success);
-        let value = self
-            .f
-            .value(format!("extractvalue {RESULT_TYPE} {result}, 0"));
-        self.bind(name, Binding::ScalarValue(value));
+        if let Some(name) = name {
+            let value = self
+                .f
+                .value(format!("extractvalue {RESULT_TYPE} {result}, 0"));
+            self.bind(name, Binding::ScalarValue(value));
+        }
     }
 
     /// Look up a checked nominal family by name for private tag assignment.

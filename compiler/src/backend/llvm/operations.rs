@@ -86,7 +86,7 @@ impl Lowering<'_> {
         // Each arm lowers a distinct typed operation without weakening checks.
         match operation {
             // Declarations are emitted as separate definitions, never entry instructions.
-            Op::Function(_) | Op::ErrorFamily(_) => {}
+            Op::Function(_) | Op::ErrorFamily(_) | Op::Enum(_) => {}
             Op::TcpScope { body, .. } => self.tcp_scope(body),
             // The checker resolves the sole live owner. Named waits use its
             // selected readiness queue; sends and receives keep their range path.
@@ -107,6 +107,8 @@ impl Lowering<'_> {
             Op::WaitOutput { result } => self.wait_output(result),
             Op::NextSession { result } => self.next_session(result),
             Op::Loop(body) => self.repeat_forever(body),
+            Op::Break => self.loop_transfer(true),
+            Op::Continue => self.loop_transfer(false),
             Op::Region {
                 name,
                 capacity,
@@ -139,6 +141,28 @@ impl Lowering<'_> {
                 let value = self.boolean(value);
                 self.bind(name, Binding::Boolean(value));
             }
+            Op::VarBool { name, value } => {
+                let value = self.boolean(value);
+                let slot = self.f.slot("i1");
+                self.f.line(format!("store i1 {value}, ptr {slot}"));
+                self.bind(name, Binding::BooleanSlot(slot));
+            }
+            Op::LetEnum {
+                name,
+                value,
+                mutable,
+            } => {
+                let value = self.enumeration(value);
+                let binding = if *mutable {
+                    let slot = self.f.slot("i8");
+                    self.f
+                        .line(format!("store i8 {value}, ptr {slot}, align 1"));
+                    Binding::EnumSlot(slot)
+                } else {
+                    Binding::Enum(value)
+                };
+                self.bind(name, binding);
+            }
             Op::BindBytes {
                 name,
                 source,
@@ -154,15 +178,22 @@ impl Lowering<'_> {
                 name,
                 function,
                 args,
-            } => self.try_binding(name, function, args),
-            Op::TrySaved { name, source } => self.try_saved_binding(name, source),
+            } => self.try_binding(Some(name), function, args),
+            Op::TrySaved { name, source } => self.try_saved_binding(Some(name), source),
+            Op::TryUnit { function, args } => self.try_binding(None, function, args),
+            Op::TrySavedUnit { source } => self.try_saved_binding(None, source),
             Op::BindResult {
                 name,
                 function,
                 args,
             } => {
                 let (index, callee) = self.ordinary_definition(function);
-                let family = callee.result.clone().expect("checked saved result family");
+                let family = callee
+                    .result
+                    .as_ref()
+                    .expect("checked saved result family")
+                    .family
+                    .clone();
                 let value = self.ordinary_call_resolved(index, callee, args);
                 self.bind(name, Binding::SavedResult { value, family });
             }
@@ -180,6 +211,21 @@ impl Lowering<'_> {
                     Binding::Scalar(slot) => self.f.line(format!("store i64 {value}, ptr {slot}")),
                     _ => panic!("checked assignment target is not scalar: {name}"),
                 }
+            }
+            Op::SetBool { name, value } => {
+                let value = self.boolean(value);
+                let Binding::BooleanSlot(slot) = self.binding(name) else {
+                    unreachable!("checked boolean assignment target: {name}");
+                };
+                self.f.line(format!("store i1 {value}, ptr {slot}"));
+            }
+            Op::SetEnum { name, value } => {
+                let value = self.enumeration(value);
+                let Binding::EnumSlot(slot) = self.binding(name) else {
+                    unreachable!("checked enum assignment target: {name}");
+                };
+                self.f
+                    .line(format!("store i8 {value}, ptr {slot}, align 1"));
             }
             Op::Append {
                 batch,
@@ -265,6 +311,25 @@ impl Lowering<'_> {
                 let pointer = self.field_pointer(reference, path);
                 let value = self.expression(value);
                 storage::store_u64(&mut self.f, &pointer, &value);
+            }
+            Op::WriteBool {
+                reference,
+                path,
+                value,
+            } => {
+                let pointer = self.field_pointer(reference, path);
+                let value = self.boolean(value);
+                storage::store_bool(&mut self.f, &pointer, &value);
+            }
+            Op::WriteEnum {
+                reference,
+                path,
+                value,
+            } => {
+                let pointer = self.field_pointer(reference, path);
+                let value = self.enumeration(value);
+                self.f
+                    .line(format!("store i8 {value}, ptr {pointer}, align 1"));
             }
             Op::WriteByte {
                 reference,

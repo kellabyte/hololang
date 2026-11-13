@@ -39,12 +39,22 @@ enum Kind {
     },
     /// Immutable boolean decision retained in the handler's zero-or-one lane.
     HandledBool,
-    /// Immutable boolean with a distinct checked local type.
-    Bool,
+    /// Boolean with a distinct checked local type.
+    Bool {
+        /// Whether assignment is permitted.
+        mutable: bool,
+    },
+    /// An enum value copied by its nominal type.
+    Enum {
+        /// Declared enum identity.
+        kind: String,
+        /// Whether assignment is permitted.
+        mutable: bool,
+    },
     /// Arm-local failure value. The scalar slice cannot coerce it to an integer.
     Error,
     /// Immutable copied tag and payload retaining its nominal outcome identity.
-    SavedResult(String),
+    SavedResult(ir::FunctionResult),
     /// Call-local byte view carrying the captured formal extent and permission.
     InputBytes {
         /// Index in the complete ordinary parameter list.
@@ -145,8 +155,8 @@ struct Lowerer {
     ordinary_body: bool,
     /// Whether the current ordinary body returns a boolean.
     returns_bool: bool,
-    /// Checked result identity of the current ordinary body, if tagged.
-    result_family: Option<String>,
+    /// Checked result type of the current ordinary body, if tagged.
+    result: Option<ir::FunctionResult>,
     /// Typed actual evaluation is contained in its expression until the call runs.
     deferred_actual: bool,
     /// Lexically selected owner and site, independent of explicit IR owner tails.
@@ -219,7 +229,7 @@ fn lower_bodies(
         depth: 0,
         ordinary_body: false,
         returns_bool: false,
-        result_family: None,
+        result: None,
         deferred_actual: false,
         placement: main
             .map(construction::source_placement)
@@ -227,6 +237,20 @@ fn lower_bodies(
             .flatten(),
     };
     let mut body = Block::default();
+    for declaration in &module.enums {
+        body.push(
+            ir::Op::Enum(ir::EnumDef {
+                name: declaration.name.clone(),
+                variants: declaration
+                    .variants
+                    .iter()
+                    .map(|(variant, _)| variant.clone())
+                    .collect(),
+            }),
+            declaration.span,
+            [],
+        );
+    }
     let mut function_spans = HashMap::new();
     // Keep case ordinals in source order. Declarations are compiler metadata only.
     for declaration in &module.errors {
@@ -295,18 +319,17 @@ fn lower_bodies(
     })
 }
 
-/// Conservatively determine whether a lexical block can fall through.
-///
-/// `body` is one lexical source block. Region declarations consume the remaining
-/// success tail; their recovery must independently terminate to make this whole
-/// block terminating. A reverse fold avoids recursion proportional to a flat
-/// sequence of owner declarations. Explicit nested scopes still recurse under
-/// the parser's nesting bound. This checks entry fallthrough; it does not prove
-/// a hosted loop ever reaches a return.
+/// Check whether the function has any path that falls through its final statement.
 fn terminates(body: &[ast::Statement]) -> bool {
-    let mut following = false;
-    // following describes the already-visited suffix. Ordinary fallthrough may
-    // use that suffix; a failed owner skips its success suffix entirely.
+    // An invalid transfer outside any loop has no continuation. Lowering retains
+    // it so the verifier can report the exact statement that needs a loop.
+    block_terminates(body, false, true)
+}
+
+/// Follow normal and loop-exit continuations to check a lexical block's paths.
+/// A reverse fold avoids recursion for a flat sequence of owner declarations.
+fn block_terminates(body: &[ast::Statement], at_end: bool, on_break: bool) -> bool {
+    let mut following = at_end;
     for statement in body.iter().rev() {
         following = match &statement.kind {
             ast::StatementKind::Let {
@@ -314,39 +337,43 @@ fn terminates(body: &[ast::Statement]) -> bool {
                 otherwise: Some(recovery),
                 ..
             } if core_call(value).is_some_and(|(operation, _)| operation == "region") => {
-                // Both owner outcomes must end entry. A handler that falls
-                // through is legal in an inner block with a later outer return,
-                // but cannot borrow a return inside this owner's success tail.
-                following && terminates(recovery)
+                // A failed owner bypasses its successful tail in this block.
+                following && block_terminates(recovery, at_end, on_break)
             }
-            // An earlier unconditional exit makes the later suffix unreachable.
-            ast::StatementKind::Return(_) => true,
-            // The unconditional loop has no break or path to its following suffix.
-            ast::StatementKind::Loop(_) => true,
-            // A terminating scope or both terminating branches end entry;
-            // otherwise any fallthrough still reaches the following suffix.
+            ast::StatementKind::Return(_) | ast::StatementKind::Continue => true,
+            ast::StatementKind::Break => on_break,
+            // Reaching the loop body end starts a new iteration. Only a break
+            // targeting this loop can reach the following statements.
+            ast::StatementKind::Loop(body) => block_terminates(body, true, following),
             ast::StatementKind::Scope(body) | ast::StatementKind::TcpScope { body, .. } => {
-                terminates(body) || following
+                block_terminates(body, following, on_break)
             }
             ast::StatementKind::If {
                 then_body,
                 else_body,
                 ..
-            } => (terminates(then_body) && terminates(else_body)) || following,
+            } => {
+                block_terminates(then_body, following, on_break)
+                    && block_terminates(else_body, following, on_break)
+            }
             ast::StatementKind::Refill {
                 data_body,
                 other_body,
                 ..
-            } => (terminates(data_body) && terminates(other_body)) || following,
+            } => {
+                block_terminates(data_body, following, on_break)
+                    && block_terminates(other_body, following, on_break)
+            }
             ast::StatementKind::WithRegion {
                 body, on_failure, ..
-            } => (terminates(body) && terminates(on_failure)) || following,
-            // The verifier checks coverage. Falling-through arms can terminate
-            // through the suffix after their handler.
-            ast::StatementKind::Construct { arms, .. }
-            | ast::StatementKind::HandleResult { arms, .. } => {
-                arms.iter().all(|arm| terminates(&arm.body)) || following
+            } => {
+                block_terminates(body, following, on_break)
+                    && block_terminates(on_failure, following, on_break)
             }
+            ast::StatementKind::Construct { arms, .. }
+            | ast::StatementKind::HandleResult { arms, .. } => arms
+                .iter()
+                .all(|arm| block_terminates(&arm.body, following, on_break)),
             // Counted loops can run zero times. Nonowner declarations and ordinary
             // operations do not supply an entry exit. Missing recovery gets its
             // specific declaration diagnostic during lowering, never acceptance.

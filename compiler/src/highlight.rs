@@ -142,7 +142,7 @@ impl Iterator for Highlighter<'_> {
             | LexemeKind::NotEqual
             | LexemeKind::LessEqual
             | LexemeKind::GreaterEqual
-            | LexemeKind::Symbol('=' | '<' | '>' | '+' | '-' | '*' | '/' | '&' | '^') => {
+            | LexemeKind::Symbol('=' | '<' | '>' | '+' | '-' | '*' | '/' | '%' | '&' | '^') => {
                 HighlightKind::Operator
             }
             LexemeKind::Symbol(_) => HighlightKind::Punctuation,
@@ -177,6 +177,11 @@ impl Highlighter<'_> {
         }
         let mut following_tokens = self.scanner.clone().filter(|lexeme| !trivia(lexeme.kind));
         let following = following_tokens.next();
+        if matches!(previous, Some((LexemeKind::Identifier, "enum")))
+            && following.is_some_and(|next| next.kind == LexemeKind::Symbol('{'))
+        {
+            return HighlightKind::Type;
+        }
         let call = matches!(
             following.map(|lexeme| lexeme.kind),
             Some(LexemeKind::Symbol('('))
@@ -201,14 +206,14 @@ impl Highlighter<'_> {
             | "readwrite" | "copy" | "reference" | "let" | "var" | "if" | "else" | "for" | "in" => {
                 HighlightKind::Keyword
             }
-            // A modifier belongs to a same-line function, record, or error declaration.
+            // A modifier belongs to a same-line declaration.
             // In other contexts `public` can still be an ordinary identifier.
             "public"
                 if following.is_some_and(|next| {
                     next.kind == LexemeKind::Identifier
                         && matches!(
                             &self.source[next.span.start..next.span.end],
-                            "func" | "struct" | "error"
+                            "func" | "struct" | "enum" | "error"
                         )
                         && !self.source[span.end..next.span.start].contains('\n')
                 }) =>
@@ -256,6 +261,14 @@ impl Highlighter<'_> {
             {
                 HighlightKind::Keyword
             }
+            "enum"
+                if following.is_some_and(|next| next.kind == LexemeKind::Identifier)
+                    && following_tokens
+                        .next()
+                        .is_some_and(|next| next.kind == LexemeKind::Symbol('{')) =>
+            {
+                HighlightKind::Keyword
+            }
             // Match contextual return/arm spellings and the two-token shape
             // of an error declaration, leaving an ordinary `error()` call alone.
             "error"
@@ -270,6 +283,17 @@ impl Highlighter<'_> {
             }
             // Hosted control words are contextual; existing calls can use them as names.
             "loop" | "refill" if !call => HighlightKind::Keyword,
+            "break" | "continue"
+                if self.previous.is_none_or(|(kind, before)| {
+                    matches!(kind, LexemeKind::Symbol('{' | '}' | ';'))
+                        || self.source[before.end..span.start].contains('\n')
+                }) && following.is_none_or(|next| {
+                    matches!(next.kind, LexemeKind::Symbol(';' | '}'))
+                        || self.source[span.end..next.span.start].contains('\n')
+                }) =>
+            {
+                HighlightKind::Keyword
+            }
             // A word between operands is an infix operator. Preserve the
             // spelling as a function or name when it starts an operand.
             "and" | "or"

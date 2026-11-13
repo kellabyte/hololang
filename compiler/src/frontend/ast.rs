@@ -11,10 +11,23 @@ use crate::source::Span;
 pub struct Module {
     /// Logical record declarations in source order.
     pub records: Vec<RecordDecl>,
+    /// Payload-free enum declarations in source order.
+    pub enums: Vec<EnumDecl>,
     /// Nominal error families in source order.
     pub errors: Vec<ErrorDecl>,
     /// Function declarations in source order, including the entry point.
     pub functions: Vec<Function>,
+}
+
+/// A payload-free enum and its variants in declaration order.
+#[derive(Clone, Debug)]
+pub struct EnumDecl {
+    /// Type name in the declaring namespace.
+    pub name: String,
+    /// Variant names with their source spans.
+    pub variants: Vec<(String, Span)>,
+    /// Full declaration range.
+    pub span: Span,
 }
 
 /// An unresolved nominal error declaration; source identities precede any tag encoding.
@@ -57,7 +70,7 @@ pub struct RecordDecl {
 pub struct FieldDecl {
     /// Field identity within the record.
     pub name: String,
-    /// Identifier naming u64, Bytes, or another declared record.
+    /// Identifier naming u64, bool, Bytes, or another declared record.
     pub ty: String,
     /// Source range for diagnostics.
     pub span: Span,
@@ -171,6 +184,10 @@ pub enum StatementKind {
     },
     /// Hosted entry loop with a fresh lexical scope per iteration.
     Loop(Vec<Statement>),
+    /// Exit the innermost loop.
+    Break,
+    /// Advance the innermost loop to its next iteration.
+    Continue,
     /// Single hosted input attempt with disjoint outcome bindings.
     Refill {
         /// Existing readwrite byte field.
@@ -237,6 +254,13 @@ pub enum ExprKind {
     },
     /// Lexical or declared name.
     Name(String),
+    /// A namespace-local enum name that can still be shadowed by a lexical binding.
+    EnumRoot {
+        /// Written name, used for lexical lookup before choosing the enum.
+        name: String,
+        /// Checked nominal name of the type.
+        nominal: String,
+    },
     /// Namespace-local family spelling in a bound error case path.
     ErrorFamilyRoot {
         /// Written root, which can also name an alias of the expected family.
@@ -332,6 +356,8 @@ pub struct ResultBlockArm {
 pub enum ResultPattern {
     /// Successful result, optionally binding its payload; `_` explicitly ignores it.
     Ok(Option<String>),
+    /// Successful scoped construction with an explicitly writable record binding.
+    ReadwriteOk(String),
     /// A named error case, with optional qualification and payload binding.
     Error {
         /// Written case path.
@@ -361,7 +387,7 @@ pub struct FieldInit {
     pub span: Span,
 }
 
-/// Parsed infix operators; presence here does not choose source arithmetic policy.
+/// Parsed infix operators; lowering selects the checked operation for each operand type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BinaryOp {
     /// Short-circuit boolean disjunction.
@@ -380,14 +406,16 @@ pub enum BinaryOp {
     Gt,
     /// Unsigned greater-than-or-equal.
     Ge,
-    /// Addition, whose default overflow behavior is not selected here.
+    /// Addition.
     Add,
-    /// Subtraction, whose default overflow behavior is not selected here.
+    /// Subtraction.
     Sub,
-    /// Multiplication, whose default overflow behavior is not selected here.
+    /// Multiplication.
     Mul,
-    /// Division, not yet supported by the initial source adapter.
+    /// Division.
     Div,
+    /// Remainder.
+    Rem,
     /// Bitwise conjunction.
     And,
     /// Bitwise exclusive-or.

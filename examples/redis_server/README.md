@@ -43,8 +43,8 @@ These commands return `OK`, `Holo`, and a nil reply, respectively.
 
 The Holo entry parses one command at a time from a 512-byte pending buffer.
 It handles the parser's named outcomes directly and reads again when the
-current command needs more data. A complete request records its consumed
-extent and the offsets of its key and value.
+current command needs more data. A complete request records its `Command`
+case, consumed extent, and the offsets of its key and value.
 The input buffer can be reused after `SET` copies into a fixed slot.
 Overwrites reuse the selected slot. Each send attempt uses a readonly view of
 the finished reply and starts at the number of bytes already sent. The output
@@ -52,7 +52,8 @@ slot stays live until the reply is complete or the session ends.
 
 The entry requests 1,024 bytes for input and output buffers, 16 for the byte
 writer cursor, 64 for the request record, and 4,096 for the table. These are
-logical backing capacities.
+logical backing capacities. The writer cursor and request metadata are
+constructed directly as writable records and reused for each request.
 `holo.buffer` compacts unread bytes before a refill when necessary. Each refill
 writes directly into a writable view of the pending buffer's free tail and
 advances its live length by the received count. A successful `SET`

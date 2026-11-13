@@ -279,6 +279,31 @@ fn literal(
                 field: field.name.clone(),
                 value: scalar::expression(lowerer, &field.value, context, 0)?,
             },
+            "bool" => ir::Build::Bool {
+                field: field.name.clone(),
+                value: scalar::boolean(lowerer, &field.value, context)?,
+            },
+            kind if lowerer.enums.contains_key(kind) => {
+                let Some((written, actual, variant)) =
+                    super::enum_member(&field.value, lowerer.enums)
+                else {
+                    return Err(Diagnostic::new(
+                        field.value.span,
+                        format!("expected a qualified `{kind}` variant"),
+                    ));
+                };
+                // A copied producer argument shadows the unqualified type spelling.
+                if context.params.contains_key(written) || actual != kind {
+                    return Err(Diagnostic::new(
+                        field.value.span,
+                        format!("expected a qualified `{kind}` variant"),
+                    ));
+                }
+                ir::Build::Enum {
+                    field: field.name.clone(),
+                    value: super::enum_constant(lowerer.enums, kind, variant, field.value.span)?,
+                }
+            }
             // Typed and numeric producers share ordered byte reservations and
             // checked reads from their explicitly captured readonly inputs.
             "Bytes" => bytes(lowerer, field, context)?,

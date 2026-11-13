@@ -24,7 +24,7 @@ pub(super) fn lower(
         if records.contains(&declaration.name)
             || matches!(
                 declaration.name.as_str(),
-                "u64" | "bool" | "Bytes" | "Result"
+                "u64" | "bool" | "Bytes" | "Result" | "Unit"
             )
             || declarations
                 .insert(declaration.name.as_str(), declaration)

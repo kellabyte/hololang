@@ -77,6 +77,8 @@ impl<'a> Inventory<'a> {
                 operation => operation,
             };
             let (binding, children): (Option<&str>, &[&[Op]]) = match operation {
+                // The cursor induction assumes that every iteration reaches its updates.
+                Op::Break | Op::Continue => return false,
                 Op::Let { name, value } => {
                     self.declarations.insert(name, value);
                     self.locations.insert(name, (block, offset));
@@ -118,7 +120,9 @@ impl<'a> Inventory<'a> {
                         let local = match &arm.pattern {
                             AppendPattern::Rejected { binding, .. } => binding.as_deref(),
                             AppendPattern::Fallback(binding) => binding.as_deref(),
-                            AppendPattern::Ok => arm.reference.as_deref(),
+                            AppendPattern::Ok => {
+                                arm.reference.as_ref().map(|binding| binding.name.as_str())
+                            }
                             AppendPattern::Full | AppendPattern::SizeOverflow => None,
                         };
                         if local.is_some_and(|name| !self.names.insert(name))
@@ -162,6 +166,8 @@ impl<'a> Inventory<'a> {
                 Op::Borrow { name, .. }
                 | Op::Alias { name, .. }
                 | Op::LetBool { name, .. }
+                | Op::VarBool { name, .. }
+                | Op::LetEnum { name, .. }
                 | Op::TryLet { name, .. }
                 | Op::TrySaved { name, .. }
                 | Op::BindResult { name, .. }

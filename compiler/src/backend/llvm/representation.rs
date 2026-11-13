@@ -40,6 +40,9 @@ pub(super) fn size(module: &Module<'_>, index: usize) -> String {
     for field in &record.fields {
         pointer = match &field.kind {
             FieldKind::U64 => storage::advance(&mut lowering.f, &pointer, "8"),
+            FieldKind::Bool | FieldKind::Enum(_) => {
+                storage::advance(&mut lowering.f, &pointer, "1")
+            }
             FieldKind::Bytes => {
                 let length = lowering.byte_length(&pointer);
                 let contents = storage::advance(

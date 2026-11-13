@@ -14,19 +14,20 @@ producers, pure scalar templates, and typed signatures for ordinary borrowed
 functions. Error declarations share the type namespace with records. The
 resolver rejects ambiguous and cyclic unions, preserves leaf order and payloads,
 and budgets the generated paths. Each case can carry one `u64` field.
-Fallible scalar headers retain their family for the parent frontend,
-which lowers entry and ordinary bodies. `Option<u64>` uses a private family
-identity for its absent tag. Typed destination constructors keep
+Ordinary fallible headers retain their success kind and family for the parent
+frontend, which lowers entry and ordinary bodies. `Option<u64>` uses a private
+family identity for its absent tag. Typed destination constructors keep
 their schema and family together in the producer definition. The checked IR
 verifier remains required before LLVM lowering. These modules do not depend on
 legacy code, allocate generated-program heap objects,
 or choose default source arithmetic semantics.
 
-An ordinary `u64`, `bool`, `Option<u64>`, or `Result<u64, E>` header can declare
-`Batch<Record>` as a readonly or readwrite reference and fixed scalar record
-state as a readwrite reference. Package binding resolves the schemas before
-definition checking. The signature carries the nominal schema and access mode
-for argument and element checks in the ordinary call graph.
+An ordinary `u64`, `bool`, `Option<u64>`, `Result<u64, E>`, or `Result<Unit, E>`
+header can declare `Batch<Record>` as a readonly or readwrite reference and
+fixed scalar record state as a readwrite reference. Package binding resolves
+the schemas before definition checking. The signature carries the nominal
+schema and access mode for argument and element checks in the ordinary call
+graph.
 
 `returns bool` selects the ordinary path even for helpers with only copied
 arguments. The signature records the boolean return type so entry and ordinary
@@ -40,13 +41,15 @@ accept `Bytes as readonly reference`; their `core.len(input)` and `input[index]`
 expressions read only the explicit borrowed input. Scalar helpers have one
 pure return. A numeric literal constructor has optional `core.reject_if`
 prefixes and one fresh literal. Fields must appear in declaration order.
+Boolean field initializers use the checked producer expression rules.
+Enum field initializers use a qualified case of the declared field type.
 Explicit `core.bytes` expressions initialize payload bytes, narrowing values
 to their low eight bits. `core.index()` exists only in the element expression.
 Returning an existing local
 aggregate, arbitrary reference inputs, writable byte parameters, mutation, and
 general function bodies remain outside these producer categories. Ordinary borrowed
 functions may mutate their explicitly passed fixed state or writable byte
-views, including when returning a typed scalar result. They cannot enter a
+views, including when returning a typed result. They cannot enter a
 producer or a pure scalar template. Owned byte output always uses explicit `core.bytes`;
 direct field forwarding does not silently copy existing payloads.
 

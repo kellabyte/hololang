@@ -7,15 +7,26 @@ conventions may change during the preview.
 
 - The compiler checks lexical lifetimes for bounded regions, batch elements,
   and borrowed byte views. Destination construction writes records directly
-  into a receiving slot and publishes successful records.
+  into a receiving slot and publishes successful records. A single scoped
+  record can be bound with writable access inside its success arm.
+- `break` and `continue` transfer to the innermost loop and run cleanup for
+  the scopes they leave.
+- Enums name states stored in locals and record fields. Redis uses
+  `Command.Get` and `Command.Set` for parsed requests.
+- The `u64` operators `+`, `-`, `*`, `/`, and `%` trap on overflow,
+  underflow, or division by zero. Explicit wrapping operations are available
+  for code that needs modulo arithmetic.
 - Local manifest packages resolve source namespaces and lock dependency
   versions and content. The `holo` CLI also provides syntax highlighting,
   formatting, diagnostics, and LLVM and layout inspection.
 - Typed `Result` values support recoverable errors and explicit propagation.
+  `Result<Unit, E>` lets socket helpers report success with `return ok`.
   Save an `Option<u64>` lookup result in a local binding and handle it later.
-  Ordinary helpers can take and return `bool` values. The standard library
-  includes bounded byte search, integer readers, byte writer cursors, decimal
-  parsing and writing, buffer operations, and socket helpers.
+  Ordinary helpers can take and return `bool` values. Booleans can be stored
+  in mutable locals and record fields, including Redis's slot occupancy flag.
+  The standard library includes bounded byte search, integer readers, byte
+  writer cursors, decimal parsing and writing, buffer operations, and socket
+  helpers.
   [Standard library](../../lib/holo/README.md)
 - The Redis example handles plain `GET` and `SET` over RESP2. It listens on
   IPv4 loopback, serves one client at a time, and keeps up to 16 binary keys

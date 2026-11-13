@@ -138,6 +138,7 @@ pub fn parse_experimental_project<'a>(
                 qualified,
                 public,
                 public_records: RecordNames::new(),
+                public_enums: RecordNames::new(),
                 public_errors: ErrorNames::new(),
             },
         ));
@@ -171,6 +172,9 @@ fn bind_entry(
     // Record names share the file with import qualifiers and must be unambiguous.
     for record in &module.records {
         scope.binding(&record.name, record.span)?;
+    }
+    for declaration in &module.enums {
+        scope.binding(&declaration.name, declaration.span)?;
     }
     // Error names occupy the same source type position as records.
     for error in &mut module.errors {
@@ -285,6 +289,8 @@ struct Interface {
     public: Members,
     /// Public records visible in a package application's batch declarations.
     public_records: RecordNames,
+    /// Public enum types and the nominal identities of their variants.
+    public_enums: RecordNames,
     /// Public error families available to qualified patterns and union declarations.
     public_errors: ErrorNames,
 }
@@ -306,6 +312,7 @@ fn check_library_function(
             (success, Some(family))
         });
     let supported_result = (matches!(success, "u64" | SCALAR_OPTION)
+        || (success == "Unit" && family.is_some())
         || (success == "bool" && family.is_none())
         || records.is_some_and(|records| records.contains_key(success)))
         && family.is_none_or(|family| errors.is_some_and(|errors| errors.contains_key(family)));
@@ -323,7 +330,7 @@ fn check_library_function(
         })
     {
         let requirement = if records.is_some() {
-            "a package library requires non-entry functions with u64, bool, Option<u64>, a namespace-local struct, or Result<u64, E> or Result<Record, E> with a namespace-local error family, and u64, bool, Bytes, Batch<Record>, or writable fixed record state arguments"
+            "a package library requires non-entry functions with u64, bool, Option<u64>, a namespace-local struct, or Result with u64, Unit, or record success and a namespace-local error family, and u64, bool, Bytes, Batch<Record>, or writable fixed record state arguments"
         } else {
             "a leaf library requires non-entry functions with u64, bool, or Option<u64> results and u64, bool, or Bytes arguments"
         };
@@ -364,6 +371,7 @@ fn bind_library(
         local: &local,
         imports: None,
         records: None,
+        enums: None,
         errors: None,
     };
     // Rewrite references before replacing declaration identities.
@@ -398,6 +406,8 @@ enum Scope<'a> {
         imports: Option<&'a Imports<'a>>,
         /// Namespace-local schemas, absent for an isolated legacy leaf.
         records: Option<&'a RecordNames>,
+        /// Namespace-local enum types, absent for an isolated legacy leaf.
+        enums: Option<&'a RecordNames>,
         /// Namespace-local error families, absent for isolated legacy leaves.
         errors: Option<&'a ErrorNames>,
     },
@@ -531,8 +541,8 @@ impl Scope<'_> {
                 }
                 Kind::Expr(expr) => self.expression(expr)?,
                 Kind::Return(expr) => self.return_expression(expr, option_return)?,
-                // A literal print contains no names to resolve.
-                Kind::PrintText(_) => {}
+                // Literal output and loop transfers contain no names to resolve.
+                Kind::PrintText(_) | Kind::Break | Kind::Continue => {}
                 Kind::Construct { subject, arms } | Kind::HandleResult { subject, arms } => {
                     self.expression(subject)?;
                     // The constructor and case qualifiers use this file's imports.
@@ -684,7 +694,10 @@ impl Scope<'_> {
                     self.expression(argument)?;
                 }
             }
-            Kind::Member { base, .. } => self.expression(base)?,
+            Kind::Member { base, .. } => {
+                self.enum_root(base)?;
+                self.expression(base)?;
+            }
             Kind::Index { base, index } => {
                 self.expression(base)?;
                 self.expression(index)?;
@@ -744,9 +757,53 @@ impl Scope<'_> {
             }
             Kind::Name(_)
             | Kind::ErrorFamilyRoot { .. }
+            | Kind::EnumRoot { .. }
             | Kind::Number(_)
             | Kind::Bool(_)
             | Kind::Bytes(_) => {}
+        }
+        Ok(())
+    }
+
+    /// Bind a variant's type root while preserving the written spelling for shadowing.
+    fn enum_root(&self, base: &mut ast::Expr) -> Result<(), Diagnostic> {
+        use ast::ExprKind as Kind;
+        let resolved = match &base.kind {
+            Kind::Name(name) => match self {
+                Self::Library {
+                    enums: Some(enums), ..
+                } => enums
+                    .get(name)
+                    .map(|nominal| (name.clone(), nominal.clone())),
+                _ => None,
+            },
+            Kind::Member { base, field } => {
+                let Kind::Name(qualifier) = &base.kind else {
+                    return Ok(());
+                };
+                let Some(interface) = self
+                    .imports()
+                    .and_then(|imports| imports.get(qualifier.as_str()))
+                else {
+                    return Ok(());
+                };
+                let nominal = interface.public_enums.get(field).ok_or_else(|| {
+                    Diagnostic::new(
+                        base.span,
+                        format!(
+                            "library `{}` has no public enum `{field}`",
+                            interface.qualified
+                        ),
+                    )
+                })?;
+                // Import qualifier names cannot be shadowed. The qualified
+                // name is therefore distinct from any lexical identifier.
+                Some((format!("{qualifier}.{field}"), nominal.clone()))
+            }
+            _ => None,
+        };
+        if let Some((name, nominal)) = resolved {
+            base.kind = Kind::EnumRoot { name, nominal };
         }
         Ok(())
     }
@@ -765,6 +822,7 @@ impl Scope<'_> {
                 binding
             }
             ast::ResultPattern::Ok(binding) | ast::ResultPattern::Fallback(binding) => binding,
+            ast::ResultPattern::ReadwriteOk(binding) => return self.binding(binding, span),
         };
         // An introduced binding cannot shadow a namespace visible in the arm.
         if let Some(binding) = binding {

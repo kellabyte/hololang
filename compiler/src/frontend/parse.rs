@@ -148,6 +148,8 @@ pub(super) struct Library {
     pub public_names: Vec<String>,
     /// Record names visible to importers of a package library.
     pub public_records: Vec<String>,
+    /// Enum names visible to importers of a package library.
+    pub public_enums: Vec<String>,
     /// Error family names visible to importers of a package library.
     pub public_errors: Vec<String>,
     /// Optional source declaration to verify against the selected import.

@@ -8,6 +8,7 @@
 use holo::driver::{NativeToolchain, TempDir};
 use holo::frontend::parse_experimental;
 use holo::layout::LayoutMode;
+use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Output};
 
 /// Closed scalar helpers exercise ordered inputs, repeated use, and unused inputs.
@@ -642,6 +643,84 @@ func main returns u64 {
         assert_ne!(output.status.code(), Some(99), "{mode}: {output:?}");
         assert!(output.stdout.is_empty(), "{mode}: {output:?}");
     });
+}
+
+/// Arithmetic preserves precedence, left-to-right operand evaluation, and explicit wrapping.
+#[test]
+fn checked_arithmetic_evaluates_operands_once_and_short_circuits() {
+    let source = r#"
+func compute arg value u64 as readonly copy returns u64 {
+    return value + 7 * 4 / 3 % 5 - 2
+}
+func choose arg enabled bool as readonly copy returns u64 {
+    if enabled { return 2 }
+    return 0
+}
+func wrapped_choice returns u64 { return 2 * choose(true) + 1 }
+func main returns u64 {
+    core.print(compute(10))
+    core.print(wrapped_choice())
+    core.print(core.now() + 10 * core.add_wrapping(core.now(), 0))
+    core.print(100 / 5 / 2)
+    core.print(18446744073709551615 % 256)
+    core.print(core.add_wrapping(18446744073709551615, 1))
+    core.print(core.now())
+    core.assert(true or 1 / 0 == 0)
+    return 0
+}
+"#;
+    execute_modes(source, COUNTING_TICK, |output, mode| {
+        assert!(output.status.success(), "{mode}: {output:?}");
+        assert_eq!(output.stdout, b"12\n5\n21\n10\n255\n0\n3\n", "{mode}");
+    });
+}
+
+/// Overflow and zero divisors trap even if the result would be discarded or narrowed.
+#[test]
+fn checked_arithmetic_traps_before_discard_narrowing_or_later_effects() {
+    let witnesses = [
+        byte_fixture("core.print((18446744073709551615 + 1) + core.add_wrapping(core.now(), 0))"),
+        byte_fixture("core.print(0 - 1)"),
+        byte_fixture("core.print(18446744073709551615 * 2)"),
+        format!(
+            "{HELPERS}\nfunc dropped returns u64 {{ return ignore(1 / 0) }}\nfunc main returns u64 {{ core.print(dropped()); return 0 }}"
+        ),
+        byte_fixture("item.data[0] = 18446744073709551615 + 1"),
+        r#"
+struct Item { data Bytes }
+func item returns Item { return Item { data: core.bytes(1, 1 % core.index()) } }
+func main returns u64 {
+    let memory = core.region(64) else { return 0 }
+    let items = core.batch(memory, Item)
+    let status = core.append(items, item())
+    core.print(status)
+    return 0
+}
+"#
+        .to_owned(),
+    ];
+    for source in witnesses {
+        execute_modes(&source, EXITING_TICK, |output, mode| {
+            assert!(!output.status.success(), "{mode}: {output:?}\n{source}");
+            assert_ne!(
+                output.status.code(),
+                Some(99),
+                "{mode}: {output:?}\n{source}"
+            );
+            if mode != "asan" {
+                let trap = match std::env::consts::ARCH {
+                    "aarch64" => 5, // BRK raises SIGTRAP.
+                    "x86_64" => 4,  // UD2 raises SIGILL.
+                    other => panic!("unsupported native target {other}"),
+                };
+                assert_eq!(
+                    output.status.signal(),
+                    Some(trap),
+                    "{mode}: {output:?}\n{source}"
+                );
+            }
+        });
+    }
 }
 
 /// Build one source-owned one-byte payload, then execute the supplied main-body statement.

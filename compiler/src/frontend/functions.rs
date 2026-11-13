@@ -34,10 +34,15 @@ pub(super) use ir::OPTION_U64_FAMILY as OPTION_FAMILY;
 /// The sole tag for a missing optional value.
 pub(super) const OPTION_NONE: &str = "None";
 
+/// Validated enum names and their sets of variants.
+pub(super) type EnumNames = HashMap<String, HashSet<String>>;
+
 /// Checked source definitions awaiting the existing IR verifier and storage planner.
 pub(super) struct Definitions {
     /// Ordered, resolved inline record schemas.
     pub records: Vec<ir::Record>,
+    /// All resolved nominal enum declarations.
+    pub enums: EnumNames,
     /// Closed, nonrecursive destination constructors, including synthetic literals.
     pub producers: Vec<ir::Producer>,
     /// Pure scalar helpers retained as parameterized expression templates.
@@ -46,8 +51,8 @@ pub(super) struct Definitions {
     pub ordinary: HashMap<String, Vec<ir::FunctionParameterKind>>,
     /// Ordinary functions with a boolean return type.
     pub bools: HashSet<String>,
-    /// Nominal result families and the private identity of optional returns.
-    pub results: HashMap<String, String>,
+    /// Checked tagged signatures, including the private identity of optional returns.
+    pub results: HashMap<String, ir::FunctionResult>,
     /// Resolved error graphs and their ordered, scalar-payload leaves.
     pub errors: HashMap<String, ir::ErrorFamily>,
 }
@@ -65,6 +70,8 @@ pub(super) struct ScalarTemplate {
 struct Lowerer<'m> {
     /// Borrowed declarations for precise field/type diagnostics.
     records: HashMap<&'m str, &'m ast::RecordDecl>,
+    /// Checked enum names and variants for typed constant initialization.
+    enums: &'m EnumNames,
     /// Statically resolved source functions, including the separately handled entry point.
     functions: HashMap<&'m str, &'m ast::Function>,
     /// Functions lowered as checked bodies instead of scalar templates or producers.
@@ -103,7 +110,8 @@ pub(super) fn lower(module: &ast::Module) -> Result<Definitions, Diagnostic> {
                 )
             })?;
     }
-    let records = schema::lower(module)?;
+    let enums = lower_enums(module, &mut budget)?;
+    let records = schema::lower(module, &enums)?;
     let mut errors = errors::lower(module, &mut budget)?;
     if module
         .functions
@@ -128,6 +136,7 @@ pub(super) fn lower(module: &ast::Module) -> Result<Definitions, Diagnostic> {
             .iter()
             .map(|record| (record.name.as_str(), record))
             .collect(),
+        enums: &enums,
         functions: HashMap::new(),
         ordinary: HashSet::new(),
         errors: &errors,
@@ -151,7 +160,7 @@ pub(super) fn lower(module: &ast::Module) -> Result<Definitions, Diagnostic> {
             lowerer.header(function)?;
         }
     }
-    lowerer.ordinary = ordinary_functions(module, &lowerer.functions);
+    lowerer.ordinary = ordinary_functions(module, &lowerer.functions, &enums);
     let mut ordinary = HashMap::new();
     let mut bools = HashSet::new();
     let mut results = HashMap::new();
@@ -166,8 +175,14 @@ pub(super) fn lower(module: &ast::Module) -> Result<Definitions, Diagnostic> {
                 bools.insert(function.name.clone());
             }
             // A fallible call keeps its exact nominal result through checking.
-            if let Some(family) = ordinary_result(&function.result) {
-                results.insert(function.name.clone(), family.to_owned());
+            if let Some((family, success)) = ordinary_result(&function.result) {
+                results.insert(
+                    function.name.clone(),
+                    ir::FunctionResult {
+                        family: family.to_owned(),
+                        success,
+                    },
+                );
             }
             let params = function.args.iter().map(|argument| {
                 // The header establishes that every nonbuiltin type names a known schema.
@@ -196,10 +211,14 @@ pub(super) fn lower(module: &ast::Module) -> Result<Definitions, Diagnostic> {
             lowerer.function(&function.name, 0)?;
         }
     }
+    let Lowerer {
+        producers, scalars, ..
+    } = lowerer;
     Ok(Definitions {
         records,
-        producers: lowerer.producers,
-        scalars: lowerer.scalars,
+        enums,
+        producers,
+        scalars,
         ordinary,
         bools,
         results,
@@ -207,19 +226,105 @@ pub(super) fn lower(module: &ast::Module) -> Result<Definitions, Diagnostic> {
     })
 }
 
-/// Borrow the nominal family from the parser's canonical scalar Result spelling.
-/// Other return types retain their existing classification without allocating.
-pub(super) fn result_family(result: &str) -> Option<&str> {
-    result.strip_prefix("Result<u64,")?.strip_suffix('>')
+/// Check the named alternatives before resolving fields and constructing IR.
+fn lower_enums(module: &ast::Module, budget: &mut usize) -> Result<EnumNames, Diagnostic> {
+    let reserved: HashSet<_> = module
+        .records
+        .iter()
+        .map(|record| record.name.as_str())
+        .chain(module.errors.iter().map(|error| error.name.as_str()))
+        .collect();
+    let mut enums = EnumNames::new();
+    for declaration in &module.enums {
+        let name = &declaration.name;
+        if matches!(
+            name.as_str(),
+            "u64" | "bool" | "Bytes" | "Unit" | "Result" | "Option"
+        ) || reserved.contains(name.as_str())
+            || enums.contains_key(name)
+        {
+            return Err(Diagnostic::new(
+                declaration.span,
+                format!("duplicate or reserved enum type `{name}`"),
+            ));
+        }
+        if !(1..=256).contains(&declaration.variants.len()) {
+            return Err(Diagnostic::new(
+                declaration.span,
+                "an enum requires 1 to 256 variants",
+            ));
+        }
+        *budget = budget
+            .checked_sub(declaration.variants.len() + 1)
+            .ok_or_else(|| {
+                Diagnostic::new(
+                    declaration.span,
+                    "enum declarations exceed the compilation node budget",
+                )
+            })?;
+        let mut variants = HashSet::with_capacity(declaration.variants.len());
+        for (variant, span) in &declaration.variants {
+            if !variants.insert(variant.clone()) {
+                return Err(Diagnostic::new(
+                    *span,
+                    format!("duplicate variant `{name}.{variant}`"),
+                ));
+            }
+        }
+        enums.insert(name.clone(), variants);
+    }
+    Ok(enums)
 }
 
-/// Resolve the source return to its checked two-lane scalar representation.
-fn ordinary_result(result: &str) -> Option<&str> {
-    if result == SCALAR_OPTION {
-        Some(OPTION_FAMILY)
-    } else {
-        result_family(result)
+/// Resolve the type part of an enum member expression without interpreting a field path.
+pub(super) fn enum_member<'a>(
+    value: &'a ast::Expr,
+    enums: &EnumNames,
+) -> Option<(&'a str, &'a str, &'a str)> {
+    let ast::ExprKind::Member { base, field } = &value.kind else {
+        return None;
+    };
+    let (written, nominal) = match &base.kind {
+        ast::ExprKind::Name(name) => (name.as_str(), name.as_str()),
+        ast::ExprKind::EnumRoot { name, nominal } => (name.as_str(), nominal.as_str()),
+        _ => return None,
+    };
+    enums
+        .contains_key(nominal)
+        .then_some((written, nominal, field))
+}
+
+/// Verify a qualified variant and retain its enum identity in IR.
+pub(super) fn enum_constant(
+    enums: &EnumNames,
+    kind: &str,
+    variant: &str,
+    span: Span,
+) -> Result<ir::EnumExpr, Diagnostic> {
+    if !enums[kind].contains(variant) {
+        return Err(Diagnostic::new(
+            span,
+            format!("enum `{kind}` has no variant `{variant}`"),
+        ));
     }
+    Ok(ir::EnumExpr::Variant {
+        kind: kind.to_owned(),
+        variant: variant.to_owned(),
+    })
+}
+
+/// Resolve an ordinary result's nominal family and observable success type.
+fn ordinary_result(result: &str) -> Option<(&str, ir::ResultSuccess)> {
+    if result == SCALAR_OPTION {
+        return Some((OPTION_FAMILY, ir::ResultSuccess::U64));
+    }
+    let (success, family) = result_parts(result)?;
+    let success = match success {
+        "u64" => ir::ResultSuccess::U64,
+        "Unit" => ir::ResultSuccess::Unit,
+        _ => return None,
+    };
+    Some((family, success))
 }
 
 /// Borrow the record component of a batch parameter's canonical type spelling.
@@ -260,6 +365,18 @@ pub(super) fn comparison(op: ast::BinaryOp) -> Option<ir::Compare> {
     })
 }
 
+/// Map unsigned arithmetic syntax to the checked operations used in both lowering paths.
+pub(super) fn arithmetic(op: ast::BinaryOp) -> Option<ir::Binary> {
+    Some(match op {
+        ast::BinaryOp::Add => ir::Binary::AddChecked,
+        ast::BinaryOp::Sub => ir::Binary::SubChecked,
+        ast::BinaryOp::Mul => ir::Binary::MulChecked,
+        ast::BinaryOp::Div => ir::Binary::DivChecked,
+        ast::BinaryOp::Rem => ir::Binary::RemChecked,
+        _ => return None,
+    })
+}
+
 /// Identify boolean literals and operators before names and call results resolve.
 pub(super) fn boolean_syntax(expr: &ast::Expr) -> bool {
     use ast::ExprKind;
@@ -294,12 +411,13 @@ enum OrdinaryFunction {
 fn ordinary_functions<'m>(
     module: &'m ast::Module,
     functions: &HashMap<&str, &ast::Function>,
+    enums: &EnumNames,
 ) -> HashSet<&'m str> {
     let mut ordinary = HashSet::new();
     let mut pending = Vec::new();
     for function in &module.functions {
         if function.name != "main"
-            && let Some(kind) = ordinary_function(function, functions)
+            && let Some(kind) = ordinary_function(function, functions, enums)
         {
             ordinary.insert(function.name.as_str());
             if matches!(kind, OrdinaryFunction::ScalarBody) {
@@ -327,8 +445,8 @@ fn ordinary_functions<'m>(
         let ast::StatementKind::Return(value) = &statement.kind else {
             continue;
         };
-        // Templates admit named/core calls and literal byte reads. Infix
-        // operations and member projections are rejected.
+        // A copied scalar helper can call a candidate anywhere within arithmetic
+        // operands, explicit call arguments, or a literal byte index.
         let mut expressions = vec![value];
         while let Some(expression) = expressions.pop() {
             match &expression.kind {
@@ -342,6 +460,11 @@ fn ordinary_functions<'m>(
                     if matches!(base.kind, ast::ExprKind::Bytes(_)) =>
                 {
                     expressions.push(index);
+                }
+                ast::ExprKind::Binary {
+                    op, left, right, ..
+                } if arithmetic(*op).is_some() => {
+                    expressions.extend([left.as_ref(), right.as_ref()]);
                 }
                 _ => {}
             }
@@ -364,6 +487,7 @@ fn ordinary_functions<'m>(
 fn ordinary_function(
     function: &ast::Function,
     functions: &HashMap<&str, &ast::Function>,
+    enums: &EnumNames,
 ) -> Option<OrdinaryFunction> {
     if function.result == "bool" || ordinary_result(&function.result).is_some() {
         return Some(OrdinaryFunction::Standard);
@@ -386,7 +510,10 @@ fn ordinary_function(
         functions.get(name).copied()
     };
     let boolean_condition = |value: &ast::Expr| {
-        logical_operator(value) || target(value).is_some_and(|callee| callee.result == "bool")
+        logical_operator(value)
+            || target(value).is_some_and(|callee| callee.result == "bool")
+            || matches!(&value.kind, ast::ExprKind::Binary { left, right, .. }
+                if enum_member(left, enums).is_some() || enum_member(right, enums).is_some())
     };
     let mut ordinary_scalar_body = false;
     let mut pending = vec![function.body.as_slice()];
@@ -409,6 +536,7 @@ fn ordinary_function(
                     }
                     ordinary_scalar_body |= callee.is_some_and(|callee| callee.result == "bool")
                         || boolean_syntax(value)
+                        || enum_member(value, enums).is_some()
                         || super::byte_ranges::split(value)
                             .is_ok_and(|(root, _)| matches!(root.kind, ast::ExprKind::Bytes(_)));
                     Some(value)
@@ -497,7 +625,9 @@ impl Lowerer<'_> {
         } else {
             result.map_or(function.result.as_str(), |(success, _)| success)
         };
-        let ordinary_return = success == "u64" || function.result == "bool";
+        let ordinary_return = success == "u64"
+            || function.result == "bool"
+            || ordinary_result(&function.result).is_some();
         // Every typed signature must name a declaration, even if no caller uses it.
         if let Some((_, family)) = result
             && !self.errors.contains_key(family)

@@ -80,21 +80,30 @@ public func send_result
     return decode_failure(status)
 }
 
-// Decode the result of an explicit readiness wait. Success reports zero
-// and permits a new transfer attempt. It does not supply a byte count.
+// Decode the result of an explicit readiness wait. Success permits a new
+// transfer attempt without supplying a byte count.
 public func wait_result
     with noalloc, noblock
     arg status u64 as readonly copy
-    returns Result<u64, SocketError>
+    returns Result<Unit, SocketError>
 {
     if status == 0 {
-        return ok 0
+        return ok
     }
     // The blocking wait adapter never produces the nonblocking I/O sentinel.
-    if status == 18446744073709551614 {
-        return error SocketError.InvalidStatus
-    }
-    return decode_failure(status)
+    decode_failure(status)
+        on Interrupted then {
+            return error SocketError.Interrupted
+        }
+        on Native(code) then {
+            return error SocketError.Native(code)
+        }
+        on ok then {
+            return error SocketError.InvalidStatus
+        }
+        on error then {
+            return error SocketError.InvalidStatus
+        }
 }
 
 // Decode a host-owned session transition. Success admits a client, and End
@@ -102,10 +111,10 @@ public func wait_result
 public func next_session_result
     with noalloc, noblock
     arg status u64 as readonly copy
-    returns Result<u64, SessionError>
+    returns Result<Unit, SessionError>
 {
     if status == 0 {
-        return ok 0
+        return ok
     }
     if status == 1 {
         return error SessionError.End

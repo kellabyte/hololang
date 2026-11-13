@@ -169,7 +169,7 @@ impl Iterator for Scanner<'_> {
             (b'>', Some(b'=')) => self.pair(LexemeKind::GreaterEqual),
             (
                 b'{' | b'}' | b'(' | b')' | b'[' | b']' | b',' | b'.' | b':' | b';' | b'=' | b'<'
-                | b'>' | b'+' | b'-' | b'*' | b'/' | b'&' | b'^',
+                | b'>' | b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'^',
                 _,
             ) => {
                 self.position += 1;

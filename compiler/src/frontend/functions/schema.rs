@@ -1,6 +1,6 @@
 //! Source schema resolution before constructor lowering.
 //!
-//! Only inline u64, Bytes, and named-record fields are representable. Graph
+//! Inline u64, bool, Bytes, and named-record fields are representable. Graph
 //! validation rejects unknown types and recursive layouts before a constructor
 //! can be treated as checked. All maps and work lists are compiler-only storage.
 
@@ -11,11 +11,14 @@ use std::collections::{HashMap, HashSet};
 
 /// Resolve all fields without reordering declarations and reject cyclic inline types.
 /// The returned schemas own names; borrowed source declarations retain diagnostic spans.
-pub(super) fn lower(module: &ast::Module) -> Result<Vec<ir::Record>, Diagnostic> {
+pub(super) fn lower(
+    module: &ast::Module,
+    enums: &super::EnumNames,
+) -> Result<Vec<ir::Record>, Diagnostic> {
     let mut records = HashMap::new();
     // Builtin type identities cannot be shadowed, because fields use their fixed scalar meanings.
     for record in &module.records {
-        if matches!(record.name.as_str(), "u64" | "bool" | "Bytes") {
+        if matches!(record.name.as_str(), "u64" | "bool" | "Bytes" | "Unit") {
             return Err(Diagnostic::new(
                 record.span,
                 format!(
@@ -45,7 +48,9 @@ pub(super) fn lower(module: &ast::Module) -> Result<Vec<ir::Record>, Diagnostic>
             }
             let kind = match field.ty.as_str() {
                 "u64" => ir::FieldKind::U64,
+                "bool" => ir::FieldKind::Bool,
                 "Bytes" => ir::FieldKind::Bytes,
+                name if enums.contains_key(name) => ir::FieldKind::Enum(name.to_owned()),
                 name if records.contains_key(name) => ir::FieldKind::Record(name.to_owned()),
                 name => {
                     return Err(Diagnostic::new(

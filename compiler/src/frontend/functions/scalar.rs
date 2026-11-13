@@ -116,17 +116,29 @@ pub(super) fn expression(
         ast::ExprKind::Call { callee, args } => {
             call(lowerer, callee, args, value.span, context, depth)
         }
-        ast::ExprKind::Binary { .. } | ast::ExprKind::Not { .. }
-            if super::boolean_syntax(value) =>
-        {
-            Err(Diagnostic::new(
-                value.span,
-                "a bool expression cannot be used as a u64",
-            ))
+        ast::ExprKind::Binary {
+            op, left, right, ..
+        } => {
+            if let Some(op) = super::arithmetic(*op) {
+                let left = expression(lowerer, left, context, depth + 1)?;
+                let right = expression(lowerer, right, context, depth + 1)?;
+                lowerer.charge(1, value.span)?;
+                Ok(ir::Expr::binary(op, left, right))
+            } else if super::boolean_syntax(value) {
+                Err(Diagnostic::new(
+                    value.span,
+                    "a bool expression cannot be used as a u64",
+                ))
+            } else {
+                Err(Diagnostic::new(
+                    value.span,
+                    "infix bitwise operators are unsupported; use `core.xor` or `core.and`",
+                ))
+            }
         }
-        ast::ExprKind::Binary { .. } => Err(Diagnostic::new(
+        ast::ExprKind::Not { .. } => Err(Diagnostic::new(
             value.span,
-            "infix scalar arithmetic is unsupported while numeric policy remains open; use explicit `core.add_wrapping`, `core.sub_wrapping`, `core.mul_wrapping`, `core.xor`, or `core.and`",
+            "a bool expression cannot be used as a u64",
         )),
         _ => Err(Diagnostic::new(
             value.span,
@@ -268,9 +280,9 @@ fn call(
     for argument in args {
         arguments.push(expression(lowerer, argument, context, depth + 1)?);
     }
-    // A scoped eager frame preserves trapping actuals, including an input or
-    // literal byte read, even when the callee ignores or repeats its parameter.
-    if context.kinds.contains(&ir::Parameter::Bytes) || arguments.iter().any(has_literal_read) {
+    // A scoped eager frame preserves trapping actuals even when the callee
+    // ignores or repeats its parameter.
+    if context.kinds.contains(&ir::Parameter::Bytes) || arguments.iter().any(can_trap) {
         lowerer.charge(1, span)?;
         let identities: Vec<_> = (0..arguments.len()).map(ir::Expr::Param).collect();
         let template = &lowerer.scalars[name].value;
@@ -285,14 +297,14 @@ fn call(
     }
 }
 
-/// Pure scalar arguments may contain trapping literal reads after inlining.
-fn has_literal_read(value: &ir::Expr) -> bool {
+/// Recognize arithmetic or byte reads that can trap inside pure scalar arguments.
+fn can_trap(value: &ir::Expr) -> bool {
     match value {
         ir::Expr::LiteralByte { .. } => true,
-        ir::Expr::Binary { left, right, .. } => has_literal_read(left) || has_literal_read(right),
-        ir::Expr::Apply { args, body } => {
-            args.iter().any(has_literal_read) || has_literal_read(body)
+        ir::Expr::Binary { op, left, right } => {
+            op.is_checked() || can_trap(left) || can_trap(right)
         }
+        ir::Expr::Apply { args, body } => args.iter().any(can_trap) || can_trap(body),
         _ => false,
     }
 }
@@ -339,8 +351,8 @@ pub(super) fn condition(
     })
 }
 
-/// Check each guard operand using the producer's pure expression context.
-fn boolean(
+/// Lower a boolean using the producer's pure expression context.
+pub(super) fn boolean(
     lowerer: &mut Lowerer<'_>,
     value: &ast::Expr,
     context: &Context<'_>,

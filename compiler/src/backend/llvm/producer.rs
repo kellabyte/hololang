@@ -404,6 +404,17 @@ impl Lowering<'_> {
                 let address = self.reserve_word_or_unit(8, returned, reservations);
                 storage::store_u64(&mut self.f, &address, &value);
             }
+            Build::Bool { value, .. } => {
+                let value = self.boolean(value);
+                let address = self.reserve_word_or_unit(1, returned, reservations);
+                storage::store_bool(&mut self.f, &address, &value);
+            }
+            Build::Enum { value, .. } => {
+                let value = self.enumeration(value);
+                let address = self.reserve_word_or_unit(1, returned, reservations);
+                self.f
+                    .line(format!("store i8 {value}, ptr {address}, align 1"));
+            }
             Build::Bytes { len, value, .. } => {
                 let choice = copy::choose(target, len, value);
                 let len = self.expression(len);

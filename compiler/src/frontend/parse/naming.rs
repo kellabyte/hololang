@@ -19,6 +19,10 @@ pub(super) enum NameKind {
     Parameter,
     /// A named struct declaration.
     Record,
+    /// A payload-free enum declaration.
+    Enum,
+    /// A named variant inside an enum.
+    EnumVariant,
     /// A named error family declaration.
     ErrorFamily,
     /// A case declared directly inside an error family.
@@ -47,6 +51,8 @@ impl NameKind {
             Self::Function => ("Function", "snake_case", false),
             Self::Parameter => ("Parameter", "snake_case", false),
             Self::Record => ("Record", "PascalCase", true),
+            Self::Enum => ("Enum", "PascalCase", true),
+            Self::EnumVariant => ("Enum variant", "PascalCase", true),
             Self::ErrorFamily => ("Error family", "PascalCase", true),
             Self::ErrorCase => ("Error case", "PascalCase", true),
             Self::ChildAlias => ("Child error alias", "PascalCase", true),

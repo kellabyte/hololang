@@ -207,6 +207,7 @@ impl LayoutPlan {
         for field in &record.fields {
             let (field_minimum, field_fixed) = match &field.kind {
                 FieldKind::U64 => (8, Some(8)),
+                FieldKind::Bool | FieldKind::Enum(_) => (1, Some(1)),
                 FieldKind::Bytes => (self.length_bytes(), None),
                 FieldKind::Record(name) => {
                     let child = self.record(name);
@@ -264,6 +265,8 @@ pub fn inspect(checked: &CheckedProgram<'_>, mode: LayoutMode) -> Result<String,
         for field in &record.fields {
             let size = match &field.kind {
                 FieldKind::U64 => "8".to_owned(),
+                FieldKind::Bool => "1".to_owned(),
+                FieldKind::Enum(name) => format!("1 (enum {name})"),
                 FieldKind::Bytes => format!("{} + length({})", plan.length_bytes(), field.name),
                 FieldKind::Record(name) => plan
                     .record(name)

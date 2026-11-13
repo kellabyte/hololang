@@ -19,8 +19,8 @@ last accepted frame stays usable. When the rest of the input arrives, the caller
 can try the append again.
 
 **Status.** The experimental checked slice is complete. It covers scalar
-results, named error unions, typed append, destination forwarding, and
-scoped construction of fixed and byte-bearing records. A `try` can
+results, Unit success, named error unions, typed append, destination
+forwarding, and scoped construction of fixed and byte-bearing records. A `try` can
 propagate a declared child error with its copied `u64` payload. The opening
 example uses the proposed outcome enum. Runnable append examples handle
 the same outcomes with scalars or booleans.
@@ -144,9 +144,9 @@ let accepted = frame.validate_header(magic, kind, length)
 
 These are two independent calls. The first maps each error to a scalar and
 reads the validated length. The second observes only whether admission
-succeeded. `on ok` ignores the scalar payload. A handled
-boolean can be bound with `let` and used as a condition. The first slice
-permits literal boolean arms for that form.
+succeeded. `on ok` ignores the scalar payload. A handler with literal boolean
+arms can initialize a `let` or `var` and the resulting local can be tested
+directly as a condition.
 
 A validator can also check the received extent before subtracting the header
 size. Here `require_prefix` returns `Truncated(required)` when the buffer is
@@ -327,10 +327,10 @@ final destination and rejects prebuilt owned results.
 
 ### Borrow a fresh result within its success arm
 
-In entry code, `core.construct` gives a typed producer the tail of a bounded
+In entry code, `core.construct` gives a destination constructor the tail of a bounded
 region. The region must be free of a live batch or another scoped record.
-Each `on` clause runs a block. Only `on ok(ticket)` introduces a readonly
-record reference. Use `on ok` when the block needs no record binding.
+Each `on` clause runs a block. Use `on ok(ticket)` for a readonly reference,
+`on ok(readwrite ticket)` for writable access, or `on ok` to discard the binding.
 
 ```holo
 core.construct(memory, open_ticket(id))
@@ -340,9 +340,10 @@ core.construct(memory, open_ticket(id))
     on SizeOverflow then { core.print(0) }
 ```
 
-A final `on error` may cover any remaining failures. Rejection restores the
-marker before its block runs, so that block can retry in the same region.
-Success releases the slot when its block ends, including on an early return.
+A final `on error` can cover any remaining failures and is required for a
+constructor returning a plain record. Rejection restores the marker before its
+block runs, so that block can retry in the same region. Success releases the
+slot when its block ends, including on an early return or loop transfer.
 Copy a scalar out of the block when it needs to survive. The reference and
 its byte views share the block lifetime.
 [Native scoped-result tests](../tests/compiler/frontend/frontend_native.rs) · [Storage and lifetime rules](spec.md#fresh-aggregate-locals)
@@ -404,6 +405,25 @@ children. Use explicit handling and mapping for an unrelated family.
 `return decode_frame(input)` forwards the entire result when its type agrees
 with the signature. `return ok frame` supplies the success payload of a result.
 
+When an operation has no success value, declare `returns Result<Unit, E>`.
+The function returns success with `return ok`. The caller handles success
+with bare `on ok` and can still bind a payload carried by a named error.
+In a manifest package with `using holo.net`, `net.wait_result` classifies a
+socket readiness status.
+
+```holo
+net.wait_result(status)
+    on ok then { core.print("ready") }
+    on Interrupted then { core.print("interrupted") }
+    on error then { core.print("wait failed") }
+```
+
+Inside an ordinary `Result` function, `try net.wait_result(status)` as a
+statement continues on Unit success and propagates a failure using the same
+family rules. The statement also accepts a saved Unit result. Saving with
+`let` and forwarding with `return` work for `Result<Unit, E>` as they do for
+`Result<u64, E>`.
+
 ```holo
 return checked_payload_length(input)
     on ok(length)    then ExpectFrameBytes(3 + length)
@@ -413,11 +433,11 @@ return checked_payload_length(input)
 
 Ordinary failure runs the lexical cleanup of scopes it exits. Writes already
 made to caller-visible state remain visible. The
-[scalar result rules](packages.md#typed-error-families) define `on` arms and
-exact forwarding for `Result<u64, E>`. Cases may carry one named `u64` field.
+[result rules](packages.md#typed-error-families) define `on` arms and
+exact forwarding for ordinary results. Cases may carry one named `u64` field.
 `return error Family.Case(value)` initializes that field. `on Case(binding)`
-binds it in the selected arm, and `on Case(_)` discards it. Stored results,
-general aggregate moves, and arbitrary payload patterns require their own rules.
+binds it in the selected arm, and `on Case(_)` discards it. General aggregate
+moves and arbitrary payload patterns require their own rules.
 
 ## Handle the result with `on`
 
@@ -429,7 +449,7 @@ general aggregate moves, and arbitrary payload patterns require their own rules.
   the value of the whole expression. All arms must produce the expected type,
   or agree on a type when the surrounding context supplies none. The expected
   return type resolves unqualified result values such as `Accepted`.
-- `on ok` selects success without binding a value. It handles unit success
+- `on ok` selects success without binding a value. It handles Unit success
   and can ignore a copied scalar payload. `on ok(value)` binds the active
   scalar in that arm, and `on ok(_)` also ignores it.
   An error arm names a case of the known family.

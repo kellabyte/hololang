@@ -52,6 +52,7 @@ impl Lowering<'_> {
         self.f.line(format!("store i64 {start}, ptr {offset_slot}"));
         let condition = self.f.fresh_label();
         let iteration = self.f.fresh_label();
+        let advance = self.f.fresh_label();
         let done = self.f.fresh_label();
         self.f.line(format!("br label %{condition}"));
         self.f.label(&condition);
@@ -82,8 +83,12 @@ impl Lowering<'_> {
             origin,
             shape.map(|shape| shape.extent),
         );
+        self.push_loop(&done, &advance);
         self.operations(body);
+        self.pop_loop();
         self.pop_scope();
+        self.f.line(format!("br label %{advance}"));
+        self.f.label(&advance);
         self.f
             .line(format!("store i64 {following}, ptr {offset_slot}"));
         self.f.line(format!("br label %{condition}"));

@@ -110,6 +110,12 @@ impl Layout {
                 .breaks
                 .extend(error.cases.iter().map(|case| case.span.start));
         }
+        for declaration in &module.enums {
+            layout.breaks.push(declaration.span.start);
+            layout
+                .breaks
+                .extend(declaration.variants.iter().map(|(_, span)| span.start));
+        }
         let mut cursor = 0;
         // Functions retain source order even though the module stores record and
         // function declarations separately. The monotonic cursor visits tokens once.
@@ -199,7 +205,9 @@ impl Layout {
                 ast::StatementKind::Expr(expression) | ast::StatementKind::Return(expression) => {
                     self.collect_expression(expression);
                 }
-                ast::StatementKind::PrintText(_) => {}
+                ast::StatementKind::PrintText(_)
+                | ast::StatementKind::Break
+                | ast::StatementKind::Continue => {}
                 ast::StatementKind::Construct { subject, arms }
                 | ast::StatementKind::HandleResult { subject, arms } => {
                     self.collect_expression(subject);
@@ -332,6 +340,7 @@ impl Layout {
             | ast::ExprKind::Bool(_)
             | ast::ExprKind::Bytes(_)
             | ast::ExprKind::Name(_)
+            | ast::ExprKind::EnumRoot { .. }
             | ast::ExprKind::ErrorFamilyRoot { .. } => {}
         }
     }
@@ -594,6 +603,15 @@ fn same_module(left: &ast::Module, right: &ast::Module) -> bool {
                         .zip(&right.fields)
                         .all(|(left, right)| left.name == right.name && left.ty == right.ty)
             })
+        && left.enums.len() == right.enums.len()
+        && left.enums.iter().zip(&right.enums).all(|(left, right)| {
+            left.name == right.name
+                && left
+                    .variants
+                    .iter()
+                    .map(|(name, _)| name)
+                    .eq(right.variants.iter().map(|(name, _)| name))
+        })
         && left.errors.len() == right.errors.len()
         && left.errors.iter().zip(&right.errors).all(|(left, right)| {
             left.name == right.name
@@ -694,6 +712,8 @@ fn same_statements(left: &[ast::Statement], right: &[ast::Statement]) -> bool {
                 (ast::StatementKind::PrintText(left), ast::StatementKind::PrintText(right)) => {
                     left == right
                 }
+                (ast::StatementKind::Break, ast::StatementKind::Break)
+                | (ast::StatementKind::Continue, ast::StatementKind::Continue) => true,
                 (
                     ast::StatementKind::Construct {
                         subject: ls,
@@ -819,6 +839,16 @@ fn same_expression(left: &ast::Expr, right: &ast::Expr) -> bool {
         (ast::ExprKind::Bool(left), ast::ExprKind::Bool(right)) => left == right,
         (ast::ExprKind::Bytes(left), ast::ExprKind::Bytes(right)) => left == right,
         (ast::ExprKind::Name(left), ast::ExprKind::Name(right)) => left == right,
+        (
+            ast::ExprKind::EnumRoot {
+                name: left,
+                nominal: left_type,
+            },
+            ast::ExprKind::EnumRoot {
+                name: right,
+                nominal: right_type,
+            },
+        ) => left == right && left_type == right_type,
         (ast::ExprKind::Ok(left), ast::ExprKind::Ok(right))
         | (ast::ExprKind::Try(left), ast::ExprKind::Try(right))
         | (ast::ExprKind::Not { value: left, .. }, ast::ExprKind::Not { value: right, .. }) => {
@@ -937,6 +967,9 @@ fn same_expression(left: &ast::Expr, right: &ast::Expr) -> bool {
 fn same_result_pattern(left: &ast::ResultPattern, right: &ast::ResultPattern) -> bool {
     // A fallback and success are distinct even if their local spellings agree.
     match (left, right) {
+        (ast::ResultPattern::ReadwriteOk(left), ast::ResultPattern::ReadwriteOk(right)) => {
+            left == right
+        }
         (ast::ResultPattern::Ok(left), ast::ResultPattern::Ok(right))
         | (ast::ResultPattern::Fallback(left), ast::ResultPattern::Fallback(right)) => {
             left == right

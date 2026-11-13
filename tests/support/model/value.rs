@@ -10,10 +10,23 @@
 pub enum Value {
     /// An initialized, fixed-width unsigned scalar.
     Scalar(u64),
+    /// An initialized boolean field.
+    Boolean(bool),
+    /// A semantic case of a nominal enum, independent of native discriminants.
+    Enum(EnumValue),
     /// Owned initialized payload bytes; the vector length is semantic metadata.
     Bytes(Vec<u8>),
     /// An inline nested record represented independently as owned Rust values.
     Record(Record),
+}
+
+/// The test model compares enum cases by their declared names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnumValue {
+    /// Nominal enum identity.
+    pub kind: String,
+    /// Name of the selected case.
+    pub variant: String,
 }
 
 /// A named field whose position records construction/declaration order.
@@ -46,6 +59,7 @@ impl Value {
         // actual representation instead of relying on Rust's enum/object sizes.
         match self {
             Self::Scalar(_) => 8,
+            Self::Boolean(_) | Self::Enum(_) => 1,
             Self::Bytes(bytes) => u128::from(length_bytes) + bytes.len() as u128,
             Self::Record(record) => record.encoded_len(),
         }

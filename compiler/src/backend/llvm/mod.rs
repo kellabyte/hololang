@@ -228,6 +228,14 @@ fn emit_with_options(
         program,
         layout: &layout,
         byte_literals: literal::ByteLiterals::default(),
+        enums: program
+            .body
+            .iter()
+            .filter_map(|op| match op {
+                Op::Enum(definition) => Some((definition.name.as_str(), definition)),
+                _ => None,
+            })
+            .collect(),
     };
     // Escape unusual configuration characters rather than allowing target text to
     // inject LLVM syntax. An unsupported triple still fails in the native driver.

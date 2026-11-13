@@ -26,8 +26,8 @@ Diagnostic>`; it depends only on the frontend AST, lexer, and source ranges.
   continuations of return or binding operands. A named case arm can bind a
   payload with `on Truncated(required)` or discard it with `on Truncated(_)`.
   Child cases use dotted paths such as `on Session.PermissionDenied`.
-  Error case paths and arm bindings retain their spans for resolution. Lowering
-  rejects arithmetic whose source default is still open.
+  Error case paths and arm bindings retain their spans for resolution.
+  Checked `u64` arithmetic uses the parsed operator precedence.
 - `return ok Record:` parses a fresh destination with equally indented
   `field = expression` lines. A field can start with contextual `try`. Append
   handling adds `on Rejected Case(value) then expression`, including qualified

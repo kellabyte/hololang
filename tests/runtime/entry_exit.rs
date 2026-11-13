@@ -172,6 +172,42 @@ fn entry_exit_without_storage_stops_later_operations() {
     compare(&program(stop(44)), &[44]);
 }
 
+/// Continue and break free iteration owners in reverse order and retain the outer owner.
+#[test]
+fn loop_transfers_release_only_the_owners_they_cross() {
+    let input = program(vec![region(
+        "outer",
+        vec![
+            Op::Repeat {
+                count: Expr::Const(3),
+                index: "index".into(),
+                body: vec![region(
+                    "first",
+                    vec![region(
+                        "second",
+                        vec![
+                            Op::Print(Expr::Local("index".into())),
+                            Op::If {
+                                condition: Condition {
+                                    op: Compare::Eq,
+                                    left: Expr::Local("index".into()),
+                                    right: Expr::Const(0),
+                                },
+                                then_body: vec![Op::Continue],
+                                else_body: vec![Op::Break],
+                            },
+                            Op::Print(Expr::Const(999)),
+                        ],
+                    )],
+                )],
+            },
+            Op::Print(Expr::Used("outer".into())),
+            Op::ExitZero,
+        ],
+    )]);
+    compare(&input, &[0, 1, 0]);
+}
+
 /// Compare independent model output and instrumented O0/O3/ASan native execution.
 ///
 /// The same checked input is used in every build. Native helper assertions catch

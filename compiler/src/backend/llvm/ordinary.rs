@@ -82,7 +82,10 @@ pub(super) fn emit(
     );
     let mut lowering = Lowering::new(module, header, inputs);
     lowering.byte_sums = byte_sums;
-    lowering.result_family = function.result.as_deref();
+    lowering.result_family = function
+        .result
+        .as_ref()
+        .map(|result| result.family.as_str());
     // Locals and state reuse the existing binding representation. Bytes are
     // immutable captures already addressed by formal index and need no slots.
     for (index, parameter) in function.params.iter().enumerate() {

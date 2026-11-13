@@ -8,10 +8,10 @@ namespace holo.net.tcp
 public func close_result
     with noalloc, noblock
     arg status u64 as readonly copy
-    returns Result<u64, CloseError>
+    returns Result<Unit, CloseError>
 {
     if status == 0 {
-        return ok 0
+        return ok
     }
 
     // The native ABI tags positive signed-int errno values with bit 63.

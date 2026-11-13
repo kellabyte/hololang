@@ -28,7 +28,7 @@ pub struct ScopedPlacement {
     /// select a scope, counted or batch iteration body, batch, successful
     /// region, or refill data body. The final index can equal the body length.
     pub site: Vec<usize>,
-    /// Typed destination constructor to call at the selected site.
+    /// Destination constructor to call at the selected site.
     pub producer: String,
     /// Actuals evaluated once, in order, after resolving the final slot.
     pub args: Vec<Argument>,
