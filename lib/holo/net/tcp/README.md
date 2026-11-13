@@ -2,8 +2,8 @@
 
 Use `using holo.net.tcp` in a manifest package. [`close_error.holo`](close_error.holo)
 defines the public terminal `CloseError` family. [`close.holo`](close.holo)
-defines the pure `tcp.close_result(status)` adapter. It preserves a positive
-native error code, including interruption, and rejects words outside the
+defines the pure `tcp.close_result(status)` adapter with a payload-free success.
+It preserves a positive native error code, including interruption, and rejects words outside the
 close status domain. Checked `noalloc` and `noblock` apply to the adapter.
 
 The compiler supplies the opaque hosted stream binding and checks

@@ -40,8 +40,10 @@ declare i64 @holo_now()
 ; Expose actual backing to an opaque memory barrier so timed work cannot vanish.
 ; No attributes promise purity or non-aliasing across this instrumentation call.
 declare void @holo_opaque(ptr)
-; Compute unsigned size addition together with its overflow bit, before addressing.
+; Compute unsigned arithmetic and its overflow bit before using the result.
 declare { i64, i1 } @llvm.uadd.with.overflow.i64(i64, i64)
+declare { i64, i1 } @llvm.usub.with.overflow.i64(i64, i64)
+declare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64)
 
 @holo.number_format = private unnamed_addr constant [6 x i8] c"%llu\0A\00"
 

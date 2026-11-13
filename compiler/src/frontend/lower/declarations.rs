@@ -73,16 +73,16 @@ impl Lowerer {
             );
             return Ok((output, false));
         }
-        if let Some((function, actuals, family)) = self.tagged_target(value) {
+        if let Some((function, actuals, result)) = self.tagged_target(value) {
             if *mutable || otherwise.is_some() {
                 return Err(Diagnostic::new(
                     statement.span,
                     "save a tagged result with an immutable `let`",
                 ));
             }
-            let family = family.to_owned();
+            let result = result.clone();
             let args = self.ordinary_arguments(function, actuals, value.span)?;
-            let name = self.bind(name, Kind::SavedResult(family), statement.span)?;
+            let name = self.bind(name, Kind::SavedResult(result), statement.span)?;
             output.push(
                 ir::Op::BindResult {
                     name,
@@ -129,7 +129,7 @@ impl Lowerer {
                     "bind a propagated scalar with `let` and `try`",
                 ));
             }
-            let operation = self.try_binding(name, subject, value.span)?;
+            let operation = self.try_binding(Some(name), subject, value.span)?;
             output.push(operation, statement.span, []);
             return Ok((output, false));
         }
@@ -372,31 +372,53 @@ impl Lowerer {
                 return Ok((output, false));
             }
         }
-        // Literal boolean arms infer an immutable condition binding. Scalar arms
-        // keep the existing u64 path, and mixed types are diagnosed arm-locally.
-        if let ast::ExprKind::Handle { subject, arms } = &value.kind
-            && arms
-                .first()
-                .is_some_and(|arm| matches!(arm.value.kind, ast::ExprKind::Bool(_)))
-        {
-            if *mutable {
-                return Err(Diagnostic::new(
-                    statement.span,
-                    "bind a handled boolean with `let`",
-                ));
+        // Literal boolean arms infer a boolean. Keep the existing immutable
+        // handler lowering for `let`; `var` needs a typed writable slot.
+        let handled_bool = match &value.kind {
+            ast::ExprKind::Handle { subject, arms }
+                if arms
+                    .first()
+                    .is_some_and(|arm| matches!(arm.value.kind, ast::ExprKind::Bool(_))) =>
+            {
+                Some((subject, arms))
             }
+            _ => None,
+        };
+        if !*mutable && let Some((subject, arms)) = handled_bool {
             let value = self.handle_result(subject, arms, true)?;
             let name = self.bind(name, Kind::HandledBool, statement.span)?;
             output.push(ir::Op::Let { name, value }, statement.span, []);
             return Ok((output, false));
         }
-        if self.is_bool(value) {
-            if *mutable {
-                return Err(Diagnostic::new(statement.span, "bind a bool with `let`"));
-            }
+        if handled_bool.is_some() || self.is_bool(value) {
             let value = self.boolean(value, &mut output)?;
-            let name = self.bind(name, Kind::Bool, statement.span)?;
-            output.push(ir::Op::LetBool { name, value }, statement.span, []);
+            let name = self.bind(name, Kind::Bool { mutable: *mutable }, statement.span)?;
+            let operation = if *mutable {
+                ir::Op::VarBool { name, value }
+            } else {
+                ir::Op::LetBool { name, value }
+            };
+            output.push(operation, statement.span, []);
+            return Ok((output, false));
+        }
+        if let Some((kind, expression)) = self.enum_value(value)? {
+            let name = self.bind(
+                name,
+                Kind::Enum {
+                    kind,
+                    mutable: *mutable,
+                },
+                statement.span,
+            )?;
+            output.push(
+                ir::Op::LetEnum {
+                    name,
+                    value: expression,
+                    mutable: *mutable,
+                },
+                statement.span,
+                [],
+            );
             return Ok((output, false));
         }
         let value = self.scalar(value, &mut output)?;

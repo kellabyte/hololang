@@ -134,6 +134,7 @@ impl Proof<'_> {
                 // only mutate contents, and reset/exit cannot create records.
                 Op::Function(_)
                 | Op::ErrorFamily(_)
+                | Op::Enum(_)
                 | Op::WaitInput { .. }
                 | Op::WaitOutput { .. }
                 | Op::NextSession { .. }
@@ -141,15 +142,25 @@ impl Proof<'_> {
                 | Op::Send { .. }
                 | Op::Let { .. }
                 | Op::LetBool { .. }
+                | Op::VarBool { .. }
+                | Op::LetEnum { .. }
                 | Op::BindBytes { .. }
                 | Op::BindResult { .. }
                 | Op::TryLet { .. }
                 | Op::TrySaved { .. }
+                | Op::TryUnit { .. }
+                | Op::TrySavedUnit { .. }
                 | Op::Set { .. }
+                | Op::SetBool { .. }
+                | Op::SetEnum { .. }
+                | Op::Break
+                | Op::Continue
                 | Op::Borrow { .. }
                 | Op::Alias { .. }
                 | Op::AssignRef { .. }
                 | Op::Write { .. }
+                | Op::WriteBool { .. }
+                | Op::WriteEnum { .. }
                 | Op::WriteByte { .. }
                 | Op::WriteInputByte { .. }
                 | Op::WriteViewByte { .. }

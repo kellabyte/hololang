@@ -127,7 +127,7 @@ and limited function forms. Scalar templates inline only
 after entry arguments are captured once left to right. Region/batch declarations
 wrap their remaining lexical block. Cleanup-aware entry completion emits reverse
 marker/backing cleanup without per-record work. General calls, effects, transfer,
-numeric defaults, and collection APIs remain unresolved/unsupported where stated
+additional numeric types, and collection APIs remain open where stated
 in the [source boundary](spec.md#experimental-source-subset). Compiler trees use
 host allocations; bounded expansion does not promise fast/incremental checking.
 

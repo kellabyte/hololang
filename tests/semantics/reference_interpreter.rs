@@ -11,9 +11,33 @@ mod model;
 
 use holo::ir::{
     Access, Binary, Build, Compare, Condition, ErrorCase, ErrorFamily, Expr, Field, FieldKind,
-    Function, FunctionArgument, FunctionParameter, FunctionParameterKind, Op, Producer, Program,
-    Record, ResultArm, ResultPattern, ResultValue,
+    Function, FunctionArgument, FunctionParameter, FunctionParameterKind, FunctionResult, Op,
+    Producer, Program, Record, ResultArm, ResultPattern, ResultSuccess, ResultValue,
 };
+
+/// The independent arithmetic semantics distinguish valid full-width values from traps.
+#[test]
+fn checked_arithmetic_matches_u64_boundaries() {
+    let run = |expression: &str| {
+        let source = format!("func main returns u64 {{ core.print({expression}); return 0 }}");
+        let program = holo::frontend::parse_experimental(&source).unwrap();
+        model::run(program.program())
+    };
+    assert_eq!(run("(18446744073709551615 - 1) + 1").unwrap(), [u64::MAX]);
+    assert_eq!(run("18446744073709551615 / 2").unwrap(), [u64::MAX / 2]);
+    for expression in [
+        "18446744073709551615 + 1",
+        "0 - 1",
+        "18446744073709551615 * 2",
+        "1 / 0",
+        "1 % 0",
+    ] {
+        assert_eq!(
+            run(expression).unwrap_err().message,
+            "checked arithmetic trap"
+        );
+    }
+}
 
 /// Nested range descriptors retain their base and extent through model calls.
 #[test]
@@ -186,7 +210,10 @@ fn typed_results_preserve_the_success_value_and_choose_one_error_arm() {
                     name: "input".into(),
                     kind: FunctionParameterKind::U64,
                 }],
-                result: Some("Decode".into()),
+                result: Some(FunctionResult {
+                    family: "Decode".into(),
+                    success: ResultSuccess::U64,
+                }),
                 body: vec![Op::If {
                     condition: Condition {
                         op: Compare::Lt,

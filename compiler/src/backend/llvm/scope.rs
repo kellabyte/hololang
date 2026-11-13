@@ -9,7 +9,7 @@ use crate::ir::{Condition, Expr, Op};
 
 use super::{
     byte_sum,
-    context::{Binding, Cleanup, Lowering},
+    context::{Binding, Cleanup, LoopTargets, Lowering},
     cursor_staging, staging_copy, staging_slots, storage, uniform_batch,
 };
 
@@ -116,19 +116,19 @@ impl Lowering<'_> {
         storage::restore(&mut self.f, &region, &start);
     }
 
-    /// Emit a back edge to an unbounded lexical entry body with no break.
-    /// Returning from the body runs ordinary active-owner cleanup. A detached
-    /// continuation keeps unreachable following source valid for LLVM.
+    /// Emit an unbounded lexical entry loop with a possible break destination.
     pub(super) fn repeat_forever(&mut self, body: &[Op]) {
         let repeat = self.f.fresh_label();
+        let done = self.f.fresh_label();
         self.f.line(format!("br label %{repeat}"));
         self.f.label(&repeat);
         self.push_scope();
+        self.push_loop(&done, &repeat);
         self.operations(body);
+        self.pop_loop();
         self.pop_scope();
         self.f.line(format!("br label %{repeat}"));
-        let unreachable = self.f.fresh_label();
-        self.f.label(&unreachable);
+        self.f.label(&done);
     }
 
     /// Emit a counted loop with one evaluation of its unsigned bound.
@@ -166,6 +166,7 @@ impl Lowering<'_> {
         self.f.line(format!("store i64 0, ptr {index_slot}"));
         let condition = self.f.fresh_label();
         let iteration = self.f.fresh_label();
+        let advance = self.f.fresh_label();
         let done = self.f.fresh_label();
         self.f.line(format!("br label %{condition}"));
         self.f.label(&condition);
@@ -178,13 +179,31 @@ impl Lowering<'_> {
         self.f.label(&iteration);
         self.push_scope();
         self.bind(index_name, Binding::Scalar(index_slot.clone()));
+        self.push_loop(&done, &advance);
         self.operations(body);
+        self.pop_loop();
         self.pop_scope();
+        self.f.line(format!("br label %{advance}"));
+        self.f.label(&advance);
         let following = self.f.value(format!("add i64 {index}, 1"));
         self.f
             .line(format!("store i64 {following}, ptr {index_slot}"));
         self.f.line(format!("br label %{condition}"));
         self.f.label(&done);
+    }
+
+    /// Capture the cleanup boundary before lowering a new loop iteration.
+    pub(super) fn push_loop(&mut self, exit: &str, advance: &str) {
+        self.loops.push(LoopTargets {
+            exit: exit.to_owned(),
+            advance: advance.to_owned(),
+            cleanup_depth: self.cleanups.len(),
+        });
+    }
+
+    /// Restore the enclosing loop destinations after emitting the body.
+    pub(super) fn pop_loop(&mut self) {
+        self.loops.pop().expect("active loop targets");
     }
 
     /// Emit exactly one branch scope after evaluating its checked condition.

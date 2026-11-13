@@ -10,9 +10,9 @@ use super::CheckError;
 use super::definitions::Definitions;
 use super::scopes::{Binding, Environment};
 use crate::ir::{
-    Access, Argument, BoolExpr, BytesSource, Compare, Condition, Expr, FieldKind, Function,
-    FunctionArgument, FunctionParameterKind, OPTION_U64_FAMILY, Parameter, ResultArm,
-    ResultPattern,
+    Access, Argument, BoolExpr, BytesSource, Compare, Condition, EnumExpr, Expr, FieldKind,
+    Function, FunctionArgument, FunctionParameterKind, FunctionResult, OPTION_U64_FAMILY,
+    Parameter, ResultArm, ResultPattern, ResultSuccess,
 };
 use std::collections::HashSet;
 
@@ -187,6 +187,49 @@ pub(super) fn require_field(
     Ok(())
 }
 
+/// Resolve the nominal type of one enum value without exposing its discriminant.
+pub(super) fn enumeration<'p>(
+    value: &'p EnumExpr,
+    definitions: &Definitions<'p>,
+    context: Context<'_, 'p>,
+) -> Result<&'p str, CheckError> {
+    match value {
+        EnumExpr::Variant { kind, variant } => {
+            let declaration = definitions.enumeration(kind)?;
+            if !declaration.variants.contains(variant) {
+                return Err(CheckError::new(format!(
+                    "unknown enum case {kind}.{variant}"
+                )));
+            }
+            Ok(&declaration.name)
+        }
+        EnumExpr::Local(name) => {
+            let Context::Execution(environment) = context else {
+                return Err(CheckError::new("enum locals require an execution context"));
+            };
+            match environment.lookup(name)? {
+                Binding::Enum { kind, .. } => Ok(kind),
+                _ => Err(CheckError::new(format!("{name} is not an enum local"))),
+            }
+        }
+        EnumExpr::Read { reference, path } => {
+            let Context::Execution(environment) = context else {
+                return Err(CheckError::new(
+                    "enum field reads require an execution context",
+                ));
+            };
+            let reference = environment.reference(reference)?;
+            match field(definitions, reference.record, path)? {
+                FieldKind::Enum(kind) => Ok(kind),
+                _ => Err(CheckError::new(format!(
+                    "field path {} is not an enum",
+                    path.join(".")
+                ))),
+            }
+        }
+    }
+}
+
 /// Validate the boolean or both ordered unsigned operands of a condition.
 pub(super) fn condition<'p>(
     value: &'p Condition,
@@ -221,14 +264,23 @@ fn push_comparison<'a, 'p>(
     Ok(())
 }
 
-/// Check an immutable boolean independently of unsigned scalar expressions.
+/// Check a boolean expression independently of unsigned scalar expressions.
 pub(super) fn boolean<'p>(
     value: &'p BoolExpr,
     definitions: &Definitions<'p>,
     environment: &Environment<'p>,
 ) -> Result<(), CheckError> {
-    let pending = vec![Pending::Boolean(value, Context::Execution(environment))];
-    walk_in_environment(pending, definitions, environment)
+    boolean_context(value, definitions, Context::Execution(environment))
+}
+
+/// Check a boolean in an execution or pure producer context.
+pub(super) fn boolean_context<'p>(
+    value: &'p BoolExpr,
+    definitions: &Definitions<'p>,
+    context: Context<'_, 'p>,
+) -> Result<(), CheckError> {
+    let pending = vec![Pending::Boolean(value, context)];
+    walk_context(pending, definitions, context)
 }
 
 /// Schedule boolean children, preserving ordinary call edges and operand order.
@@ -240,13 +292,22 @@ fn push_boolean<'a, 'p>(
 ) -> Result<(), CheckError> {
     match value {
         BoolExpr::Const(_) => {}
+        BoolExpr::Read { reference, path } => {
+            let Context::Execution(environment) = context else {
+                return Err(CheckError::new(
+                    "boolean field reads require an execution context",
+                ));
+            };
+            let reference = environment.reference(reference)?;
+            require_field(definitions, reference.record, path, FieldKind::Bool)?;
+        }
         BoolExpr::Local(name) => {
             let Context::Execution(environment) = context else {
                 return Err(CheckError::new(
                     "boolean locals require an execution context",
                 ));
             };
-            if !matches!(environment.lookup(name)?, Binding::Boolean) {
+            if !matches!(environment.lookup(name)?, Binding::Boolean { .. }) {
                 return Err(CheckError::new(format!("{name} is not a boolean local")));
             }
         }
@@ -263,6 +324,15 @@ fn push_boolean<'a, 'p>(
             push_actuals(pending, callee, args, environment)?;
         }
         BoolExpr::Compare(value) => push_comparison(pending, value, context)?,
+        BoolExpr::EnumEq { left, right } => {
+            let left = enumeration(left, definitions, context)?;
+            let right = enumeration(right, definitions, context)?;
+            if left != right {
+                return Err(CheckError::new(format!(
+                    "cannot compare enum {left} with {right}"
+                )));
+            }
+        }
         BoolExpr::And(left, right) | BoolExpr::Or(left, right) => {
             // Both operands are checked and contribute call edges.
             pending.push(Pending::Boolean(right, context));
@@ -304,7 +374,7 @@ pub(super) enum ResultForwarding {
     /// A bare return forwards a result of the exact declared type.
     Exact,
     /// Explicit `try` can also lift a declared direct child.
-    Try,
+    Try(ResultSuccess),
 }
 
 /// Validate a result-forwarding call and its ordered actuals and record its
@@ -312,44 +382,62 @@ pub(super) enum ResultForwarding {
 pub(super) fn forward_result<'p>(
     name: &str,
     args: &'p [FunctionArgument],
-    family: &str,
+    result: &FunctionResult,
     forwarding: ResultForwarding,
     definitions: &Definitions<'p>,
     environment: &Environment<'p>,
 ) -> Result<(), CheckError> {
     let callee = definitions.function(name)?;
-    let source = callee.result.as_deref();
+    let source = callee.result.as_ref();
     match forwarding {
-        ResultForwarding::Exact if source != Some(family) => {
+        ResultForwarding::Exact
+            if source.map(|source| source.family.as_str()) != Some(&result.family) =>
+        {
             return Err(CheckError::new(format!(
-                "forwarded result from {name} must have error family {family}"
+                "forwarded result from {name} must have error family {}",
+                result.family
             )));
         }
-        ResultForwarding::Try => check_try_family(name, source, family, definitions)?,
+        ResultForwarding::Exact if source != Some(result) => {
+            return Err(CheckError::new(format!(
+                "forwarded result from {name} must have the exact success type"
+            )));
+        }
+        ResultForwarding::Try(success) => {
+            check_try_type(name, source, result, success, definitions)?
+        }
         ResultForwarding::Exact => {}
     }
     check_actuals(callee, args, definitions, environment)
 }
 
-/// Require an exact family or one direct child for either propagation operand.
-pub(super) fn check_try_family(
+/// Require the expected success and an exact or direct child failure family.
+pub(super) fn check_try_type(
     name: &str,
-    source: Option<&str>,
-    family: &str,
+    source: Option<&FunctionResult>,
+    result: &FunctionResult,
+    success: ResultSuccess,
     definitions: &Definitions<'_>,
 ) -> Result<(), CheckError> {
-    if family == OPTION_U64_FAMILY || source == Some(OPTION_U64_FAMILY) {
+    let family = result.family.as_str();
+    let source_family = source.map(|source| source.family.as_str());
+    if family == OPTION_U64_FAMILY || source_family == Some(OPTION_U64_FAMILY) {
         return Err(CheckError::new(
             "try requires a Result operand inside a Result function",
         ));
     }
-    if source != Some(family) {
+    if source_family != Some(family) {
         let target = definitions.error_family(family)?;
-        if source.is_none_or(|source| target.try_error_offset(source).is_none()) {
+        if source_family.is_none_or(|source| target.try_error_offset(source).is_none()) {
             return Err(CheckError::new(format!(
                 "try result from {name} must have error family {family} or a declared child"
             )));
         }
+    }
+    if source.is_none_or(|source| source.success != success) {
+        return Err(CheckError::new(format!(
+            "try result from {name} must have {success:?} success"
+        )));
     }
     Ok(())
 }
@@ -360,15 +448,15 @@ pub(super) fn result_initializer<'p>(
     args: &'p [FunctionArgument],
     definitions: &Definitions<'p>,
     environment: &Environment<'p>,
-) -> Result<&'p str, CheckError> {
+) -> Result<&'p FunctionResult, CheckError> {
     let callee = definitions.function(name)?;
-    let family = callee.result.as_deref().ok_or_else(|| {
+    let result = callee.result.as_ref().ok_or_else(|| {
         CheckError::new(format!(
             "result initializer {name} must return a typed result"
         ))
     })?;
     check_actuals(callee, args, definitions, environment)?;
-    Ok(family)
+    Ok(result)
 }
 
 /// Resolve a saved result's nominal family and check its complete partition.
@@ -378,13 +466,13 @@ pub(super) fn saved_result_subject<'p>(
     definitions: &Definitions<'p>,
     environment: &Environment<'p>,
 ) -> Result<&'p str, CheckError> {
-    let Binding::SavedResult(family) = environment.lookup(name)? else {
+    let Binding::SavedResult(result) = environment.lookup(name)? else {
         return Err(CheckError::new(format!(
             "{name} is not a saved result local"
         )));
     };
-    check_arms(patterns, family, definitions)?;
-    Ok(family)
+    check_arms(patterns, result, definitions)?;
+    Ok(&result.family)
 }
 
 /// Validate the call and its partition before checking any statement arm body.
@@ -396,12 +484,12 @@ pub(super) fn result_block_subject<'p>(
     environment: &Environment<'p>,
 ) -> Result<&'p str, CheckError> {
     let callee = definitions.function(name)?;
-    let family = callee.result.as_deref().ok_or_else(|| {
+    let result = callee.result.as_ref().ok_or_else(|| {
         CheckError::new(format!("result handler subject {name} has no error family"))
     })?;
-    check_arms(patterns, family, definitions)?;
+    check_arms(patterns, result, definitions)?;
     check_actuals(callee, args, definitions, environment)?;
-    Ok(family)
+    Ok(&result.family)
 }
 
 /// Check ordinary actuals using the ordered walker and register the call edge.
@@ -441,9 +529,10 @@ fn push_actuals<'a, 'p>(
 /// Check the disjoint tag partition of one immediate result handler.
 fn check_arms<'a>(
     patterns: impl ExactSizeIterator<Item = &'a ResultPattern>,
-    family: &str,
+    result: &FunctionResult,
     definitions: &Definitions<'_>,
 ) -> Result<(), CheckError> {
+    let family = result.family.as_str();
     let declared = definitions.error_family(family)?;
     let mut success = false;
     let mut cases = HashSet::new();
@@ -452,7 +541,12 @@ fn check_arms<'a>(
     let count = patterns.len();
     for (index, pattern) in patterns.enumerate() {
         match pattern {
-            ResultPattern::Ok(_) => {
+            ResultPattern::Ok(binding) => {
+                if result.success == ResultSuccess::Unit && binding.is_some() {
+                    return Err(CheckError::new(
+                        "Unit result success has no payload to bind",
+                    ));
+                }
                 if std::mem::replace(&mut success, true) {
                     return Err(CheckError::new("duplicate success arm"));
                 }
@@ -662,15 +756,15 @@ fn walk<'a, 'p>(
                     ));
                 };
                 let callee = definitions.function(function)?;
-                let family = callee.result.as_deref().ok_or_else(|| {
+                let result = callee.result.as_ref().ok_or_else(|| {
                     CheckError::new(format!(
                         "result handler subject {function} has no error family"
                     ))
                 })?;
-                check_arms(arms.iter().map(|arm| &arm.pattern), family, definitions)?;
+                check_arms(arms.iter().map(|arm| &arm.pattern), result, definitions)?;
                 // Actuals are scheduled last so they validate before any arm locals exist.
                 for arm in arms.iter().rev() {
-                    pending.push(Pending::Arm(arm, family, environment));
+                    pending.push(Pending::Arm(arm, &result.family, environment));
                 }
                 push_actuals(&mut pending, callee, args, environment)?;
             }

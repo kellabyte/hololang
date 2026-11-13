@@ -7,7 +7,9 @@
 use super::ModelError;
 use super::construction::{BuildFailure, Rejection};
 use super::ordinary::Outcome;
-use super::state::{Batch, Binding, ByteInput, ByteOrigin, Reference, Region, State, Stored};
+use super::state::{
+    Batch, Binding, ByteInput, ByteOrigin, LoopTransfer, Reference, Region, State, Stored,
+};
 use super::value::{Record, Value};
 use holo::ir::{Access, AppendArm, AppendPattern, Argument, ConstructArm, Expr, Op, ResultValue};
 use std::collections::BTreeMap;
@@ -15,7 +17,7 @@ use std::collections::BTreeMap;
 /// Match a semantic outcome and supply its optional binding without native tags.
 ///
 /// The outer option means the pattern matched. The inner option names an
-/// active payload or opaque error. Legacy rejection is outside typed handling.
+/// active payload or opaque error. A construct fallback may cover legacy rejection.
 fn match_outcome<'a, T>(
     pattern: &'a AppendPattern,
     outcome: &Result<T, Rejection>,
@@ -46,6 +48,7 @@ fn match_outcome<'a, T>(
             AppendPattern::Fallback(name),
             Err(Rejection::Full | Rejection::SizeOverflow | Rejection::Named { .. }),
         ) => Some(name.as_ref().map(|name| (name, Binding::Error))),
+        (AppendPattern::Fallback(None), Err(Rejection::Legacy)) => Some(None),
         _ => None,
     }
 }
@@ -79,17 +82,21 @@ impl State<'_> {
     }
 
     /// Bind a success or return the original failure under the caller's family.
-    fn propagate_result(&mut self, name: &str, outcome: Outcome) -> Result<(), ModelError> {
+    fn propagate_result(&mut self, name: Option<&str>, outcome: Outcome) -> Result<(), ModelError> {
         let target = self
             .ordinary_result_family
             .ok_or_else(|| ModelError::new("model try outside typed ordinary function"))?;
-        match outcome {
-            Outcome::Success(value) => self.declare(name, Binding::Scalar(value)),
-            Outcome::Failure {
-                family,
-                case,
-                payload,
-            } => {
+        match (name, outcome) {
+            (Some(name), Outcome::Success(value)) => self.declare(name, Binding::Scalar(value)),
+            (None, Outcome::SuccessUnit) => Ok(()),
+            (
+                _,
+                Outcome::Failure {
+                    family,
+                    case,
+                    payload,
+                },
+            ) => {
                 let (family, case) = self.lift_error(family, case, target)?;
                 self.returned = Some(Outcome::Failure {
                     family,
@@ -98,9 +105,9 @@ impl State<'_> {
                 });
                 Ok(())
             }
-            Outcome::Scalar(_) | Outcome::Boolean(_) => {
-                Err(ModelError::new("model try needs a typed result"))
-            }
+            _ => Err(ModelError::new(
+                "model try needs a result with the matching success type",
+            )),
         }
     }
 
@@ -111,7 +118,7 @@ impl State<'_> {
         for operation in operations {
             // Completion propagates out of structured bodies while their callers
             // still restore lexical markers and end their model owner lifetimes.
-            if self.exited || self.returned.is_some() {
+            if self.exited || self.returned.is_some() || self.loop_transfer.is_some() {
                 break;
             }
             self.execute(operation)?;
@@ -125,6 +132,12 @@ impl State<'_> {
         let result = self.execute_ops(operations);
         self.scopes.pop();
         result
+    }
+
+    /// Resolve a pending transfer after the iteration's lexical scope ends.
+    fn loop_finished(&mut self) -> bool {
+        let transferred = self.loop_transfer.take();
+        matches!(transferred, Some(LoopTransfer::Break)) || self.exited || self.returned.is_some()
     }
 
     /// Construct one private suffix and either publish a complete record or
@@ -220,8 +233,8 @@ impl State<'_> {
             .program
             .producers
             .iter()
-            .find(|candidate| candidate.name == producer && candidate.error.is_some())
-            .ok_or_else(|| ModelError::new("model scoped construction needs a typed producer"))?;
+            .find(|candidate| candidate.name == producer)
+            .ok_or_else(|| ModelError::new("unknown scoped constructor"))?;
         let start = self.regions[region].used;
         let actuals = self.arguments(args, &[])?;
         let outcome = match self.construct(producer, &actuals, region) {
@@ -261,13 +274,13 @@ impl State<'_> {
                     active: true,
                 });
                 // Discarding the name does not relinquish the tail early.
-                if let Some(name) = &arm.reference {
+                if let Some(binding) = &arm.reference {
                     locals.insert(
-                        name.clone(),
+                        binding.name.clone(),
                         Binding::Reference(Reference {
                             batch: id,
                             index: 0,
-                            access: Access::Readonly,
+                            access: binding.access,
                         }),
                     );
                 }
@@ -311,7 +324,7 @@ impl State<'_> {
         // never turns into a whole-function transaction or an implicit relocation.
         match operation {
             // Ordinary definitions have no executable effect in the entry sequence.
-            Op::Function(_) | Op::ErrorFamily(_) => Ok(()),
+            Op::Function(_) | Op::ErrorFamily(_) | Op::Enum(_) => Ok(()),
             // The bounded memory oracle owns no descriptors or live readiness.
             Op::TcpScope { .. }
             | Op::TcpIo { .. }
@@ -320,10 +333,28 @@ impl State<'_> {
             | Op::WaitInput { .. }
             | Op::Send { .. }
             | Op::WaitOutput { .. }
-            | Op::NextSession { .. }
-            | Op::Loop(_) => Err(ModelError::new(
-                "hosted input and unbounded entry loops are outside the memory model",
-            )),
+            | Op::NextSession { .. } => {
+                Err(ModelError::new("hosted input is outside the memory model"))
+            }
+            Op::Loop(body) => {
+                loop {
+                    // Even an empty iteration consumes budget.
+                    self.tick()?;
+                    self.scoped(body)?;
+                    if self.loop_finished() {
+                        break;
+                    }
+                }
+                Ok(())
+            }
+            Op::Break => {
+                self.loop_transfer = Some(LoopTransfer::Break);
+                Ok(())
+            }
+            Op::Continue => {
+                self.loop_transfer = Some(LoopTransfer::Continue);
+                Ok(())
+            }
             Op::Region {
                 name,
                 capacity,
@@ -388,9 +419,23 @@ impl State<'_> {
                 let value = self.expression(value, &[], None)?;
                 self.declare(name, Binding::Scalar(value))
             }
-            Op::LetBool { name, value } => {
+            Op::LetBool { name, value } | Op::VarBool { name, value } => {
                 let value = self.boolean(value)?;
                 self.declare(name, Binding::Boolean(value))
+            }
+            Op::LetEnum {
+                name,
+                value,
+                mutable,
+            } => {
+                let value = self.enumeration(value)?;
+                self.declare(
+                    name,
+                    Binding::Enum {
+                        value,
+                        mutable: *mutable,
+                    },
+                )
             }
             Op::BindBytes {
                 name,
@@ -412,11 +457,19 @@ impl State<'_> {
                 args,
             } => {
                 let outcome = self.invoke(function, args)?;
-                self.propagate_result(name, outcome)
+                self.propagate_result(Some(name), outcome)
             }
             Op::TrySaved { name, source } => {
                 let outcome = self.saved_result(source)?;
-                self.propagate_result(name, outcome)
+                self.propagate_result(Some(name), outcome)
+            }
+            Op::TryUnit { function, args } => {
+                let outcome = self.invoke(function, args)?;
+                self.propagate_result(None, outcome)
+            }
+            Op::TrySavedUnit { source } => {
+                let outcome = self.saved_result(source)?;
+                self.propagate_result(None, outcome)
             }
             Op::BindResult {
                 name,
@@ -442,6 +495,33 @@ impl State<'_> {
                 self.scalar(name)?;
                 let value = self.expression(value, &[], None)?;
                 self.replace(name, Binding::Scalar(value))
+            }
+            Op::SetBool { name, value } => {
+                if !matches!(self.binding(name)?, Binding::Boolean(_)) {
+                    return Err(ModelError::new(format!("{name} is not a boolean")));
+                }
+                let value = self.boolean(value)?;
+                self.replace(name, Binding::Boolean(value))
+            }
+            Op::SetEnum { name, value } => {
+                let value = self.enumeration(value)?;
+                let Binding::Enum {
+                    value: previous,
+                    mutable: true,
+                } = self.binding(name)?
+                else {
+                    return Err(ModelError::new("assignment to nonmutable enum local"));
+                };
+                if value.kind != previous.kind {
+                    return Err(ModelError::new("assignment across enum types"));
+                }
+                self.replace(
+                    name,
+                    Binding::Enum {
+                        value,
+                        mutable: true,
+                    },
+                )
             }
             Op::Append {
                 batch,
@@ -541,6 +621,39 @@ impl State<'_> {
                 let record = &mut self.batches[handle.batch].records[handle.index].record;
                 write_scalar(record, path, value)
             }
+            Op::WriteBool {
+                reference,
+                path,
+                value,
+            } => {
+                let handle = self.reference(reference)?;
+                self.require_write(&handle)?;
+                let replacement = self.boolean(value)?;
+                let record = &mut self.batches[handle.batch].records[handle.index].record;
+                let Value::Boolean(value) = project_mut(record, path)? else {
+                    return Err(ModelError::new("non-boolean write projection"));
+                };
+                *value = replacement;
+                Ok(())
+            }
+            Op::WriteEnum {
+                reference,
+                path,
+                value,
+            } => {
+                let handle = self.reference(reference)?;
+                self.require_write(&handle)?;
+                let replacement = self.enumeration(value)?;
+                let record = &mut self.batches[handle.batch].records[handle.index].record;
+                let Value::Enum(value) = project_mut(record, path)? else {
+                    return Err(ModelError::new("non-enum write projection"));
+                };
+                if replacement.kind != value.kind {
+                    return Err(ModelError::new("enum field write has incompatible type"));
+                }
+                *value = replacement;
+                Ok(())
+            }
             Op::WriteByte {
                 reference,
                 path,
@@ -624,17 +737,15 @@ impl State<'_> {
                 // Count is captured once. Every iteration has its own lexical
                 // bindings, while assignments to outer scalars remain visible.
                 for value in 0..count {
-                    // Entry completion ends the loop rather than spending model
-                    // budget on unreachable iterations after a nested exit.
-                    if self.exited || self.returned.is_some() {
-                        break;
-                    }
                     self.tick()?;
                     self.scopes.push(BTreeMap::new());
                     self.declare(index, Binding::Scalar(value))?;
                     let result = self.execute_ops(body);
                     self.scopes.pop();
                     result?;
+                    if self.loop_finished() {
+                        break;
+                    }
                 }
                 Ok(())
             }
@@ -648,10 +759,6 @@ impl State<'_> {
                 // Capture the initial published prefix. Appended records are not
                 // visited, and rebinding the body cursor cannot change progression.
                 for index in 0..view.count {
-                    // A completed process cannot visit another published record.
-                    if self.exited || self.returned.is_some() {
-                        break;
-                    }
                     self.tick()?;
                     self.scopes.push(BTreeMap::new());
                     self.declare(
@@ -665,6 +772,9 @@ impl State<'_> {
                     let result = self.execute_ops(body);
                     self.scopes.pop();
                     result?;
+                    if self.loop_finished() {
+                        break;
+                    }
                 }
                 Ok(())
             }
@@ -722,6 +832,7 @@ impl State<'_> {
                     ));
                 }
                 self.returned = Some(match value {
+                    ResultValue::OkUnit => Outcome::SuccessUnit,
                     ResultValue::Ok(value) => {
                         Outcome::Success(self.expression(value, &[], None)?)
                     }

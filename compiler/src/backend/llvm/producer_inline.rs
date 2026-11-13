@@ -232,7 +232,7 @@ fn charge(expr: &Expr, remaining: &mut usize) -> Option<()> {
     while let Some(expr) = pending.pop() {
         *remaining = remaining.checked_sub(1)?;
         match expr {
-            Expr::Binary { left, right, .. } => {
+            Expr::Binary { op, left, right } if !op.is_checked() => {
                 pending.push(left);
                 pending.push(right);
             }

@@ -92,8 +92,8 @@ impl Lowerer {
             // keeps its separate process cleanup and zero status.
             ast::StatementKind::Return(value) => {
                 // A typed return owns exactly one alternative and retains its nominal identity.
-                if let Some(family) = self.result_family.clone() {
-                    let result = self.result_return(value, &family, &mut output)?;
+                if let Some(result) = self.result.clone() {
+                    let result = self.result_return(value, &result, &mut output)?;
                     output.push(ir::Op::ReturnResult(result), statement.span, []);
                     return Ok(output);
                 }
@@ -149,6 +149,8 @@ impl Lowerer {
                 let body = self.scoped(body)?;
                 output.push(ir::Op::Loop(body.ops), statement.span, [body.spans]);
             }
+            ast::StatementKind::Break => output.push(ir::Op::Break, statement.span, []),
+            ast::StatementKind::Continue => output.push(ir::Op::Continue, statement.span, []),
             ast::StatementKind::Refill {
                 slot,
                 limit,
@@ -246,6 +248,11 @@ impl Lowerer {
     /// Lower a statement-position operation; status-bearing append cannot be discarded.
     /// Scalar and boolean calls may discard their value while retaining evaluation.
     fn operation(&mut self, expr: &ast::Expr, output: &mut Block) -> Result<(), Diagnostic> {
+        if let ast::ExprKind::Try(operand) = &expr.kind {
+            let operation = self.try_binding(None, operand, expr.span)?;
+            output.push(operation, expr.span, []);
+            return Ok(());
+        }
         if let Some((name, args)) = core_call(expr) {
             // The closed helper subset admits assertion traps but no external
             // observation or owner invalidation through statement builtins.
@@ -344,7 +351,7 @@ impl Lowerer {
         ))
     }
 
-    /// Lower explicit scalar/reference rebinding or fixed-shape field/byte mutation.
+    /// Lower explicit local rebinding or fixed-shape field/byte mutation.
     /// Binding mutability never grants new write authority or changes root rules.
     fn assign(
         &mut self,
@@ -369,6 +376,17 @@ impl Lowerer {
                             [],
                         );
                     }
+                    Kind::Bool { mutable: true } => {
+                        let value = self.boolean(value, output)?;
+                        output.push(
+                            ir::Op::SetBool {
+                                name: binding.ir_name,
+                                value,
+                            },
+                            span,
+                            [],
+                        );
+                    }
                     Kind::Reference { mutable: true, .. } => {
                         let source = self.named(value)?;
                         if !matches!(source.kind, Kind::Reference { .. }) {
@@ -386,33 +404,55 @@ impl Lowerer {
                             [],
                         );
                     }
+                    Kind::Enum {
+                        kind,
+                        mutable: true,
+                    } => {
+                        let value = self.expect_enum(value, &kind)?;
+                        output.push(
+                            ir::Op::SetEnum {
+                                name: binding.ir_name,
+                                value,
+                            },
+                            span,
+                            [],
+                        );
+                    }
                     _ => {
                         return Err(Diagnostic::new(
                             target.span,
-                            "binding cannot be reassigned; use var for scalars/references (owners remain noncopyable)",
+                            "binding cannot be reassigned; use var for scalar or reference locals (owners remain noncopyable)",
                         ));
                     }
                 }
             }
-            // A field store changes only existing u64 data; shape metadata is inaccessible.
+            // A field store changes only existing scalar data; shape metadata is inaccessible.
             ast::ExprKind::Member { .. } => {
                 let (reference, path, kind) = self.projection(target)?;
-                if kind != ir::FieldKind::U64 {
-                    return Err(Diagnostic::new(
-                        target.span,
-                        "only existing u64 fields can be assigned; record/Bytes shape replacement is unsupported",
-                    ));
-                }
-                let value = self.scalar(value, output)?;
-                output.push(
-                    ir::Op::Write {
+                let operation = match kind {
+                    ir::FieldKind::U64 => ir::Op::Write {
                         reference,
                         path,
-                        value,
+                        value: self.scalar(value, output)?,
                     },
-                    span,
-                    [],
-                );
+                    ir::FieldKind::Bool => ir::Op::WriteBool {
+                        reference,
+                        path,
+                        value: self.boolean(value, output)?,
+                    },
+                    ir::FieldKind::Enum(kind) => ir::Op::WriteEnum {
+                        reference,
+                        path,
+                        value: self.expect_enum(value, &kind)?,
+                    },
+                    _ => {
+                        return Err(Diagnostic::new(
+                            target.span,
+                            "only existing scalar fields can be assigned; record/Bytes shape replacement is unsupported",
+                        ));
+                    }
+                };
+                output.push(operation, span, []);
             }
             ast::ExprKind::Index { base, index } => {
                 if matches!(base.kind, ast::ExprKind::Bytes(_)) {

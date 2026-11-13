@@ -42,6 +42,8 @@ struct LocalBindings {
     functions: Members,
     /// Every struct by bare source name and its canonical nominal schema name.
     records: RecordNames,
+    /// Every payload-free enum, private or exported.
+    enums: RecordNames,
     /// Every error family, with the same nominal identity for local and public uses.
     errors: ErrorNames,
 }
@@ -177,6 +179,7 @@ fn check_library_package<'a>(
     let module = bind_package(
         ast::Module {
             records: Vec::new(),
+            enums: Vec::new(),
             functions: Vec::new(),
             errors: Vec::new(),
         },
@@ -491,6 +494,7 @@ fn read_namespace<'a>(
             qualified,
             public: Members::new(),
             public_records: RecordNames::new(),
+            public_enums: RecordNames::new(),
             public_errors: ErrorNames::new(),
         },
         local: LocalBindings::default(),
@@ -531,6 +535,7 @@ fn read_namespace<'a>(
     }
     // Fields and signatures can name records declared in later contributors.
     index_records(&mut namespace, sources)?;
+    index_enums(&mut namespace, sources)?;
     check_record_fields(&namespace)?;
     index_errors(&mut namespace, sources)?;
     index_functions(&mut namespace, sources)?;
@@ -545,8 +550,9 @@ fn index_errors(namespace: &mut Namespace, sources: &[SourceFile<'_>]) -> Result
     for file in &namespace.files {
         for declaration in &file.module.errors {
             let name = &declaration.name;
-            if matches!(name.as_str(), "u64" | "bool" | "Bytes" | "Result")
+            if matches!(name.as_str(), "u64" | "bool" | "Bytes" | "Result" | "Unit")
                 || namespace.local.records.contains_key(name)
+                || namespace.local.enums.contains_key(name)
             {
                 return Err(Diagnostic::new(
                     declaration.span,
@@ -576,6 +582,44 @@ fn index_errors(namespace: &mut Namespace, sources: &[SourceFile<'_>]) -> Result
     Ok(())
 }
 
+/// Bind enums across namespace contributors before checking record fields.
+fn index_enums(namespace: &mut Namespace, sources: &[SourceFile<'_>]) -> Result<(), Diagnostic> {
+    let mut declarations = HashMap::<&str, Span>::new();
+    for file in &namespace.files {
+        for declaration in &file.module.enums {
+            let name = &declaration.name;
+            if matches!(
+                name.as_str(),
+                "u64" | "bool" | "Bytes" | "Unit" | "Result" | "Option"
+            ) || namespace.local.records.contains_key(name)
+            {
+                return Err(Diagnostic::new(
+                    declaration.span,
+                    format!("duplicate or reserved enum type `{name}`"),
+                ));
+            }
+            if let Some(first) = declarations.insert(name, declaration.span) {
+                let first = source_location(sources, first.start);
+                return Err(Diagnostic::new(
+                    declaration.span,
+                    format!("duplicate library enum `{name}`; first declared at {first}"),
+                ));
+            }
+            namespace.local.enums.insert(
+                name.clone(),
+                format!("{}.{name}", namespace.interface.qualified),
+            );
+        }
+        for name in &file.public_enums {
+            namespace
+                .interface
+                .public_enums
+                .insert(name.clone(), namespace.local.enums[name].clone());
+        }
+    }
+    Ok(())
+}
+
 /// Collect every record in source order and expose only its public names.
 /// Each schema identity is nominal. The graph selects one provider per package,
 /// so its full namespace and type name are unique without a runtime descriptor.
@@ -585,7 +629,7 @@ fn index_records(namespace: &mut Namespace, sources: &[SourceFile<'_>]) -> Resul
     for file in &namespace.files {
         for record in &file.module.records {
             // Builtin type names keep their ordinary meanings in every namespace.
-            if matches!(record.name.as_str(), "u64" | "bool" | "Bytes") {
+            if matches!(record.name.as_str(), "u64" | "bool" | "Bytes" | "Unit") {
                 return Err(Diagnostic::new(
                     record.span,
                     format!(
@@ -638,7 +682,19 @@ fn check_record_fields(namespace: &Namespace) -> Result<(), Diagnostic> {
                 .contains_key(&record.name);
             for field in &record.fields {
                 // Builtins have no declaration whose visibility can restrict them.
-                if matches!(field.ty.as_str(), "u64" | "Bytes") {
+                if matches!(field.ty.as_str(), "u64" | "bool" | "Bytes") {
+                    continue;
+                }
+                if namespace.local.enums.contains_key(&field.ty) {
+                    if public && !namespace.interface.public_enums.contains_key(&field.ty) {
+                        return Err(Diagnostic::new(
+                            field.span,
+                            format!(
+                                "public struct `{}` cannot expose private enum `{}` in field `{}`",
+                                record.name, field.ty, field.name
+                            ),
+                        ));
+                    }
                     continue;
                 }
                 // Reject unresolved names before merging namespaces with distinct type tables.
@@ -646,7 +702,7 @@ fn check_record_fields(namespace: &Namespace) -> Result<(), Diagnostic> {
                     return Err(Diagnostic::new(
                         field.span,
                         format!(
-                            "package field `{}` requires a namespace-local struct, `u64`, or `Bytes`; found `{}`",
+                            "package field `{}` requires a namespace-local struct or enum, `u64`, `bool`, or `Bytes`; found `{}`",
                             field.name, field.ty
                         ),
                     ));
@@ -702,7 +758,7 @@ fn index_functions(
                         ),
                     ));
                 }
-                if !matches!(success, "u64" | "bool" | SCALAR_OPTION)
+                if !matches!(success, "u64" | "bool" | "Unit" | SCALAR_OPTION)
                     && !namespace.interface.public_records.contains_key(success)
                 {
                     return Err(Diagnostic::new(
@@ -855,6 +911,8 @@ fn bind_namespaces(
                     Some("function")
                 } else if local.records.contains_key(&import.leaf) {
                     Some("struct")
+                } else if local.enums.contains_key(&import.leaf) {
+                    Some("enum")
                 } else if local.errors.contains_key(&import.leaf) {
                     Some("error family")
                 } else {
@@ -875,6 +933,7 @@ fn bind_namespaces(
                 local: &local.functions,
                 imports: Some(&imports),
                 records: Some(&local.records),
+                enums: Some(&local.enums),
                 errors: Some(&local.errors),
             };
             // Preserve the field order and bind the validated inline record
@@ -883,11 +942,19 @@ fn bind_namespaces(
                 record.name = local.records[&record.name].clone();
                 for field in &mut record.fields {
                     // Builtins have no namespace identity to rewrite.
-                    if let Some(identity) = local.records.get(&field.ty) {
+                    if let Some(identity) = local
+                        .records
+                        .get(&field.ty)
+                        .or_else(|| local.enums.get(&field.ty))
+                    {
                         field.ty.clone_from(identity);
                     }
                 }
                 module.records.push(record);
+            }
+            for mut declaration in file.module.enums {
+                declaration.name = local.enums[&declaration.name].clone();
+                module.enums.push(declaration);
             }
             // Definitions and every result signature use the same nominal family.
             for mut declaration in file.module.errors {
@@ -910,7 +977,7 @@ fn bind_namespaces(
                 } else if let Some((success, family)) = result_parts(&function.result) {
                     // Signature checking already established each nonbuiltin
                     // result component in the namespace's corresponding map.
-                    let success = if success == "u64" {
+                    let success = if matches!(success, "u64" | "Unit") {
                         success
                     } else {
                         &local.records[success]

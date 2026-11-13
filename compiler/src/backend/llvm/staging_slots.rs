@@ -187,7 +187,11 @@ fn select<'a>(
             }
             Op::ConstructHandled { arms, .. } => {
                 // A success binding can shadow a reference from the preheader.
-                introduced.extend(arms.iter().filter_map(|arm| arm.reference.as_deref()));
+                introduced.extend(
+                    arms.iter().filter_map(|arm| {
+                        arm.reference.as_ref().map(|binding| binding.name.as_str())
+                    }),
+                );
             }
             Op::HandleResult { arms, .. } | Op::HandleSavedResult { arms, .. } => {
                 for arm in arms {
@@ -289,6 +293,7 @@ fn visit<'a>(body: &'a [Op], visitor: &mut impl FnMut(&'a Op)) {
             // These operations contain no nested entry blocks.
             Op::Function(_)
             | Op::ErrorFamily(_)
+            | Op::Enum(_)
             | Op::WaitInput { .. }
             | Op::WaitOutput { .. }
             | Op::NextSession { .. }
@@ -296,17 +301,27 @@ fn visit<'a>(body: &'a [Op], visitor: &mut impl FnMut(&'a Op)) {
             | Op::Send { .. }
             | Op::Let { .. }
             | Op::LetBool { .. }
+            | Op::VarBool { .. }
+            | Op::LetEnum { .. }
             | Op::BindBytes { .. }
             | Op::BindResult { .. }
             | Op::TryLet { .. }
             | Op::TrySaved { .. }
+            | Op::TryUnit { .. }
+            | Op::TrySavedUnit { .. }
             | Op::Set { .. }
+            | Op::SetBool { .. }
+            | Op::SetEnum { .. }
+            | Op::Break
+            | Op::Continue
             | Op::Append { .. }
             | Op::AppendHandled { .. }
             | Op::Borrow { .. }
             | Op::Alias { .. }
             | Op::AssignRef { .. }
             | Op::Write { .. }
+            | Op::WriteBool { .. }
+            | Op::WriteEnum { .. }
             | Op::WriteByte { .. }
             | Op::WriteInputByte { .. }
             | Op::WriteViewByte { .. }

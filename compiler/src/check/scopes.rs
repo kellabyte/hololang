@@ -11,7 +11,8 @@ use super::expressions::{self, Context};
 use super::{CheckError, HostedIo, PrivatePlacement};
 use crate::ir::{
     Access, AppendPattern, Argument, BytesSource, ConstructArm, FieldKind, Function,
-    FunctionParameterKind, Op, Producer, Refill, ResultBlockArm, ResultPattern, ResultValue,
+    FunctionParameterKind, FunctionResult, Op, Producer, Refill, ResultBlockArm, ResultPattern,
+    ResultSuccess, ResultValue,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -46,10 +47,20 @@ pub(super) enum Binding<'p> {
         /// Whether `Set` may update this scalar; loop indices are readonly.
         writable: bool,
     },
-    /// Immutable boolean, distinct from unsigned scalar locals.
-    Boolean,
+    /// Boolean, distinct from unsigned scalar locals.
+    Boolean {
+        /// Whether `SetBool` may update this local.
+        writable: bool,
+    },
+    /// Enum local with a fixed nominal type.
+    Enum {
+        /// Checked enum declaration identity.
+        kind: &'p str,
+        /// Whether assignment may replace this value.
+        writable: bool,
+    },
     /// Immutable result family, independent of the initializer's borrows.
-    SavedResult(&'p str),
+    SavedResult(&'p FunctionResult),
     /// An arm-local error with its checked nominal family, never a scalar tag.
     Error {
         /// Family of the subject's failure result.
@@ -75,7 +86,7 @@ pub(super) enum Binding<'p> {
     BatchView(Reference<'p>),
     /// Checked reference into one live owner root.
     Reference(Reference<'p>),
-    /// Immutable success name for a record constructed directly at its final address.
+    /// Non-rebindable success path to a record constructed at its final address.
     ScopedReference(Reference<'p>),
     /// Immutable Bytes formal whose observations address the typed formal index.
     Bytes,
@@ -104,6 +115,8 @@ pub(super) struct Environment<'p> {
     next_root: usize,
     /// Next entry-operation preorder index, including all structured child bodies.
     next_operation: usize,
+    /// Number of enclosing loops available to a local break or continue.
+    loop_depth: usize,
     /// Ordinary helper whose closed local frame is being checked, if any.
     function: Option<&'p Function>,
     /// Entry effects that require the host and its optional output support.
@@ -128,6 +141,7 @@ impl<'p> Environment<'p> {
             constructed_tails: Vec::new(),
             next_root: 0,
             next_operation: 0,
+            loop_depth: 0,
             function: None,
             hosted: HostedIo::default(),
             allows_tcp_scope: false,
@@ -473,7 +487,7 @@ pub(super) fn validate<'p>(
     // execute and may coexist with that root without changing close authority.
     let mut executable = body
         .iter()
-        .filter(|op| !matches!(op, Op::Function(_) | Op::ErrorFamily(_)));
+        .filter(|op| !matches!(op, Op::Function(_) | Op::ErrorFamily(_) | Op::Enum(_)));
     environment.allows_tcp_scope =
         matches!(executable.next(), Some(Op::TcpScope { .. })) && executable.next().is_none();
     operations(body, definitions, &mut environment)?;
@@ -493,7 +507,7 @@ pub(super) fn validate_function<'p>(
     for parameter in &function.params {
         let binding = match &parameter.kind {
             FunctionParameterKind::U64 => Binding::Scalar { writable: false },
-            FunctionParameterKind::Bool => Binding::Boolean,
+            FunctionParameterKind::Bool => Binding::Boolean { writable: false },
             FunctionParameterKind::Bytes | FunctionParameterKind::WritableBytes => Binding::Bytes,
             FunctionParameterKind::State(record) => {
                 definitions.require_scalar_record(record)?;
@@ -594,23 +608,33 @@ fn operation_check<'p>(
             Op::Scope(_)
                 | Op::Let { .. }
                 | Op::LetBool { .. }
+                | Op::VarBool { .. }
+                | Op::LetEnum { .. }
                 | Op::BindBytes { .. }
                 | Op::BindResult { .. }
                 | Op::TryLet { .. }
                 | Op::TrySaved { .. }
+                | Op::TryUnit { .. }
+                | Op::TrySavedUnit { .. }
                 | Op::HandleResult { .. }
                 | Op::HandleSavedResult { .. }
                 | Op::Set { .. }
+                | Op::SetBool { .. }
+                | Op::SetEnum { .. }
                 | Op::Borrow { .. }
                 | Op::Alias { .. }
                 | Op::AssignRef { .. }
                 | Op::Write { .. }
+                | Op::WriteBool { .. }
+                | Op::WriteEnum { .. }
                 | Op::WriteByte { .. }
                 | Op::WriteInputByte { .. }
                 | Op::WriteViewByte { .. }
                 | Op::MoveInputBytes { .. }
                 | Op::Repeat { .. }
                 | Op::ForEach { .. }
+                | Op::Break
+                | Op::Continue
                 | Op::If { .. }
                 | Op::Assert(_)
                 | Op::Return(_)
@@ -641,10 +665,10 @@ fn operation_check<'p>(
     }
     match operation {
         // Only outermost declarations enter the static table, with no runtime action.
-        Op::Function(_) | Op::ErrorFamily(_) => {
+        Op::Function(_) | Op::ErrorFamily(_) | Op::Enum(_) => {
             if environment.scopes.len() != 1 {
                 return Err(CheckError::new(
-                    "function or error-family declaration must be at the outermost level",
+                    "function, error-family, or enum declaration must be at the outermost level",
                 ));
             }
         }
@@ -742,7 +766,19 @@ fn operation_check<'p>(
             environment.insert(result, Binding::Scalar { writable: false })?;
         }
         // The loop cannot publish an iteration's local bindings at its back edge.
-        Op::Loop(body) => scope(body, definitions, environment)?,
+        Op::Loop(body) => loop_scope(body, None, definitions, environment)?,
+        Op::Break | Op::Continue => {
+            if environment.loop_depth == 0 {
+                let keyword = if matches!(operation, Op::Break) {
+                    "break"
+                } else {
+                    "continue"
+                };
+                return Err(CheckError::new(format!(
+                    "`{keyword}` requires an enclosing loop"
+                )));
+            }
+        }
         // Acquisition creates the owner only in the success scope.
         Op::Region {
             name,
@@ -799,9 +835,29 @@ fn operation_check<'p>(
             expressions::expression(value, definitions, Context::Execution(environment))?;
             environment.insert(name, Binding::Scalar { writable: true })?;
         }
-        Op::LetBool { name, value } => {
+        Op::LetBool { name, value } | Op::VarBool { name, value } => {
             expressions::boolean(value, definitions, environment)?;
-            environment.insert(name, Binding::Boolean)?;
+            environment.insert(
+                name,
+                Binding::Boolean {
+                    writable: matches!(operation, Op::VarBool { .. }),
+                },
+            )?;
+        }
+        Op::LetEnum {
+            name,
+            value,
+            mutable,
+        } => {
+            let kind =
+                expressions::enumeration(value, definitions, Context::Execution(environment))?;
+            environment.insert(
+                name,
+                Binding::Enum {
+                    kind,
+                    writable: *mutable,
+                },
+            )?;
         }
         Op::BindBytes {
             name,
@@ -830,42 +886,52 @@ fn operation_check<'p>(
             function,
             args,
         } => {
-            let family = expressions::result_initializer(function, args, definitions, environment)?;
-            environment.insert(name, Binding::SavedResult(family))?;
+            let result = expressions::result_initializer(function, args, definitions, environment)?;
+            environment.insert(name, Binding::SavedResult(result))?;
         }
         // Only the success continuation gains an immutable scalar. Failure
         // exits the owner-free frame with the same family or a checked child lift.
-        Op::TryLet {
-            name,
-            function,
-            args,
-        } => {
-            let family = environment
+        Op::TryLet { function, args, .. } | Op::TryUnit { function, args } => {
+            let result = environment
                 .function
-                .and_then(|function| function.result.as_deref())
-                .ok_or_else(|| CheckError::new("try requires a scalar typed-result function"))?;
+                .and_then(|function| function.result.as_ref())
+                .ok_or_else(|| {
+                    CheckError::new(
+                        "try requires a scalar typed-result function or a Result<Unit, E> function",
+                    )
+                })?;
+            let (name, success) = try_binding(operation);
             expressions::forward_result(
                 function,
                 args,
-                family,
-                expressions::ResultForwarding::Try,
+                result,
+                expressions::ResultForwarding::Try(success),
                 definitions,
                 environment,
             )?;
-            environment.insert(name, Binding::Scalar { writable: false })?;
+            if let Some(name) = name {
+                environment.insert(name, Binding::Scalar { writable: false })?;
+            }
         }
-        Op::TrySaved { name, source } => {
-            let family = environment
+        Op::TrySaved { source, .. } | Op::TrySavedUnit { source } => {
+            let result = environment
                 .function
-                .and_then(|function| function.result.as_deref())
-                .ok_or_else(|| CheckError::new("try requires a scalar typed-result function"))?;
+                .and_then(|function| function.result.as_ref())
+                .ok_or_else(|| {
+                    CheckError::new(
+                        "try requires a scalar typed-result function or a Result<Unit, E> function",
+                    )
+                })?;
             let Binding::SavedResult(actual) = environment.lookup(source)? else {
                 return Err(CheckError::new(format!(
                     "{source} is not a saved result local"
                 )));
             };
-            expressions::check_try_family(source, Some(actual), family, definitions)?;
-            environment.insert(name, Binding::Scalar { writable: false })?;
+            let (name, success) = try_binding(operation);
+            expressions::check_try_type(source, Some(actual), result, success, definitions)?;
+            if let Some(name) = name {
+                environment.insert(name, Binding::Scalar { writable: false })?;
+            }
         }
         // Scalar mutation cannot replace a backing owner, reference, or loop index.
         Op::Set { name, value } => {
@@ -876,6 +942,35 @@ fn operation_check<'p>(
             ) {
                 return Err(CheckError::new(format!(
                     "{name} is not a writable scalar local"
+                )));
+            }
+        }
+        Op::SetBool { name, value } => {
+            expressions::boolean(value, definitions, environment)?;
+            if !matches!(
+                environment.lookup(name)?,
+                Binding::Boolean { writable: true }
+            ) {
+                return Err(CheckError::new(format!(
+                    "{name} is not a writable boolean local"
+                )));
+            }
+        }
+        Op::SetEnum { name, value } => {
+            let actual =
+                expressions::enumeration(value, definitions, Context::Execution(environment))?;
+            let Binding::Enum {
+                kind,
+                writable: true,
+            } = environment.lookup(name)?
+            else {
+                return Err(CheckError::new(format!(
+                    "{name} is not a writable enum local"
+                )));
+            };
+            if kind != actual {
+                return Err(CheckError::new(format!(
+                    "cannot assign enum {actual} to {kind}"
                 )));
             }
         }
@@ -906,7 +1001,7 @@ fn operation_check<'p>(
             })?;
             check_destination_arms(
                 arms.iter().map(|arm| (&arm.pattern, arm)),
-                family,
+                Some(family),
                 "append",
                 definitions,
                 |arm, local| {
@@ -1041,6 +1136,31 @@ fn operation_check<'p>(
             expressions::require_field(definitions, reference.record, path, FieldKind::U64)?;
             expressions::expression(value, definitions, Context::Execution(environment))?;
         }
+        Op::WriteBool {
+            reference,
+            path,
+            value,
+        } => {
+            let reference = environment.writable_reference(reference)?;
+            expressions::require_field(definitions, reference.record, path, FieldKind::Bool)?;
+            expressions::boolean(value, definitions, environment)?;
+        }
+        Op::WriteEnum {
+            reference,
+            path,
+            value,
+        } => {
+            let reference = environment.writable_reference(reference)?;
+            let actual =
+                expressions::enumeration(value, definitions, Context::Execution(environment))?;
+            if !matches!(expressions::field(definitions, reference.record, path)?, FieldKind::Enum(kind) if kind == actual)
+            {
+                return Err(CheckError::new(format!(
+                    "field path {} cannot store enum {actual}",
+                    path.join(".")
+                )));
+            }
+        }
         // Byte stores can replace a byte but cannot mutate its payload length/header.
         Op::WriteByte {
             reference,
@@ -1106,10 +1226,12 @@ fn operation_check<'p>(
         // The count is evaluated outside a fresh body scope with a readonly index.
         Op::Repeat { count, index, body } => {
             expressions::expression(count, definitions, Context::Execution(environment))?;
-            environment.scopes.push(HashMap::new());
-            environment.insert(index, Binding::Scalar { writable: false })?;
-            operations(body, definitions, environment)?;
-            environment.scopes.pop();
+            loop_scope(
+                body,
+                Some((index, Binding::Scalar { writable: false })),
+                definitions,
+                environment,
+            )?;
         }
         // The cursor views the snapshot prefix; extending the owner remains sound.
         Op::ForEach {
@@ -1119,11 +1241,13 @@ fn operation_check<'p>(
             body,
         } => {
             let view = environment.batch_view(batch, *access)?;
-            environment.scopes.push(HashMap::new());
-            environment.insert(reference, Binding::Reference(view))?;
             // The cursor is a normal rooted path: append stays valid, reset cannot pass it.
-            operations(body, definitions, environment)?;
-            environment.scopes.pop();
+            loop_scope(
+                body,
+                Some((reference, Binding::Reference(view))),
+                definitions,
+                environment,
+            )?;
         }
         // Both branches must be well-typed even when a condition is currently constant.
         Op::If {
@@ -1186,15 +1310,22 @@ fn operation_check<'p>(
             expressions::boolean(value, definitions, environment)?;
         }
         Op::ReturnResult(value) => {
-            let family = environment
+            let result = environment
                 .function
-                .and_then(|function| function.result.as_deref())
+                .and_then(|function| function.result.as_ref())
                 .ok_or_else(|| {
                     CheckError::new("typed result return requires a typed-result function")
                 })?;
+            let family = result.family.as_str();
             match value {
-                ResultValue::Ok(value) => {
+                ResultValue::Ok(value) if result.success == ResultSuccess::U64 => {
                     expressions::expression(value, definitions, Context::Execution(environment))?
+                }
+                ResultValue::OkUnit if result.success == ResultSuccess::Unit => {}
+                ResultValue::Ok(_) | ResultValue::OkUnit => {
+                    return Err(CheckError::new(
+                        "return success must match the declared Result success type",
+                    ));
                 }
                 ResultValue::Error {
                     family: actual,
@@ -1219,7 +1350,7 @@ fn operation_check<'p>(
                 ResultValue::Call { function, args } => expressions::forward_result(
                     function,
                     args,
-                    family,
+                    result,
                     expressions::ResultForwarding::Exact,
                     definitions,
                     environment,
@@ -1230,9 +1361,14 @@ fn operation_check<'p>(
                             "{name} is not a saved result local"
                         )));
                     };
-                    if actual != family {
+                    if actual.family != family {
                         return Err(CheckError::new(format!(
                             "saved result {name} must have the exact return family {family}"
+                        )));
+                    }
+                    if actual != result {
+                        return Err(CheckError::new(format!(
+                            "saved result {name} must have the exact success type"
                         )));
                     }
                 }
@@ -1249,6 +1385,15 @@ fn operation_check<'p>(
         }
     }
     Ok(())
+}
+
+/// Resolve whether a checked try form introduces a scalar success binding.
+fn try_binding(operation: &Op) -> (Option<&str>, ResultSuccess) {
+    match operation {
+        Op::TryLet { name, .. } | Op::TrySaved { name, .. } => (Some(name), ResultSuccess::U64),
+        Op::TryUnit { .. } | Op::TrySavedUnit { .. } => (None, ResultSuccess::Unit),
+        _ => unreachable!("only try operations carry this expectation"),
+    }
 }
 
 /// Validate each statement arm under a fresh scope with only its active payload.
@@ -1321,10 +1466,7 @@ fn check_construct<'p>(
     environment: &mut Environment<'p>,
 ) -> Result<(), CheckError> {
     let definition = definitions.producer(producer)?;
-    let family = definition
-        .error
-        .as_deref()
-        .ok_or_else(|| CheckError::new("construct outcome handler requires a typed producer"))?;
+    let family = definition.error.as_deref();
     expressions::arguments(
         args,
         &definition.params,
@@ -1355,14 +1497,14 @@ fn check_construct<'p>(
             // alias/rebind rules keep any projection tied to this lifetime.
             if success {
                 environment.constructed_tails.push(region_root);
-                if let Some(name) = &arm.reference {
+                if let Some(binding) = &arm.reference {
                     let reference = Reference {
                         root: environment.root(),
                         root_depth: environment.scopes.len() - 1,
                         record: &definition.record,
-                        access: Access::Readonly,
+                        access: binding.access,
                     };
-                    environment.insert(name, Binding::ScopedReference(reference))?;
+                    environment.insert(&binding.name, Binding::ScopedReference(reference))?;
                 }
             }
             // Failure exposes only an active rejection payload, if requested.
@@ -1379,19 +1521,21 @@ fn check_construct<'p>(
     )
 }
 
-/// Verify the typed destination outcome partition and visit each active arm.
+/// Verify the destination outcome partition and visit each active arm.
 ///
 /// The callback receives only the binding justified by this pattern. It checks
 /// each arm's own body and may advance the lexical traversal; no target data
 /// or result storage is created by partition checking.
 fn check_destination_arms<'p, A>(
     arms: impl ExactSizeIterator<Item = (&'p AppendPattern, A)>,
-    family: &'p str,
+    family: Option<&'p str>,
     destination: &str,
     definitions: &Definitions<'p>,
     mut check: impl FnMut(A, Option<(&'p str, Binding<'p>)>) -> Result<(), CheckError>,
 ) -> Result<(), CheckError> {
-    let declared = definitions.error_family(family)?;
+    let declared = family
+        .map(|family| definitions.error_family(family))
+        .transpose()?;
     let arm_count = arms.len();
     let mut success = false;
     let mut full = false;
@@ -1423,6 +1567,11 @@ fn check_destination_arms<'p, A>(
                 case,
                 binding,
             } => {
+                let family = family.ok_or_else(|| {
+                    CheckError::new(format!(
+                        "named {destination} rejection requires a typed producer"
+                    ))
+                })?;
                 let case = definitions.error_case(family, actual, case)?;
                 // Distinct nominal cases cannot overlap and inactive payload
                 // lanes cannot be exposed through a scalar binding.
@@ -1450,9 +1599,15 @@ fn check_destination_arms<'p, A>(
                     )));
                 }
                 fallback = true;
-                binding
-                    .as_deref()
-                    .map(|name| (name, Binding::Error { family }))
+                match (binding.as_deref(), family) {
+                    (Some(name), Some(family)) => Some((name, Binding::Error { family })),
+                    (Some(_), None) => {
+                        return Err(CheckError::new(format!(
+                            "{destination} error fallback cannot bind a value"
+                        )));
+                    }
+                    (None, _) => None,
+                }
             }
         };
         // A binding introduced by a public IR client must have a usable name.
@@ -1469,6 +1624,11 @@ fn check_destination_arms<'p, A>(
         return Err(CheckError::new(format!("missing {destination} ok arm")));
     }
     if !fallback {
+        let (Some(family), Some(declared)) = (family, declared) else {
+            return Err(CheckError::new(format!(
+                "untyped {destination} requires an error fallback arm"
+            )));
+        };
         if !full || !overflow {
             let missing = if !full { "Full" } else { "SizeOverflow" };
             return Err(CheckError::new(format!(
@@ -1548,6 +1708,24 @@ fn scope<'p>(
 ) -> Result<(), CheckError> {
     environment.scopes.push(HashMap::new());
     operations(body, definitions, environment)?;
+    environment.scopes.pop();
+    Ok(())
+}
+
+/// Check a loop body with a fresh scope and its optional index or element binding.
+fn loop_scope<'p>(
+    body: &'p [Op],
+    local: Option<(&'p str, Binding<'p>)>,
+    definitions: &Definitions<'p>,
+    environment: &mut Environment<'p>,
+) -> Result<(), CheckError> {
+    environment.scopes.push(HashMap::new());
+    if let Some((name, binding)) = local {
+        environment.insert(name, binding)?;
+    }
+    environment.loop_depth += 1;
+    operations(body, definitions, environment)?;
+    environment.loop_depth -= 1;
     environment.scopes.pop();
     Ok(())
 }

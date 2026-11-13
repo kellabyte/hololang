@@ -115,7 +115,7 @@ impl Lowering<'_> {
         self.bind(result_name, Binding::ScalarValue(value));
     }
 
-    /// Construct one typed local directly into the checked region's free tail.
+    /// Construct one local directly into the checked region's free tail.
     ///
     /// The selected success arm receives the final address in SSA and owns one
     /// active marker cleanup. Failure arms run after rollback and may reuse the
@@ -145,9 +145,9 @@ impl Lowering<'_> {
                     start: attempt.start.clone(),
                 });
                 // A discarded result still owns the tail for the complete arm.
-                if let Some(name) = &arm.reference {
+                if let Some(binding) = &arm.reference {
                     self.bind(
-                        name,
+                        &binding.name,
                         Binding::ScopedReference {
                             pointer: attempt.destination.clone(),
                             record: record.clone(),
@@ -160,8 +160,8 @@ impl Lowering<'_> {
             }
             self.operations(&arm.body);
             self.pop_scope();
-            // Entry return emits its active cleanup and leaves an unreachable
-            // continuation. The normal arm exit below covers other paths.
+            // A return or loop transfer emits its active cleanup and leaves
+            // a detached continuation. Fallthrough restores the tail here.
             if success {
                 self.cleanups
                     .pop()

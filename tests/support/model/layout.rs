@@ -91,7 +91,7 @@ fn shape(
     // Field order determines whether the sole variable component is the final tail.
     for (position, field) in record.fields.iter().enumerate() {
         let nested = match &field.kind {
-            FieldKind::U64 => Shape {
+            FieldKind::U64 | FieldKind::Bool | FieldKind::Enum(_) => Shape {
                 variable: false,
                 derivable: true,
             },

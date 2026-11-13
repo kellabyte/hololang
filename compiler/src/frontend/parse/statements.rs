@@ -70,6 +70,37 @@ impl Parser<'_> {
                 kind: StatementKind::Loop(body),
                 span: Span { start, end },
             })
+        } else if (self.at_word("break") || self.at_word("continue"))
+            && self.tokens.get(self.position + 1).is_some_and(|token| {
+                matches!(
+                    token.kind,
+                    TokenKind::Newline | TokenKind::Symbol(';' | '}') | TokenKind::Eof
+                )
+            })
+        {
+            // A bare control word ends the statement. Calls and assignments can
+            // still use the same spelling as an ordinary name.
+            let kind = if self.at_word("break") {
+                StatementKind::Break
+            } else {
+                StatementKind::Continue
+            };
+            let span = self.advance().span;
+            self.end_statement()?;
+            Ok(Statement { kind, span })
+        } else if self.at_word("try")
+            && matches!(
+                self.tokens.get(self.position + 1).map(|token| &token.kind),
+                Some(TokenKind::Ident(_))
+            )
+        {
+            let value = self.binding_operand()?;
+            let span = value.span;
+            self.end_statement()?;
+            Ok(Statement {
+                kind: StatementKind::Expr(value),
+                span,
+            })
         } else if self.at_word("refill")
             && matches!(
                 self.tokens.get(self.position + 1).map(|token| &token.kind),
@@ -226,11 +257,12 @@ impl Parser<'_> {
     /// Parse outcome blocks following a standalone expression.
     /// Nested blocks use the same depth and separator rules as other statements.
     fn block_handler(&mut self, subject: Expr) -> Result<(StatementKind, usize), Diagnostic> {
+        let constructor = is_construct(&subject);
         let mut arms = Vec::new();
         let mut column = None;
         // Each written arm contributes one lexical block and its own source range.
         while let Some((start, pattern)) =
-            self.result_arm_header(subject.span.start, &mut column)?
+            self.result_arm_header(subject.span.start, &mut column, constructor)?
         {
             self.newlines();
             let (body, end) = self.block()?;
@@ -240,7 +272,6 @@ impl Parser<'_> {
                 span: Span { start, end },
             });
         }
-        let constructor = is_construct(&subject);
         if let Some(end) = arms.last().map(|arm| arm.span.end) {
             let kind = if constructor {
                 StatementKind::Construct { subject, arms }

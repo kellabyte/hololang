@@ -97,6 +97,18 @@ pub(super) fn store_u64(f: &mut Function, pointer: &str, value: &str) {
     f.line(format!("store i64 {value}, ptr {pointer}, align 1"));
 }
 
+/// Read a canonical boolean byte as the native boolean type.
+pub(super) fn load_bool(f: &mut Function, pointer: &str) -> String {
+    let byte = f.value(format!("load i8, ptr {pointer}, align 1"));
+    f.value(format!("trunc i8 {byte} to i1"))
+}
+
+/// Store an i1 boolean as a fully initialized byte containing zero or one.
+pub(super) fn store_bool(f: &mut Function, pointer: &str, value: &str) {
+    let byte = f.value(format!("zext i1 {value} to i8"));
+    f.line(format!("store i8 {byte}, ptr {pointer}, align 1"));
+}
+
 /// Compiler-side cursor and field offsets for one checked fixed producer.
 ///
 /// Each successful reserve supplies the next cursor in SSA. Nested success

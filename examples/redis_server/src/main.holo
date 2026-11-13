@@ -14,10 +14,16 @@ using redis_server.store
 // publishes copied offsets in one fixed record only after the complete
 // request passes length, delimiter, command, and arity checks.
 
+enum Command {
+    Unset
+    Get
+    Set
+}
+
 // Completed request metadata in the caller's reusable record.
 struct Request {
-    // One for GET, two for SET, and zero before the first success.
-    command u64
+    // Unset until the parser publishes its first complete request.
+    command Command
     // Wire bytes consumed starting from the request's first byte.
     consumed u64
     // Absolute offset in the supplied byte view of the validated key.
@@ -36,7 +42,7 @@ func empty_request
     returns Request
 {
     return Request {
-        command: 0,
+        command: Command.Unset,
         consumed: 0,
         key_offset: 0,
         key_length: 0,
@@ -72,11 +78,11 @@ func request_decimal
     if wire[start] != marker {
         return error RequestError.Malformed
     }
-    let first = core.add_wrapping(start, 1)
+    let first = start + 1
     if first == extent {
         return error RequestError.NeedMore(core.add_wrapping(extent, 1))
     }
-    var length = core.sub_wrapping(extent, first)
+    var length = extent - first
     // Twenty digits exhaust u64. The following byte must be CR or establish
     // a terminal decimal error, so the search can stop at that position.
     if length > 21 {
@@ -124,9 +130,9 @@ func request_bulk_payload
     returns Result<u64, RequestError>
 {
     // A validated header is dollar, one to three digits, and CRLF.
-    let payload = core.add_wrapping(core.add_wrapping(header, decimal.digit_count(length)), 3)
-    let ending = core.add_wrapping(payload, length)
-    let next = core.add_wrapping(ending, 2)
+    let payload = header + decimal.digit_count(length) + 3
+    let ending = payload + length
+    let next = ending + 2
     let extent = core.len(wire)
     // Inspect the first trailer byte as soon as it is live. A malformed
     // partial trailer can therefore fail before the next byte arrives.
@@ -136,7 +142,7 @@ func request_bulk_payload
     if extent < next {
         return error RequestError.NeedMore(next)
     }
-    if wire[core.add_wrapping(ending, 1)] != 10 {
+    if wire[ending + 1] != 10 {
         return error RequestError.Malformed
     }
     return ok payload
@@ -167,7 +173,7 @@ func parse_request
     if count < 2 or count > 3 {
         return error RequestError.Malformed
     }
-    let command_header = core.add_wrapping(start, 4)
+    let command_header = start + 4
     let command_length = try request_decimal(wire, command_header, 36)
     // Both commands have exactly three bytes and the same framing overhead.
     if command_length != core.len(b"GET") {
@@ -175,31 +181,31 @@ func parse_request
     }
     let command_start = try request_bulk_payload(wire, command_header, command_length)
     let name = core.subrange(wire, command_start, command_length)
-    var command = 1
+    var command = Command.Get
     if count == 3 {
         if not bytes.equal_ignore_ascii_case(name, b"SET") {
             return error RequestError.Malformed
         }
-        command = 2
+        command = Command.Set
     } else {
         if not bytes.equal_ignore_ascii_case(name, b"GET") {
             return error RequestError.Malformed
         }
     }
 
-    let key_header = core.add_wrapping(command_start, 5)
+    let key_header = command_start + 5
     let key_length = try request_decimal(wire, key_header, 36)
     if key_length > 32 {
         return error RequestError.OverLimit
     }
     // Validate key framing before computing the value's header offset.
     let key_offset = try request_bulk_payload(wire, key_header, key_length)
-    let after_key = core.add_wrapping(core.add_wrapping(key_offset, key_length), 2)
+    let after_key = key_offset + key_length + 2
     var value_offset = 0
     var value_length = 0
     var after_request = after_key
     // SET admits exactly one value. GET publishes zero in both value fields.
-    if command == 2 {
+    if command == Command.Set {
         let parsed_length = try request_decimal(wire, after_key, 36)
         if parsed_length > 128 {
             return error RequestError.OverLimit
@@ -207,12 +213,12 @@ func parse_request
         let parsed_offset = try request_bulk_payload(wire, after_key, parsed_length)
         value_length = parsed_length
         value_offset = parsed_offset
-        after_request = core.add_wrapping(core.add_wrapping(parsed_offset, parsed_length), 2)
+        after_request = parsed_offset + parsed_length + 2
     }
 
     // Every body and trailer has been validated. Publish together at this
     // boundary so incomplete and terminal errors cannot alter caller state.
-    let consumed = core.sub_wrapping(after_request, start)
+    let consumed = after_request - start
     request.command = command
     request.consumed = consumed
     request.key_offset = key_offset
@@ -312,219 +318,225 @@ func main
         core.assert(false)
         return 0
     }
-    let writers = core.batch(writer_memory, write.Cursor)
-    let writer_status = core.append(writers, write.start())
-    core.assert(writer_status == 0)
-    let writer = core.borrow_readwrite(writers, 0)
-
-    let request_memory = core.region(64) else {
-        core.assert(false);
-        return 0
-    }
-    let requests = core.batch(request_memory, Request)
-    let request_status = core.append(requests, empty_request())
-    core.assert(request_status == 0)
-    let request = core.borrow_readwrite(requests, 0)
-
-    let table_memory = core.region(4096) else {
-        core.assert(false);
-        return 0
-    }
-    let entries = core.batch(table_memory, store.Slot)
-    // Initialize all slots once. Updates mutate a checked prefix in place.
-    for index in core.range(entries_capacity) {
-        let status = core.append(entries, store.empty_slot(key_capacity, value_capacity))
-        core.assert(status == 0)
-    }
-
-    var filled = 0
-    var cursor = 0
-    var sent = 0
-    var reply_length = 0
-    var close_after_reply = 0
-    var session_finished = 0
-    loop {
-        // Advancing the session discards only stream state. A prior SET
-        // remains committed even if the peer never read its reply.
-        if session_finished == 1 {
-            let next = core.next_session()
-            net.next_session_result(next)
-                on ok then {
-                    filled = 0
-                    cursor = 0
-                    sent = 0
-                    reply_length = 0
-                    close_after_reply = 0
-                    session_finished = 0
-                }
-                on Interrupted then {
-                    // Keep the session finished so the loop retries accept.
-                }
-                on End then {
-                    return 0
-                }
-                on error then {
-                    // A failed accept leaves no client to serve.
-                    return 0
-                }
-        } else {
-            // A partially written reply owns the output slot until all its
-            // bytes are accepted or the session terminates.
-            if sent < reply_length {
-                let reply_bytes = core.prefix(reply.wire, reply_length)
-                let remaining = core.sub_wrapping(core.len(reply_bytes), sent)
-                let outcome = core.send(reply_bytes, sent, remaining)
-                net.send_result(outcome)
-                    on ok(count) then {
-                        sent = core.add_wrapping(sent, count)
+    core.construct(writer_memory, write.start())
+        on ok(readwrite writer) then {
+            let request_memory = core.region(64) else {
+                core.assert(false);
+                return 0
+            }
+            core.construct(request_memory, empty_request())
+                on ok(readwrite request) then {
+                    let table_memory = core.region(4096) else {
+                        core.assert(false);
+                        return 0
                     }
-                    on Interrupted then {
-                        // Retry from the same send offset.
+                    let entries = core.batch(table_memory, store.Slot)
+                    // Initialize all slots once. Updates mutate a checked prefix in place.
+                    for index in core.range(entries_capacity) {
+                        let status = core.append(entries, store.empty_slot(key_capacity, value_capacity))
+                        core.assert(status == 0)
                     }
-                    on WouldBlock then {
-                        let ready = core.wait_output()
-                        net.wait_result(ready)
-                            on ok then {
+
+                    var filled = 0
+                    var cursor = 0
+                    var sent = 0
+                    var reply_length = 0
+                    var close_after_reply = false
+                    var session_finished = false
+                    loop {
+                        // Advancing the session discards only stream state. A prior SET
+                        // remains committed even if the peer never read its reply.
+                        if session_finished {
+                            let next = core.next_session()
+                            net.next_session_result(next)
+                                on ok then {
+                                    filled = 0
+                                    cursor = 0
+                                    sent = 0
+                                    reply_length = 0
+                                    close_after_reply = false
+                                    session_finished = false
+                                }
+                                on Interrupted then {
+                                    // Keep the session finished so the loop retries accept.
+                                }
+                                on End then {
+                                    break
+                                }
+                                on error then {
+                                    // A failed accept leaves no client to serve.
+                                    break
+                                }
+                            continue
+                        }
+
+                        // A partially written reply owns the output slot until all its
+                        // bytes are accepted or the session terminates.
+                        if sent < reply_length {
+                            let reply_bytes = core.prefix(reply.wire, reply_length)
+                            let remaining = core.sub_wrapping(core.len(reply_bytes), sent)
+                            let outcome = core.send(reply_bytes, sent, remaining)
+                            net.send_result(outcome)
+                                on ok(count) then {
+                                    sent = core.add_wrapping(sent, count)
+                                }
+                                on Interrupted then {
+                                    // Retry from the same send offset.
+                                }
+                                on WouldBlock then {
+                                    let ready = core.wait_output()
+                                    net.wait_result(ready)
+                                        on ok then {
+                                        }
+                                        on Interrupted then {
+                                        }
+                                        on error then {
+                                            session_finished = true
+                                        }
+                                }
+                                on error then {
+                                    session_finished = true
+                                }
+                            continue
+                        }
+                        if close_after_reply {
+                            session_finished = true
+                            continue
+                        }
+
+                        // Bytes before cursor belong to completed requests. Keep
+                        // all pending bytes in place unless a new read needs room.
+                        if cursor == filled {
+                            cursor = 0
+                            filled = 0
+                        }
+                        var read_needed = true
+                        var reply_error = 0
+                        if cursor < filled {
+                            let pending_input = core.prefix(pending.wire, filled)
+                            parse_request(request, pending_input, cursor)
+                                on ok(consumed) then {
+                                    core.assert(consumed > 0)
+                                    read_needed = false
+                                    cursor = core.add_wrapping(cursor, consumed)
+
+                                    let key = core.subrange(pending_input, request.key_offset, request.key_length)
+                                    sent = 0
+                                    if request.command == Command.Get {
+                                        let match_index = store.find(entries, key)
+                                        match_index
+                                            on Some(index) then {
+                                                let hit = core.borrow_readonly(entries, index)
+                                                write_bulk_reply(writer, reply.wire, core.prefix(hit.value, hit.value_length))
+                                                    on ok(length) then {
+                                                        reply_length = length
+                                                    }
+                                                    on error then {
+                                                        core.assert(false)
+                                                    }
+                                            }
+                                            on None then {
+                                                reply_length = bytes.move(reply.wire, b"$-1\r\n")
+                                            }
+                                    } else {
+                                        core.assert(request.command == Command.Set)
+                                        let value = core.subrange(pending_input, request.value_offset, request.value_length)
+                                        store.put(entries, key, value)
+                                            on ok then {
+                                                reply_length = bytes.move(reply.wire, b"+OK\r\n")
+                                            }
+                                            on Full then {
+                                                reply_error = 5
+                                            }
+                                            on OverLimit then {
+                                                reply_error = 3
+                                                close_after_reply = true
+                                            }
+                                    }
+                                }
+                                on NeedMore(required) then {
+                                    core.assert(required > filled)
+                                }
+                                on Malformed then {
+                                    read_needed = false
+                                    close_after_reply = true
+                                    reply_error = 2
+                                }
+                                on OverLimit then {
+                                    read_needed = false
+                                    close_after_reply = true
+                                    reply_error = 3
+                                }
+                                on Overflow then {
+                                    read_needed = false
+                                    close_after_reply = true
+                                    reply_error = 4
+                                }
+                        }
+                        if read_needed {
+                            // The unread tail may overlap its destination at the start of the slot.
+                            if cursor > 0 {
+                                filled = buffer.compact(pending.wire, cursor, filled)
+                                cursor = 0
                             }
-                            on Interrupted then {
-                            }
-                            on error then {
-                                session_finished = 1
-                            }
-                    }
-                    on error then {
-                        session_finished = 1
-                    }
-            } else {
-                if close_after_reply == 1 {
-                    session_finished = 1
-                } else {
-                    // Bytes before cursor belong to completed requests. Keep
-                    // all pending bytes in place unless a new read needs room.
-                    if cursor == filled {
-                        cursor = 0
-                        filled = 0
-                    }
-                    var read_needed = 1
-                    var reply_error = 0
-                    if cursor < filled {
-                        let pending_input = core.prefix(pending.wire, filled)
-                        parse_request(request, pending_input, cursor)
-                            on ok(consumed) then {
-                                core.assert(consumed > 0)
-                                read_needed = 0
-                                cursor = core.add_wrapping(cursor, consumed)
-
-                                let key = core.subrange(pending_input, request.key_offset, request.key_length)
-                                sent = 0
-                                if request.command == 1 {
-                                    let match_index = store.find(entries, key)
-                                    match_index
-                                        on Some(index) then {
-                                            let hit = core.borrow_readonly(entries, index)
-                                            write_bulk_reply(writer, reply.wire, core.prefix(hit.value, hit.value_length))
-                                                on ok(length) then {
-                                                    reply_length = length
+                            let room = buffer.space(pending.wire, filled)
+                            if room == 0 {
+                                close_after_reply = true
+                                reply_error = 3
+                            } else {
+                                let readwrite free_tail = core.subrange(pending.wire, filled, room)
+                                refill free_tail, room as chunk {
+                                    filled = core.add_wrapping(filled, core.len(chunk))
+                                } else status {
+                                    net.recv_result(status)
+                                        on ok(count) then {
+                                            // Only EOF reaches this arm. Progress goes to chunk.
+                                            core.assert(count == 0)
+                                            // A half-closed peer can still read the truncation reply.
+                                            if filled == 0 {
+                                                session_finished = true
+                                            } else {
+                                                close_after_reply = true
+                                                reply_error = 1
+                                            }
+                                        }
+                                        on Interrupted then {
+                                        }
+                                        on WouldBlock then {
+                                            let ready = core.wait_input()
+                                            net.wait_result(ready)
+                                                on ok then {
+                                                }
+                                                on Interrupted then {
                                                 }
                                                 on error then {
-                                                    core.assert(false)
+                                                    session_finished = true
                                                 }
                                         }
-                                        on None then {
-                                            reply_length = bytes.move(reply.wire, b"$-1\r\n")
-                                        }
-                                } else {
-                                    let value = core.subrange(pending_input, request.value_offset, request.value_length)
-                                    store.put(entries, key, value)
-                                        on ok then {
-                                            reply_length = bytes.move(reply.wire, b"+OK\r\n")
-                                        }
-                                        on Full then {
-                                            reply_error = 5
-                                        }
-                                        on OverLimit then {
-                                            reply_error = 3
-                                            close_after_reply = 1
+                                        on error then {
+                                            session_finished = true
                                         }
                                 }
                             }
-                            on NeedMore(required) then {
-                                core.assert(required > filled)
-                            }
-                            on Malformed then {
-                                read_needed = 0
-                                close_after_reply = 1
-                                reply_error = 2
-                            }
-                            on OverLimit then {
-                                read_needed = 0
-                                close_after_reply = 1
-                                reply_error = 3
-                            }
-                            on Overflow then {
-                                read_needed = 0
-                                close_after_reply = 1
-                                reply_error = 4
-                            }
-                    }
-                    if read_needed == 1 {
-                        // The unread tail may overlap its destination at the start of the slot.
-                        if cursor > 0 {
-                            filled = buffer.compact(pending.wire, cursor, filled)
-                            cursor = 0
                         }
-                        let room = buffer.space(pending.wire, filled)
-                        if room == 0 {
-                            close_after_reply = 1
-                            reply_error = 3
-                        } else {
-                            let readwrite free_tail = core.subrange(pending.wire, filled, room)
-                            refill free_tail, room as chunk {
-                                filled = core.add_wrapping(filled, core.len(chunk))
-                            } else status {
-                                net.recv_result(status)
-                                    on ok(count) then {
-                                        // Only EOF reaches this arm. Progress goes to chunk.
-                                        core.assert(count == 0)
-                                        // A half-closed peer can still read the truncation reply.
-                                        if filled == 0 {
-                                            session_finished = 1
-                                        } else {
-                                            close_after_reply = 1
-                                            reply_error = 1
-                                        }
-                                    }
-                                    on Interrupted then {
-                                    }
-                                    on WouldBlock then {
-                                        let ready = core.wait_input()
-                                        net.wait_result(ready)
-                                            on ok then {
-                                            }
-                                            on Interrupted then {
-                                            }
-                                            on error then {
-                                                session_finished = 1
-                                            }
-                                    }
-                                    on error then {
-                                        session_finished = 1
-                                    }
-                            }
+                        // A single bounded simple-error frame covers parse and
+                        // store failures. Only fatal framing closes the connection.
+                        if reply_error != 0 {
+                            let prefix = bytes.move(reply.wire, b"-ERR ")
+                            reply.wire[prefix] = core.add_wrapping(48, reply_error)
+                            let ending = core.add_wrapping(prefix, 1)
+                            let trailer = bytes.move(core.subrange(reply.wire, ending, core.len(b"\r\n")), b"\r\n")
+                            sent = 0
+                            reply_length = core.add_wrapping(ending, trailer)
                         }
-                    }
-                    // A single bounded simple-error frame covers parse and
-                    // store failures. Only fatal framing closes the connection.
-                    if reply_error != 0 {
-                        let prefix = bytes.move(reply.wire, b"-ERR ")
-                        reply.wire[prefix] = core.add_wrapping(48, reply_error)
-                        let ending = core.add_wrapping(prefix, 1)
-                        let trailer = bytes.move(core.subrange(reply.wire, ending, core.len(b"\r\n")), b"\r\n")
-                        sent = 0
-                        reply_length = core.add_wrapping(ending, trailer)
                     }
                 }
-            }
+                on error then {
+                    core.assert(false)
+                }
         }
-    }
+        on error then {
+            core.assert(false)
+        }
+    return 0
 }

@@ -71,6 +71,11 @@ address in its success arm. Tail release restores a saved top without enumeratin
 nested values. The driver handles tool discovery, target selection, and native
 linking.
 
+Each loop records the cleanup depth at entry. `break` and `continue` emit the
+cleanups for scopes they exit before branching to the nearest loop's exit or
+advance block. For a finite traversal, `continue` follows the normal cursor
+or index advance path.
+
 The experimental TCP entry receives an admitted descriptor in SSA and may
 borrow a host-owned readiness queue. Its single outer lexical owner adds one
 native close on each reachable normal exit. A direct explicit close removes

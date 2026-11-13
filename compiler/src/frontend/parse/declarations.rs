@@ -6,7 +6,7 @@
 
 use super::{LeafPath, Library, NameKind, Parser, PathMode, valid_leaf_name, valid_path_segment};
 use crate::frontend::ast::{
-    Argument, ErrorCaseDecl, ErrorDecl, FieldDecl, Function, Module, RecordDecl,
+    Argument, EnumDecl, ErrorCaseDecl, ErrorDecl, FieldDecl, Function, Module, RecordDecl,
 };
 use crate::lex::TokenKind;
 use crate::source::{Diagnostic, Span};
@@ -28,10 +28,12 @@ impl Parser<'_> {
     /// parser and the resolver checks identity without adding generated state.
     pub(super) fn library(&mut self, mode: PathMode) -> Result<Library, Diagnostic> {
         let mut records = Vec::new();
+        let mut enums = Vec::new();
         let mut errors = Vec::new();
         let mut functions = Vec::new();
         let mut public_names = Vec::new();
         let mut public_records = Vec::new();
+        let mut public_enums = Vec::new();
         let mut public_errors = Vec::new();
         self.separators();
         // Recognize the optional source identity before any declarations.
@@ -79,6 +81,13 @@ impl Parser<'_> {
                     public_records.push(record.name.clone());
                 }
                 records.push(record);
+            } else if matches!(mode, PathMode::Package) && self.at_word("enum") {
+                let mut declaration = self.enumeration()?;
+                if public {
+                    declaration.span.start = start;
+                    public_enums.push(declaration.name.clone());
+                }
+                enums.push(declaration);
             } else if matches!(mode, PathMode::Package) && self.at_word("error") {
                 let mut error = self.error_family()?;
                 // Retain the marker for formatting and export the name only in package mode.
@@ -102,11 +111,13 @@ impl Parser<'_> {
         Ok(Library {
             module: Module {
                 records,
+                enums,
                 errors,
                 functions,
             },
             public_names,
             public_records,
+            public_enums,
             public_errors,
             namespace,
             imports,
@@ -201,6 +212,7 @@ impl Parser<'_> {
     /// Unknown top-level forms are rejected rather than interpreted as executable code.
     pub(super) fn module(&mut self) -> Result<Module, Diagnostic> {
         let mut records = Vec::new();
+        let mut enums = Vec::new();
         let mut errors = Vec::new();
         let mut functions = Vec::new();
         self.separators();
@@ -209,6 +221,8 @@ impl Parser<'_> {
             self.reject_import_directive()?;
             if self.at_word("struct") {
                 records.push(self.record()?);
+            } else if self.at_word("enum") {
+                enums.push(self.enumeration()?);
             } else if self.at_word("error") {
                 errors.push(self.error_family()?);
             } else if self.at_word("func") {
@@ -216,15 +230,40 @@ impl Parser<'_> {
             } else {
                 return Err(Diagnostic::new(
                     self.span(),
-                    "expected `struct` or `func` declaration, or an `error` family",
+                    "expected `struct` or `func` declaration, an `enum`, or an `error` family",
                 ));
             }
             self.separators();
         }
         Ok(Module {
             records,
+            enums,
             errors,
             functions,
+        })
+    }
+
+    /// Parse a closed list of variant names without assigning representation tags.
+    fn enumeration(&mut self) -> Result<EnumDecl, Diagnostic> {
+        let start = self.expect_word("enum")?.start;
+        let (name, _) = self.declared_identifier(NameKind::Enum)?;
+        self.newlines();
+        self.expect_symbol('{')?;
+        self.separators();
+        let mut variants = Vec::new();
+        while !self.at_symbol('}') {
+            variants.push(self.declared_identifier(NameKind::EnumVariant)?);
+            if self.take_symbol(',') || matches!(self.current().kind, TokenKind::Ident(_)) {
+                self.separators();
+            } else {
+                self.end_statement()?;
+            }
+        }
+        let end = self.expect_symbol('}')?.end;
+        Ok(EnumDecl {
+            name,
+            variants,
+            span: Span { start, end },
         })
     }
 

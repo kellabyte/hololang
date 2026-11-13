@@ -9,7 +9,7 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 
-use crate::ir::{FieldKind, Program};
+use crate::ir::{EnumDef, FieldKind, Program};
 use crate::layout::LayoutPlan;
 
 use super::{
@@ -22,6 +22,8 @@ pub(super) struct Module<'a> {
     pub(super) program: &'a Program,
     pub(super) layout: &'a LayoutPlan,
     pub(super) byte_literals: ByteLiterals,
+    /// Checked declarations indexed once for lowering all enum literals.
+    pub(super) enums: HashMap<&'a str, &'a EnumDef>,
 }
 
 /// Native storage associated with a checked lexical binding.
@@ -33,6 +35,12 @@ pub(super) enum Binding {
     ScalarValue(String),
     /// Immutable boolean in its native i1 representation.
     Boolean(String),
+    /// Mutable boolean stored in a fixed i1 entry slot.
+    BooleanSlot(String),
+    /// Immutable enum discriminant in SSA.
+    Enum(String),
+    /// Mutable enum discriminant stored in a fixed i8 entry slot.
+    EnumSlot(String),
     /// Immutable result with its payload and tag captured in SSA.
     SavedResult {
         /// Captured tag and payload.
@@ -85,7 +93,7 @@ pub(super) enum Binding {
         /// Exact initialized byte-field extent from a proved cursor batch.
         extent: Option<u64>,
     },
-    /// Readonly reference to the single record owned by a success arm.
+    /// Direct reference to the single record owned by a success arm.
     ScopedReference {
         /// Address passed to the producer, already in SSA.
         pointer: String,
@@ -127,10 +135,22 @@ pub(super) enum Cleanup {
     },
 }
 
+/// Native destinations and the cleanup boundary for one enclosing loop.
+pub(super) struct LoopTargets {
+    /// Continuation after the loop.
+    pub(super) exit: String,
+    /// Back edge for a plain loop or the advance block for a finite traversal.
+    pub(super) advance: String,
+    /// Number of active cleanups belonging to scopes outside this loop.
+    pub(super) cleanup_depth: usize,
+}
+
 /// Mutable emission state for exactly one native function.
 pub(super) struct Lowering<'a> {
     /// Validated program supplying schemas and constructor identities.
     pub(super) program: &'a Program,
+    /// Checked enum declarations shared across emitted functions.
+    pub(super) enums: &'a HashMap<&'a str, &'a EnumDef>,
     /// Checked schema-driven representation; no runtime layout dispatch is emitted.
     pub(super) layout: &'a LayoutPlan,
     /// SSA and basic-block text under construction.
@@ -172,6 +192,8 @@ pub(super) struct Lowering<'a> {
     scopes: Vec<HashMap<String, Binding>>,
     /// Outermost-first lexical cleanup actions, retained across emitted branches.
     pub(super) cleanups: Vec<Cleanup>,
+    /// Loop destinations, innermost last.
+    pub(super) loops: Vec<LoopTargets>,
 }
 
 impl<'a> Lowering<'a> {
@@ -182,6 +204,7 @@ impl<'a> Lowering<'a> {
     pub(super) fn new(module: &'a Module<'a>, header: String, params: Vec<Input>) -> Self {
         Self {
             program: module.program,
+            enums: &module.enums,
             layout: module.layout,
             f: Function::new(header),
             text_literals: Vec::new(),
@@ -201,6 +224,7 @@ impl<'a> Lowering<'a> {
             hosted_session: false,
             scopes: vec![HashMap::new()],
             cleanups: Vec::new(),
+            loops: Vec::new(),
         }
     }
 
@@ -419,6 +443,9 @@ impl<'a> Lowering<'a> {
                 }
                 pointer = match field.kind {
                     FieldKind::U64 => storage::advance(&mut self.f, &pointer, "8"),
+                    FieldKind::Bool | FieldKind::Enum(_) => {
+                        storage::advance(&mut self.f, &pointer, "1")
+                    }
                     FieldKind::Bytes => {
                         let len = self.byte_length(&pointer);
                         let width = self.layout.length_bytes().to_string();

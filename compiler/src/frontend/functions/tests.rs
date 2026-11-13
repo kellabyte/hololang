@@ -271,7 +271,7 @@ fn headers_and_contracts_reject_unsupported_modes() {
     }
 }
 
-/// Scalars reject unknown core calls, contextual-index escape, implicit arithmetic, and extra effects.
+/// Scalars reject unknown core calls, contextual-index escape, infix bitwise operators, and extra effects.
 #[test]
 fn pure_expression_boundaries_are_explicit() {
     let cases = [
@@ -284,8 +284,8 @@ fn pure_expression_boundaries_are_explicit() {
             "unsupported pure core call",
         ),
         (
-            "func bad\nreturns u64\n{ return 1 + 2 }",
-            "numeric policy remains open",
+            "func bad\nreturns u64\n{ return 1 & 2 }",
+            "infix bitwise operators are unsupported",
         ),
         (
             "func bad\nreturns u64\n{\nlet x = 1\nreturn x\n}",

@@ -372,8 +372,8 @@ fn projected_assignment_and_nested_scope_parse() {
 }
 
 #[test]
-/// Parsing operator order must not silently choose an overflow or division policy.
-fn operator_precedence_preserves_structure_for_later_rejection() {
+/// The parser groups multiplication before addition and arithmetic before comparison.
+fn arithmetic_precedence_preserves_operator_grouping() {
     let statements = body("return 1 + 2 * 3 == 7");
     // Multiplication groups inside addition, which groups inside comparison.
     let StatementKind::Return(Expr {

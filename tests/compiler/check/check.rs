@@ -10,12 +10,65 @@
 use holo::check::check;
 use holo::ir::{
     Access, AppendArm, AppendPattern, BoolExpr, Build, ByteRange, BytesSource, Compare, Condition,
-    ConstructArm, ErrorCase, ErrorChild, ErrorFamily, Expr, Field, FieldKind, Function,
-    FunctionArgument, FunctionParameter, FunctionParameterKind, Op, Producer, Program, Record,
-    Refill, ResultArm, ResultBlockArm, ResultPattern, ResultValue,
+    ConstructArm, ConstructReference, EnumDef, EnumExpr, ErrorCase, ErrorChild, ErrorFamily, Expr,
+    Field, FieldKind, Function, FunctionArgument, FunctionParameter, FunctionParameterKind,
+    FunctionResult, Op, Producer, Program, Record, Refill, ResultArm, ResultBlockArm,
+    ResultPattern, ResultSuccess, ResultValue,
 };
 use holo::ir::{Argument, Parameter};
 use holo::placement::{PlacementError, ScopedPlacement, place_scoped_aggregate};
+
+/// The public IR cannot invent enum cases or cross nominal types.
+#[test]
+fn enum_checker_rejects_incompatible_and_forged_cases() {
+    let definition = |name: &str| {
+        Op::Enum(EnumDef {
+            name: name.into(),
+            variants: vec!["First".into(), "Last".into()],
+        })
+    };
+    let case = |kind: &str, variant: &str| EnumExpr::Variant {
+        kind: kind.into(),
+        variant: variant.into(),
+    };
+    let local = || EnumExpr::Local("state".into());
+    let compare = |value| {
+        Op::Assert(Condition::truth(BoolExpr::EnumEq {
+            left: Box::new(local()),
+            right: Box::new(value),
+        }))
+    };
+    let mut program = Program {
+        body: vec![
+            definition("Direction"),
+            definition("Position"),
+            Op::LetEnum {
+                name: "state".into(),
+                value: case("Direction", "First"),
+                mutable: true,
+            },
+            Op::SetEnum {
+                name: "state".into(),
+                value: case("Direction", "Last"),
+            },
+            compare(case("Direction", "Last")),
+        ],
+        ..Program::default()
+    };
+    assert!(check(&program).is_ok());
+    program.body[4] = compare(case("Position", "Last"));
+    rejects(&program, "cannot compare enum Direction with Position");
+    program.body[4] = compare(case("Direction", "Missing"));
+    rejects(&program, "unknown enum case Direction.Missing");
+    program.body[4] = Op::Print(Expr::Local("state".into()));
+    rejects(&program, "is not a scalar local");
+    program.body[4] = compare(case("Direction", "Last"));
+    let Op::SetEnum { value, .. } = &mut program.body[3] else {
+        unreachable!()
+    };
+    *value = case("Position", "Last");
+    rejects(&program, "cannot assign enum Position to Direction");
+}
 
 /// Construct a two-field record fixture around `body` in one region/batch scope.
 ///
@@ -898,6 +951,17 @@ fn shape_and_field_kinds_are_protected() {
         ]),
         "not a nested record",
     );
+    rejects(
+        &program(vec![
+            borrow("writer", Access::Readwrite),
+            Op::WriteBool {
+                reference: "writer".into(),
+                path: vec!["id".into()],
+                value: BoolExpr::Const(true),
+            },
+        ]),
+        "incompatible type",
+    );
 }
 
 /// Constructors cannot observe entry locals/published data through scalar expressions.
@@ -909,6 +973,15 @@ fn constructor_memory_observations_are_rejected() {
         value: id("published"),
     };
     rejects(&input, "constructor expressions cannot observe");
+    input.records[0].fields[0].kind = FieldKind::Bool;
+    input.producers[0].body[0] = Build::Bool {
+        field: "id".into(),
+        value: BoolExpr::Read {
+            reference: "published".into(),
+            path: vec!["id".into()],
+        },
+    };
+    rejects(&input, "boolean field reads require an execution context");
 }
 
 /// A possible successful result requires every field initialized exactly in order.
@@ -1047,7 +1120,64 @@ fn call(name: &str, args: Vec<FunctionArgument>) -> Expr {
     }
 }
 
-/// Boolean calls and saved values stay separate from the scalar and result paths.
+/// Raw IR must preserve the distinction between Unit success and a scalar payload.
+#[test]
+fn unit_result_ir_rejects_forged_success_payloads() {
+    let signature = FunctionResult {
+        family: "Failure".into(),
+        success: ResultSuccess::Unit,
+    };
+    let mut program = Program {
+        body: vec![
+            Op::ErrorFamily(ErrorFamily {
+                name: "Failure".into(),
+                cases: vec![ErrorCase {
+                    name: "Rejected".into(),
+                    payload: false,
+                }],
+                children: vec![],
+            }),
+            Op::Function(Function {
+                name: "finish".into(),
+                params: vec![],
+                returns_bool: false,
+                result: Some(signature),
+                body: vec![Op::ReturnResult(ResultValue::OkUnit)],
+            }),
+            Op::HandleResult {
+                function: "finish".into(),
+                args: vec![],
+                arms: vec![
+                    ResultBlockArm {
+                        pattern: ResultPattern::Ok(None),
+                        body: vec![],
+                    },
+                    ResultBlockArm {
+                        pattern: ResultPattern::Fallback(None),
+                        body: vec![],
+                    },
+                ],
+            },
+        ],
+        ..Program::default()
+    };
+    assert!(check(&program).is_ok());
+
+    let Op::HandleResult { arms, .. } = &mut program.body[2] else {
+        unreachable!();
+    };
+    arms[0].pattern = ResultPattern::Ok(Some("forged".into()));
+    rejects(&program, "success has no payload to bind");
+
+    program.body.pop();
+    let Op::Function(function) = &mut program.body[1] else {
+        unreachable!();
+    };
+    function.body[0] = Op::ReturnResult(ResultValue::Ok(Expr::Const(0)));
+    rejects(&program, "must match the declared Result success type");
+}
+
+/// Boolean calls and locals stay separate from the scalar and result paths.
 #[test]
 fn ordinary_booleans_have_checked_returns_and_conditions() {
     let predicate = |body| {
@@ -1074,6 +1204,14 @@ fn ordinary_booleans_have_checked_returns_and_conditions() {
                 name: "decision".into(),
                 value: boolean_call.clone(),
             },
+            Op::VarBool {
+                name: "pending".into(),
+                value: BoolExpr::Const(false),
+            },
+            Op::SetBool {
+                name: "pending".into(),
+                value: BoolExpr::Local("decision".into()),
+            },
             Op::Assert(Condition::truth(BoolExpr::Local("decision".into()))),
             Op::Assert(Condition::truth(boolean_call.clone())),
         ],
@@ -1089,6 +1227,20 @@ fn ordinary_booleans_have_checked_returns_and_conditions() {
         (
             Op::Print(Expr::Local("decision".into())),
             "not a scalar local",
+        ),
+        (
+            Op::SetBool {
+                name: "decision".into(),
+                value: BoolExpr::Const(false),
+            },
+            "not a writable boolean local",
+        ),
+        (
+            Op::Set {
+                name: "pending".into(),
+                value: Expr::Const(0),
+            },
+            "not a writable scalar local",
         ),
         (
             Op::BindResult {
@@ -1274,7 +1426,10 @@ fn typed_result_ir_rejects_forged_cases_and_payloads() {
                 returns_bool: false,
                 name: "make".into(),
                 params: vec![],
-                result: Some("First".into()),
+                result: Some(FunctionResult {
+                    family: "First".into(),
+                    success: ResultSuccess::U64,
+                }),
                 body: vec![Op::ReturnResult(ResultValue::Ok(Expr::Const(u64::MAX)))],
             }),
             Op::Print(Expr::Handle {
@@ -1310,7 +1465,10 @@ fn typed_result_ir_rejects_forged_cases_and_payloads() {
             returns_bool: false,
             name: "forward".into(),
             params: vec![],
-            result: Some("First".into()),
+            result: Some(FunctionResult {
+                family: "First".into(),
+                success: ResultSuccess::U64,
+            }),
             body: vec![
                 Op::BindResult {
                     name: "outcome".into(),
@@ -1325,7 +1483,10 @@ fn typed_result_ir_rejects_forged_cases_and_payloads() {
     let Op::Function(function) = &mut forwarded.body[3] else {
         unreachable!("test forwarder is an ordinary function");
     };
-    function.result = Some("Other".into());
+    function.result = Some(FunctionResult {
+        family: "Other".into(),
+        success: ResultSuccess::U64,
+    });
     rejects(
         &forwarded,
         "saved result outcome must have the exact return family Other",
@@ -1442,7 +1603,10 @@ fn saved_option_ir_rejects_forged_values_and_arms() {
                 returns_bool: false,
                 name: "optional".into(),
                 params: vec![],
-                result: Some(option_family.into()),
+                result: Some(FunctionResult {
+                    family: option_family.into(),
+                    success: ResultSuccess::U64,
+                }),
                 body: vec![Op::ReturnResult(ResultValue::Ok(Expr::Const(u64::MAX)))],
             }),
             ordinary("scalar", vec![], vec![Op::Return(Expr::Const(0))]),
@@ -1590,7 +1754,10 @@ fn scoped_local(region: &str, reference: Option<&str>, success: Vec<Op>, failure
         arms: vec![
             ConstructArm {
                 pattern: AppendPattern::Ok,
-                reference: reference.map(String::from),
+                reference: reference.map(|name| ConstructReference {
+                    name: name.into(),
+                    access: Access::Readonly,
+                }),
                 body: success,
             },
             ConstructArm {
@@ -1874,7 +2041,10 @@ fn scoped_construct_ir_rejects_inactive_or_escaped_reference() {
     let Op::ConstructHandled { arms, .. } = &mut forged else {
         unreachable!("fixture provides a scoped constructor");
     };
-    arms[1].reference = Some("forged".into());
+    arms[1].reference = Some(ConstructReference {
+        name: "forged".into(),
+        access: Access::Readwrite,
+    });
     rejects(
         &typed_fixed_fixture(region_program(vec![forged])),
         "only a construct ok arm may bind the record",
@@ -1996,14 +2166,20 @@ fn scoped_construct_ir_rejects_competing_tail_owners() {
     );
 }
 
-/// Only typed producers and complete block handlers reach scoped lowering.
+/// Both constructor conventions require complete block handlers.
 #[test]
 fn scoped_construct_ir_rejects_invalid_convention_and_fallback() {
     let mut local = scoped_local("memory", None, vec![], vec![]);
+    check(&region_program(vec![local.clone()])).expect("untyped construction can use a fallback");
+    let Op::ConstructHandled { arms, .. } = &mut local else {
+        unreachable!("fixture provides a scoped constructor");
+    };
+    arms.pop();
     rejects(
-        &region_program(vec![local.clone()]),
-        "construct outcome handler requires a typed producer",
+        &region_program(vec![local]),
+        "untyped construct requires an error fallback arm",
     );
+    let mut local = scoped_local("memory", None, vec![], vec![]);
     let Op::ConstructHandled { arms, .. } = &mut local else {
         unreachable!("fixture provides a scoped constructor");
     };
@@ -2387,14 +2563,20 @@ fn try_ir_requires_its_ordinary_frame_and_a_success_return() {
                 returns_bool: false,
                 name: "decode".into(),
                 params: vec![],
-                result: Some("First".into()),
+                result: Some(FunctionResult {
+                    family: "First".into(),
+                    success: ResultSuccess::U64,
+                }),
                 body: vec![Op::ReturnResult(ResultValue::Ok(Expr::Const(u64::MAX)))],
             }),
             Op::Function(Function {
                 returns_bool: false,
                 name: "relay".into(),
                 params: vec![],
-                result: Some("First".into()),
+                result: Some(FunctionResult {
+                    family: "First".into(),
+                    success: ResultSuccess::U64,
+                }),
                 body: vec![
                     declaration.clone(),
                     Op::ReturnResult(ResultValue::Ok(Expr::Local("value".into()))),
@@ -2431,7 +2613,10 @@ fn try_ir_requires_its_ordinary_frame_and_a_success_return() {
     let Op::Function(relay) = &mut saved.body[3] else {
         unreachable!("test relay is a function");
     };
-    relay.result = Some("Other".into());
+    relay.result = Some(FunctionResult {
+        family: "Other".into(),
+        success: ResultSuccess::U64,
+    });
     rejects(&saved, "try result from saved must have error family Other");
 
     // Same-spelling cases do not authorize forwarding another family's ordinal.
@@ -2439,7 +2624,10 @@ fn try_ir_requires_its_ordinary_frame_and_a_success_return() {
     let Op::Function(relay) = &mut wrong_family.body[3] else {
         unreachable!("test relay is a function");
     };
-    relay.result = Some("Other".into());
+    relay.result = Some(FunctionResult {
+        family: "Other".into(),
+        success: ResultSuccess::U64,
+    });
     rejects(&wrong_family, "must have error family Other");
     // Explicit propagation can lift a declared child without permitting a
     // bare return to change the nominal type of its result.

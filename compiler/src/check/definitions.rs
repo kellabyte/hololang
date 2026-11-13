@@ -11,8 +11,8 @@ use super::CheckError;
 use super::expressions::{self, Context};
 use super::scopes;
 use crate::ir::{
-    Build, ErrorCase, ErrorFamily, FieldKind, Function, OPTION_U64_FAMILY, Op, Producer, Program,
-    Record,
+    Build, EnumDef, ErrorCase, ErrorFamily, FieldKind, Function, OPTION_U64_FAMILY, Op, Producer,
+    Program, Record,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -26,6 +26,8 @@ pub(super) struct Definitions<'p> {
     functions: HashMap<&'p str, &'p Function>,
     /// Closed nominal error families used by ordinary results and destination producers.
     errors: HashMap<&'p str, &'p ErrorFamily>,
+    /// Closed enum declarations with nominal identity.
+    enums: HashMap<&'p str, &'p EnumDef>,
 }
 
 impl<'p> Definitions<'p> {
@@ -59,6 +61,14 @@ impl<'p> Definitions<'p> {
             .get(name)
             .copied()
             .ok_or_else(|| CheckError::new(format!("unknown error family {name}")))
+    }
+
+    /// Resolve an enum type before its fields or values can be used.
+    pub(super) fn enumeration(&self, name: &str) -> Result<&'p EnumDef, CheckError> {
+        self.enums
+            .get(name)
+            .copied()
+            .ok_or_else(|| CheckError::new(format!("unknown enum {name}")))
     }
 
     /// Resolve `family.case` and its payload shape against the expected nominal identity.
@@ -95,7 +105,7 @@ impl<'p> Definitions<'p> {
             // Following logical fields excludes byte payloads and representation metadata.
             for field in &self.record(record)?.fields {
                 match &field.kind {
-                    FieldKind::U64 => {}
+                    FieldKind::U64 | FieldKind::Bool | FieldKind::Enum(_) => {}
                     FieldKind::Record(child) => pending.push(child),
                     FieldKind::Bytes => {
                         return Err(CheckError::new(format!(
@@ -116,6 +126,7 @@ pub(super) fn validate(program: &Program) -> Result<Definitions<'_>, CheckError>
         producers: HashMap::new(),
         functions: HashMap::new(),
         errors: HashMap::new(),
+        enums: HashMap::new(),
     };
     // Unique nonempty identities prevent ambiguous schema resolution or diagnostics.
     for record in &program.records {
@@ -124,6 +135,38 @@ pub(super) fn validate(program: &Program) -> Result<Definitions<'_>, CheckError>
                 "duplicate or empty record name {}",
                 record.name
             )));
+        }
+    }
+    for operation in &program.body {
+        let Op::Enum(declaration) = operation else {
+            continue;
+        };
+        if declaration.name.is_empty()
+            || definitions.records.contains_key(declaration.name.as_str())
+            || definitions
+                .enums
+                .insert(&declaration.name, declaration)
+                .is_some()
+        {
+            return Err(CheckError::new(format!(
+                "duplicate or empty enum name {}",
+                declaration.name
+            )));
+        }
+        if !(1..=256).contains(&declaration.variants.len()) {
+            return Err(CheckError::new(format!(
+                "enum {} must declare between 1 and 256 cases",
+                declaration.name
+            )));
+        }
+        let mut names = HashSet::new();
+        for variant in &declaration.variants {
+            if variant.is_empty() || !names.insert(variant) {
+                return Err(CheckError::new(format!(
+                    "duplicate or empty case in enum {}",
+                    declaration.name
+                )));
+            }
         }
     }
     // Producer names are resolved statically; duplicates cannot select arbitrary effects.
@@ -155,6 +198,9 @@ pub(super) fn validate(program: &Program) -> Result<Definitions<'_>, CheckError>
             if let FieldKind::Record(name) = &field.kind {
                 definitions.record(name)?;
                 nested.push(name.as_str());
+            }
+            if let FieldKind::Enum(name) = &field.kind {
+                definitions.enumeration(name)?;
             }
         }
         record_edges.insert(record.name.as_str(), nested);
@@ -264,6 +310,17 @@ pub(super) fn validate(program: &Program) -> Result<Definitions<'_>, CheckError>
                         },
                     )?;
                     (field.as_str(), matches!(&expected.kind, FieldKind::U64))
+                }
+                Build::Bool { field, value } => {
+                    expressions::boolean_context(value, &definitions, context)?;
+                    (field.as_str(), matches!(&expected.kind, FieldKind::Bool))
+                }
+                Build::Enum { field, value } => {
+                    let actual = expressions::enumeration(value, &definitions, context)?;
+                    (
+                        field.as_str(),
+                        matches!(&expected.kind, FieldKind::Enum(kind) if kind == actual),
+                    )
                 }
                 Build::Bytes { field, len, value } => {
                     expressions::expression(
@@ -377,9 +434,15 @@ pub(super) fn validate(program: &Program) -> Result<Definitions<'_>, CheckError>
                 );
             }
             // Even unused typed functions need a valid nominal result family.
-            if let Some(family) = &function.result {
+            if let Some(result) = &function.result {
+                if result.family == crate::ir::OPTION_U64_FAMILY
+                    && result.success != crate::ir::ResultSuccess::U64
+                {
+                    return Err(CheckError::new("Option<u64> requires a u64 success type")
+                        .in_function(&function.name));
+                }
                 definitions
-                    .error_family(family)
+                    .error_family(&result.family)
                     .map_err(|error| error.in_function(&function.name))?;
             }
             let calls = scopes::validate_function(function, &definitions)
@@ -412,6 +475,7 @@ fn validate_error_families<'p>(
         // The type namespace is shared by records and error families.
         if family.name.is_empty()
             || definitions.records.contains_key(family.name.as_str())
+            || definitions.enums.contains_key(family.name.as_str())
             || definitions.errors.insert(&family.name, family).is_some()
         {
             return Err(CheckError::new(format!(

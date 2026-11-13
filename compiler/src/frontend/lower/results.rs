@@ -31,19 +31,19 @@ enum HandlerSubject {
     Call {
         function: String,
         args: Vec<ir::FunctionArgument>,
-        family: String,
+        result: ir::FunctionResult,
     },
     Local {
         name: String,
-        family: String,
+        result: ir::FunctionResult,
     },
 }
 
 impl HandlerSubject {
     /// Return the checked outcome identity that determines the legal arms.
-    fn family(&self) -> &str {
+    fn result(&self) -> &ir::FunctionResult {
         match self {
-            Self::Call { family, .. } | Self::Local { family, .. } => family,
+            Self::Call { result, .. } | Self::Local { result, .. } => result,
         }
     }
 }
@@ -150,7 +150,7 @@ impl Lowerer {
             let item = (|| {
                 let pattern = match &arm.pattern {
                     ast::ResultPattern::Ok(None) => ir::AppendPattern::Ok,
-                    ast::ResultPattern::Ok(Some(_)) => {
+                    ast::ResultPattern::Ok(Some(_)) | ast::ResultPattern::ReadwriteOk(_) => {
                         return Err(Diagnostic::new(
                             arm.span,
                             "append success has no payload; use `on ok`",
@@ -205,19 +205,27 @@ impl Lowerer {
         Ok((call, lowered))
     }
 
-    /// Bind a successful call or saved result, or propagate its same-family or
-    /// declared child failure. Resolve the operand before introducing the local.
+    /// Propagate a call or saved result's failure and optionally bind its scalar
+    /// success. Resolve the operand before introducing the local.
     /// Lowering allocates compiler IR only and rejects unsupported contexts.
     pub(super) fn try_binding(
         &mut self,
-        name: &str,
+        name: Option<&str>,
         expression: &ast::Expr,
         span: Span,
     ) -> Result<ir::Op, Diagnostic> {
         self.charge(span)?;
-        let family = self.result_family.as_deref().ok_or_else(|| {
-            Diagnostic::new(span, "`try` requires a scalar typed-result function")
+        let target = self.result.as_ref().ok_or_else(|| {
+            Diagnostic::new(
+                span,
+                "`try` requires a scalar typed-result function or a `Result<Unit, E>` function",
+            )
         })?;
+        let success = if name.is_some() {
+            ir::ResultSuccess::U64
+        } else {
+            ir::ResultSuccess::Unit
+        };
         if let ast::ExprKind::Name(source) = &expression.kind {
             let binding = self.lookup(source, expression.span)?;
             let Kind::SavedResult(actual) = binding.kind else {
@@ -226,75 +234,117 @@ impl Lowerer {
                     "`try` requires a saved `Result`",
                 ));
             };
-            self.require_try_family(&actual, family, expression.span)?;
-            let name = self.bind(name, Kind::Scalar { mutable: false }, span)?;
-            return Ok(ir::Op::TrySaved {
-                name,
-                source: binding.ir_name,
+            self.require_try_type(&actual, target, success, expression.span)?;
+            return Ok(match name {
+                Some(name) => ir::Op::TrySaved {
+                    name: self.bind(name, Kind::Scalar { mutable: false }, span)?,
+                    source: binding.ir_name,
+                },
+                None => ir::Op::TrySavedUnit {
+                    source: binding.ir_name,
+                },
             });
         }
         let (function, args) = self.tagged_call(expression)?;
-        self.require_try_family(&self.definitions.results[function], family, expression.span)?;
+        self.require_try_type(
+            &self.definitions.results[function],
+            target,
+            success,
+            expression.span,
+        )?;
         let args = self.ordinary_arguments(function, args, expression.span)?;
-        let name = self.bind(name, Kind::Scalar { mutable: false }, span)?;
-        Ok(ir::Op::TryLet {
-            name,
-            function: function.to_owned(),
-            args,
+        let function = function.to_owned();
+        Ok(match name {
+            Some(name) => ir::Op::TryLet {
+                name: self.bind(name, Kind::Scalar { mutable: false }, span)?,
+                function,
+                args,
+            },
+            None => ir::Op::TryUnit { function, args },
         })
     }
 
-    /// Require a Result family that is exact or declared as a direct child.
-    fn require_try_family(&self, actual: &str, family: &str, span: Span) -> Result<(), Diagnostic> {
-        if family == OPTION_FAMILY || actual == OPTION_FAMILY {
+    /// Require the expected success and a family that is exact or a direct child.
+    fn require_try_type(
+        &self,
+        actual: &ir::FunctionResult,
+        target: &ir::FunctionResult,
+        success: ir::ResultSuccess,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        let actual_family = actual.family.as_str();
+        let family = target.family.as_str();
+        if family == OPTION_FAMILY || actual_family == OPTION_FAMILY {
             return Err(Diagnostic::new(
                 span,
                 "`try` requires a Result operand inside a Result function. Handle `Option<u64>` with `on Some` and `on None`",
             ));
         }
+        if actual.success != success {
+            let message = if success == ir::ResultSuccess::Unit {
+                "standalone `try` requires a `Result<Unit, E>` operand"
+            } else {
+                "`Result<Unit, E>` has no value to bind; use a standalone `try`"
+            };
+            return Err(Diagnostic::new(span, message));
+        }
         // An explicit child edge provides exactly one nominal route on failure.
         if self.definitions.errors[family]
-            .try_error_offset(actual)
+            .try_error_offset(actual_family)
             .is_none()
         {
             return Err(Diagnostic::new(
                 span,
                 format!(
-                    "cannot forward Result from error family `{actual}` as `{family}` with `try`; declare it as a direct child"
+                    "cannot forward Result from error family `{actual_family}` as `{family}` with `try`; declare it as a direct child"
                 ),
             ));
         }
         Ok(())
     }
 
-    /// Resolve a typed return against `family`. Scalar evaluation preludes
+    /// Resolve a typed return against its declared type. Scalar evaluation preludes
     /// stay in `output`, and a saved result needs only its lexical name.
     pub(super) fn result_return(
         &mut self,
         expression: &ast::Expr,
-        family: &str,
+        result: &ir::FunctionResult,
         output: &mut Block,
     ) -> Result<ir::ResultValue, Diagnostic> {
         self.charge(expression.span)?;
+        let family = result.family.as_str();
         if let ast::ExprKind::Name(name) = &expression.kind
             && (family != OPTION_FAMILY || name != OPTION_NONE)
         {
-            let binding = self.lookup(name, expression.span)?;
+            // Preserve exact forwarding if a lexical binding happens to be
+            // called `ok`. Otherwise the contextual word means Unit success.
+            let binding = match self.lookup(name, expression.span) {
+                Err(_) if name == "ok" && result.success == ir::ResultSuccess::Unit => {
+                    return Ok(ir::ResultValue::OkUnit);
+                }
+                binding => binding?,
+            };
             let Kind::SavedResult(actual) = &binding.kind else {
                 return Err(Diagnostic::new(
                     expression.span,
                     "a named result return requires a saved `Result` or `Option<u64>`",
                 ));
             };
-            self.require_forwarded_type(actual, family, "saved result", expression.span)?;
+            self.require_forwarded_type(actual, result, "saved result", expression.span)?;
             return Ok(ir::ResultValue::Saved(binding.ir_name));
         }
         if family == OPTION_FAMILY {
-            return self.option_return(expression, output);
+            return self.option_return(expression, result, output);
         }
         match &expression.kind {
             // The first success value is a full-width u64, including zero.
-            ast::ExprKind::Ok(value) => Ok(ir::ResultValue::Ok(self.scalar(value, output)?)),
+            ast::ExprKind::Ok(value) if result.success == ir::ResultSuccess::U64 => {
+                Ok(ir::ResultValue::Ok(self.scalar(value, output)?))
+            }
+            ast::ExprKind::Ok(_) => Err(Diagnostic::new(
+                expression.span,
+                "`Result<Unit, E>` success uses bare `return ok`",
+            )),
             ast::ExprKind::Error { case, payload } => {
                 let (family, case, has_payload) = self.error_case(case, family, true)?;
                 // The payload is an ordinary u64 expression on this return edge.
@@ -322,7 +372,7 @@ impl Lowerer {
             }
             // Forward the pair as a result, rather than silently translating its error.
             ast::ExprKind::Call { .. } => {
-                let (name, args) = self.forwarded_call(expression, family)?;
+                let (name, args) = self.forwarded_call(expression, result)?;
                 Ok(ir::ResultValue::Call {
                     function: name.to_owned(),
                     args: self.ordinary_arguments(name, args, expression.span)?,
@@ -330,7 +380,7 @@ impl Lowerer {
             }
             _ => Err(Diagnostic::new(
                 expression.span,
-                "return `ok value`, `error Family.Case`, or a call or saved result with the exact Result type",
+                "return `ok` for Unit, `ok value` for u64, `error Family.Case`, or a call or saved result with the exact Result type",
             )),
         }
     }
@@ -339,6 +389,7 @@ impl Lowerer {
     fn option_return(
         &mut self,
         expression: &ast::Expr,
+        result: &ir::FunctionResult,
         output: &mut Block,
     ) -> Result<ir::ResultValue, Diagnostic> {
         match &expression.kind {
@@ -353,7 +404,7 @@ impl Lowerer {
                 Ok(ir::ResultValue::Ok(self.scalar(&args[0], output)?))
             }
             ast::ExprKind::Call { .. } => {
-                let (name, args) = self.forwarded_call(expression, OPTION_FAMILY)?;
+                let (name, args) = self.forwarded_call(expression, result)?;
                 Ok(ir::ResultValue::Call {
                     function: name.to_owned(),
                     args: self.ordinary_arguments(name, args, expression.span)?,
@@ -366,29 +417,28 @@ impl Lowerer {
         }
     }
 
-    /// Borrow the name and actual expressions of a direct call only when its
-    /// error family is exactly the enclosing scalar result's family.
+    /// Borrow a direct call's name and actuals when its result type matches exactly.
     fn forwarded_call<'a>(
         &self,
         expression: &'a ast::Expr,
-        family: &str,
+        result: &ir::FunctionResult,
     ) -> Result<(&'a str, &'a [ast::Expr]), Diagnostic> {
         let (name, args) = self.tagged_call(expression)?;
         let actual = &self.definitions.results[name];
-        self.require_forwarded_type(actual, family, "forwarded call", expression.span)?;
+        self.require_forwarded_type(actual, result, "forwarded call", expression.span)?;
         Ok((name, args))
     }
 
     /// Require exact nominal identity for a return that preserves the original tag.
     fn require_forwarded_type(
         &self,
-        actual: &str,
-        family: &str,
+        actual: &ir::FunctionResult,
+        result: &ir::FunctionResult,
         subject: &str,
         span: Span,
     ) -> Result<(), Diagnostic> {
-        if actual != family {
-            if actual == OPTION_FAMILY || family == OPTION_FAMILY {
+        if actual.family != result.family {
+            if actual.family == OPTION_FAMILY || result.family == OPTION_FAMILY {
                 return Err(Diagnostic::new(
                     span,
                     format!(
@@ -398,7 +448,16 @@ impl Lowerer {
             }
             return Err(Diagnostic::new(
                 span,
-                format!("cannot forward Result from error family `{actual}` as `{family}`"),
+                format!(
+                    "cannot forward Result from error family `{}` as `{}`",
+                    actual.family, result.family
+                ),
+            ));
+        }
+        if actual.success != result.success {
+            return Err(Diagnostic::new(
+                span,
+                format!("the {subject} must have the exact Result success type"),
             ));
         }
         Ok(())
@@ -406,7 +465,7 @@ impl Lowerer {
 
     /// Resolve a result subject and its disjoint arms. All scalar
     /// work inside each arm remains an expression until that arm executes.
-    /// `boolean` selects the initial bool-literal decision form for a `let`.
+    /// `boolean` selects the bool-literal decision form.
     pub(super) fn handle_result(
         &mut self,
         subject: &ast::Expr,
@@ -416,7 +475,7 @@ impl Lowerer {
         let selected = self.handler_subject(subject)?;
         let arms = self.result_arms(
             subject.span,
-            selected.family(),
+            selected.result(),
             arms.iter().map(|arm| (&arm.pattern, arm.span, arm)),
             |lowerer, pattern, arm| {
                 let saved = std::mem::replace(&mut lowerer.deferred_actual, true);
@@ -451,7 +510,7 @@ impl Lowerer {
         let mut children = Vec::with_capacity(arms.len());
         let arms = self.result_arms(
             subject.span,
-            selected.family(),
+            selected.result(),
             arms.iter().map(|arm| (&arm.pattern, arm.span, arm)),
             |lowerer, pattern, arm| {
                 let body = lowerer.block(&arm.body)?;
@@ -478,10 +537,10 @@ impl Lowerer {
     fn handler_subject(&mut self, subject: &ast::Expr) -> Result<HandlerSubject, Diagnostic> {
         if let ast::ExprKind::Name(name) = &subject.kind {
             let binding = self.lookup(name, subject.span)?;
-            if let Kind::SavedResult(family) = binding.kind {
+            if let Kind::SavedResult(result) = binding.kind {
                 return Ok(HandlerSubject::Local {
                     name: binding.ir_name,
-                    family,
+                    result,
                 });
             }
             return Err(Diagnostic::new(
@@ -492,7 +551,7 @@ impl Lowerer {
         let (name, actuals) = self.tagged_call(subject)?;
         Ok(HandlerSubject::Call {
             function: name.to_owned(),
-            family: self.definitions.results[name].clone(),
+            result: self.definitions.results[name].clone(),
             args: self.ordinary_arguments(name, actuals, subject.span)?,
         })
     }
@@ -502,10 +561,11 @@ impl Lowerer {
     fn result_arms<'a, A, B>(
         &mut self,
         subject: Span,
-        family: &str,
+        result: &ir::FunctionResult,
         arms: impl ExactSizeIterator<Item = (&'a ast::ResultPattern, Span, A)>,
         mut lower: impl FnMut(&mut Self, ir::ResultPattern, A) -> Result<B, Diagnostic>,
     ) -> Result<Vec<B>, Diagnostic> {
+        let family = result.family.as_str();
         if family == OPTION_FAMILY {
             return self.option_arms(subject, arms, lower);
         }
@@ -525,6 +585,12 @@ impl Lowerer {
             let item = (|| {
                 let pattern = match pattern {
                     ast::ResultPattern::Ok(binding) => {
+                        if result.success == ir::ResultSuccess::Unit && binding.is_some() {
+                            return Err(Diagnostic::new(
+                                span,
+                                "`Result<Unit, E>` success has no payload; use `on ok`",
+                            ));
+                        }
                         if std::mem::replace(&mut success, true) {
                             return Err(Diagnostic::new(span, "duplicate `on ok` arm"));
                         }
@@ -568,6 +634,12 @@ impl Lowerer {
                         return Err(Diagnostic::new(
                             span,
                             "`on Rejected Case` requires a typed append",
+                        ));
+                    }
+                    ast::ResultPattern::ReadwriteOk(_) => {
+                        return Err(Diagnostic::new(
+                            span,
+                            "`on ok(readwrite name)` requires `core.construct`",
                         ));
                     }
                 };
@@ -714,7 +786,7 @@ impl Lowerer {
     /// Keep one result expression behind its selected arm. Boolean decisions
     /// accept literals only; scalar operands use deferred actual evaluation.
     fn arm_value(&mut self, arm: &ast::ResultArm, boolean: bool) -> Result<ir::Expr, Diagnostic> {
-        // The initial bool representation is an immutable zero/one binding.
+        // Boolean handler expressions produce a canonical zero or one in the scalar IR.
         if boolean {
             let ast::ExprKind::Bool(value) = arm.value.kind else {
                 return Err(Diagnostic::new(
@@ -765,12 +837,12 @@ impl Lowerer {
     pub(super) fn tagged_target<'a>(
         &self,
         expression: &'a ast::Expr,
-    ) -> Option<(&'a str, &'a [ast::Expr], &str)> {
+    ) -> Option<(&'a str, &'a [ast::Expr], &ir::FunctionResult)> {
         if let ast::ExprKind::Call { callee, args } = &expression.kind
             && let ast::ExprKind::Name(name) = &callee.kind
-            && let Some(family) = self.definitions.results.get(name)
+            && let Some(result) = self.definitions.results.get(name)
         {
-            return Some((name, args, family));
+            return Some((name, args, result));
         }
         None
     }

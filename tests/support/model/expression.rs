@@ -10,8 +10,8 @@
 
 use super::ModelError;
 use super::state::{Binding, ByteInput, ByteOrigin, Input, State};
-use super::value::{Record, Value};
-use holo::ir::{Access, Binary, BoolExpr, Compare, Condition, Expr};
+use super::value::{EnumValue, Record, Value};
+use holo::ir::{Access, Binary, BoolExpr, Compare, Condition, EnumExpr, Expr, Op};
 
 impl State<'_> {
     /// Evaluate a scalar expression in source order using explicit pure inputs.
@@ -115,15 +115,19 @@ impl State<'_> {
             Expr::Binary { op, left, right } => {
                 let a = self.expression_context(left, params, index, scalar_only)?;
                 let b = self.expression_context(right, params, index, scalar_only)?;
-                // All user arithmetic in this IR is explicitly wrapping; this
-                // says nothing about address/size reservations, checked elsewhere.
-                Ok(match op {
-                    Binary::AddWrapping => a.wrapping_add(b),
-                    Binary::SubWrapping => a.wrapping_sub(b),
-                    Binary::MulWrapping => a.wrapping_mul(b),
-                    Binary::Xor => a ^ b,
-                    Binary::And => a & b,
-                })
+                let value = match op {
+                    Binary::AddChecked => a.checked_add(b),
+                    Binary::SubChecked => a.checked_sub(b),
+                    Binary::MulChecked => a.checked_mul(b),
+                    Binary::DivChecked => a.checked_div(b),
+                    Binary::RemChecked => a.checked_rem(b),
+                    Binary::AddWrapping => Some(a.wrapping_add(b)),
+                    Binary::SubWrapping => Some(a.wrapping_sub(b)),
+                    Binary::MulWrapping => Some(a.wrapping_mul(b)),
+                    Binary::Xor => Some(a ^ b),
+                    Binary::And => Some(a & b),
+                };
+                value.ok_or_else(|| ModelError::new("checked arithmetic trap"))
             }
             Expr::Read { reference, path } => {
                 // A scalar projection cannot reinterpret payload/header bytes as
@@ -182,7 +186,7 @@ impl State<'_> {
     }
 
     /// Evaluate boolean operators using the scalar inputs of their enclosing frame.
-    fn boolean_context(
+    pub(super) fn boolean_context(
         &mut self,
         value: &BoolExpr,
         params: &[Input],
@@ -191,6 +195,15 @@ impl State<'_> {
         self.tick()?;
         match value {
             BoolExpr::Const(value) => Ok(*value),
+            BoolExpr::Read { reference, path } => {
+                if !self.construction_stack.is_empty() {
+                    return Err(ModelError::new("boolean field read in model construction"));
+                }
+                match self.projection(reference, path)?.0 {
+                    Value::Boolean(value) => Ok(*value),
+                    _ => Err(ModelError::new("non-boolean read projection")),
+                }
+            }
             BoolExpr::Local(name) => {
                 if !self.construction_stack.is_empty() {
                     return Err(ModelError::new("boolean local used in model construction"));
@@ -202,11 +215,50 @@ impl State<'_> {
             }
             BoolExpr::Call { function, args } => self.boolean_call(function, args),
             BoolExpr::Compare(condition) => self.scalar_comparison(condition, params, index),
+            BoolExpr::EnumEq { left, right } => {
+                let left = self.enumeration(left)?;
+                let right = self.enumeration(right)?;
+                if left.kind != right.kind {
+                    return Err(ModelError::new("comparison of distinct enum types"));
+                }
+                Ok(left == right)
+            }
             BoolExpr::And(left, right) => Ok(self.boolean_context(left, params, index)?
                 && self.boolean_context(right, params, index)?),
             BoolExpr::Or(left, right) => Ok(self.boolean_context(left, params, index)?
                 || self.boolean_context(right, params, index)?),
             BoolExpr::Not(value) => Ok(!self.boolean_context(value, params, index)?),
+        }
+    }
+
+    /// Evaluate one enum as its logical type and case rather than a native ordinal.
+    pub(super) fn enumeration(&mut self, expression: &EnumExpr) -> Result<EnumValue, ModelError> {
+        self.tick()?;
+        match expression {
+            EnumExpr::Variant { kind, variant } => {
+                if !self.program.body.iter().any(|operation| matches!(operation,
+                    Op::Enum(declaration) if declaration.name == *kind && declaration.variants.contains(variant)))
+                {
+                    return Err(ModelError::new("unknown enum case"));
+                }
+                Ok(EnumValue {
+                    kind: kind.clone(),
+                    variant: variant.clone(),
+                })
+            }
+            EnumExpr::Local(name) if self.construction_stack.is_empty() => {
+                match self.binding(name)? {
+                    Binding::Enum { value, .. } => Ok(value),
+                    _ => Err(ModelError::new("non-enum local read")),
+                }
+            }
+            EnumExpr::Read { reference, path } if self.construction_stack.is_empty() => {
+                match self.projection(reference, path)?.0 {
+                    Value::Enum(value) => Ok(value.clone()),
+                    _ => Err(ModelError::new("non-enum field read")),
+                }
+            }
+            _ => Err(ModelError::new("enum storage read in model construction")),
         }
     }
 

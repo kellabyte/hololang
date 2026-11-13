@@ -2,8 +2,8 @@
 //!
 //! Pure templates keep eager actuals, including within typed ordinary calls.
 //! Readonly means path permission, not frozen memory or LLVM alias independence.
-//! Numeric overflow defaults remain unavailable; explicit wrapping calls select
-//! existing IR operations without silently choosing future language semantics.
+//! Infix u64 arithmetic traps on overflow or a zero divisor. Explicit wrapping
+//! calls retain their own operations.
 
 use super::{Block, Kind, Lowerer, arity, ast, core_call, functions};
 use crate::frontend::byte_ranges;
@@ -47,14 +47,20 @@ impl Lowerer {
                         "a typed error cannot be used as a u64",
                     ));
                 }
-                if matches!(binding.kind, Kind::Bool | Kind::HandledBool) {
+                if matches!(binding.kind, Kind::Bool { .. } | Kind::HandledBool) {
                     return Err(Diagnostic::new(
                         expr.span,
                         "a bool binding cannot be used as a u64",
                     ));
                 }
-                if let Kind::SavedResult(family) = &binding.kind {
-                    let message = if family == super::functions::OPTION_FAMILY {
+                if matches!(binding.kind, Kind::Enum { .. }) {
+                    return Err(Diagnostic::new(
+                        expr.span,
+                        "an enum value cannot be used as a u64",
+                    ));
+                }
+                if let Kind::SavedResult(result) = &binding.kind {
+                    let message = if result.family == super::functions::OPTION_FAMILY {
                         "handle the saved `Option<u64>` with `on Some` and `on None`"
                     } else {
                         "handle the saved `Result` with `on` arms before using its payload"
@@ -71,7 +77,19 @@ impl Lowerer {
             }
             // Field paths are resolved statically; only u64 fields become scalar reads.
             ast::ExprKind::Member { .. } => {
+                if self.enum_value(expr)?.is_some() {
+                    return Err(Diagnostic::new(
+                        expr.span,
+                        "an enum value cannot be used as a u64",
+                    ));
+                }
                 let (reference, path, kind) = self.projection(expr)?;
+                if kind == ir::FieldKind::Bool {
+                    return Err(Diagnostic::new(
+                        expr.span,
+                        "a bool field cannot be used as a u64",
+                    ));
+                }
                 if kind != ir::FieldKind::U64 {
                     return Err(Diagnostic::new(
                         expr.span,
@@ -165,14 +183,28 @@ impl Lowerer {
                 }
                 functions::instantiate(&template.value, &arguments, expr.span, &mut self.budget)
             }
-            // Parsing an infix operator does not silently settle overflow/truth conventions.
-            ast::ExprKind::Binary { .. } if functions::boolean_syntax(expr) => Err(
-                Diagnostic::new(expr.span, "a bool expression cannot be used as a u64"),
-            ),
-            ast::ExprKind::Binary { .. } => Err(Diagnostic::new(
-                expr.span,
-                "infix scalar arithmetic is unsupported while numeric defaults remain open; use explicit core.add_wrapping, core.sub_wrapping, core.mul_wrapping, core.and, or core.xor",
-            )),
+            // Keep both operands inside the expression so right-hand lowering
+            // cannot move its captures or side effects ahead of a left-hand trap.
+            ast::ExprKind::Binary {
+                op, left, right, ..
+            } => {
+                let Some(op) = functions::arithmetic(*op) else {
+                    let message = if functions::boolean_syntax(expr) {
+                        "a bool expression cannot be used as a u64"
+                    } else {
+                        "infix bitwise operators are unsupported; use `core.xor` or `core.and`"
+                    };
+                    return Err(Diagnostic::new(expr.span, message));
+                };
+                let previous = std::mem::replace(&mut self.deferred_actual, true);
+                let value = (|| {
+                    let left = self.scalar(left, output)?;
+                    let right = self.scalar(right, output)?;
+                    Ok(ir::Expr::binary(op, left, right))
+                })();
+                self.deferred_actual = previous;
+                value
+            }
             ast::ExprKind::Not { .. } | ast::ExprKind::Bool(_) => Err(Diagnostic::new(
                 expr.span,
                 "boolean values cannot be used as a u64",
@@ -182,6 +214,9 @@ impl Lowerer {
                 expr.span,
                 "an error family cannot be used as a u64",
             )),
+            ast::ExprKind::EnumRoot { .. } => {
+                Err(Diagnostic::new(expr.span, "use a qualified enum variant"))
+            }
             ast::ExprKind::Record { .. } => Err(Diagnostic::new(
                 expr.span,
                 "record literals cannot initialize scalar locals; use a destination constructor with core.construct for a scoped record",
@@ -389,9 +424,12 @@ impl Lowerer {
         match &expr.kind {
             ast::ExprKind::Name(name) => self
                 .lookup(name, expr.span)
-                .is_ok_and(|binding| matches!(binding.kind, Kind::Bool | Kind::HandledBool)),
+                .is_ok_and(|binding| matches!(binding.kind, Kind::Bool { .. } | Kind::HandledBool)),
             ast::ExprKind::Call { .. } => functions::named_call(expr)
                 .is_some_and(|(name, _)| self.definitions.bools.contains(name)),
+            ast::ExprKind::Member { .. } => self
+                .projection(expr)
+                .is_ok_and(|(_, _, kind)| kind == ir::FieldKind::Bool),
             _ => functions::boolean_syntax(expr),
         }
     }
@@ -405,10 +443,16 @@ impl Lowerer {
         self.charge(expr.span)?;
         match &expr.kind {
             ast::ExprKind::Bool(value) => return Ok(ir::BoolExpr::Const(*value)),
+            ast::ExprKind::Member { .. } => {
+                let (reference, path, kind) = self.projection(expr)?;
+                if kind == ir::FieldKind::Bool {
+                    return Ok(ir::BoolExpr::Read { reference, path });
+                }
+            }
             ast::ExprKind::Name(name) => {
                 let binding = self.lookup(name, expr.span)?;
                 match binding.kind {
-                    Kind::Bool => return Ok(ir::BoolExpr::Local(binding.ir_name)),
+                    Kind::Bool { .. } => return Ok(ir::BoolExpr::Local(binding.ir_name)),
                     Kind::HandledBool => {
                         return Ok(ir::BoolExpr::Compare(handled_truth(ir::Expr::Local(
                             binding.ir_name,
@@ -434,6 +478,9 @@ impl Lowerer {
                     });
                 }
                 if let Some(op) = functions::comparison(*op) {
+                    if let Some(test) = self.enum_comparison(op, left, right)? {
+                        return Ok(test);
+                    }
                     return self
                         .scalar_comparison(op, left, right, output)
                         .map(ir::BoolExpr::Compare);
@@ -484,7 +531,7 @@ impl Lowerer {
             // Earlier result handlers leave a canonical zero-or-one decision.
             ast::ExprKind::Name(name) => {
                 let binding = self.lookup(name, expr.span)?;
-                if matches!(binding.kind, Kind::Bool) {
+                if matches!(binding.kind, Kind::Bool { .. }) {
                     self.charge(expr.span)?;
                     return Ok(ir::Condition::truth(ir::BoolExpr::Local(binding.ir_name)));
                 }
@@ -500,7 +547,11 @@ impl Lowerer {
                 op, left, right, ..
             } => {
                 if let Some(op) = functions::comparison(*op) {
-                    self.scalar_comparison(op, left, right, output)
+                    if let Some(test) = self.enum_comparison(op, left, right)? {
+                        Ok(ir::Condition::truth(test))
+                    } else {
+                        self.scalar_comparison(op, left, right, output)
+                    }
                 } else if self.is_bool(expr) {
                     self.boolean(expr, output).map(ir::Condition::truth)
                 } else {
@@ -514,6 +565,92 @@ impl Lowerer {
             _ => Err(Diagnostic::new(
                 expr.span,
                 "expected a comparison or boolean condition",
+            )),
+        }
+    }
+
+    /// Resolve an enum variant, copied local, or existing enum field.
+    pub(super) fn enum_value(
+        &self,
+        expr: &ast::Expr,
+    ) -> Result<Option<(String, ir::EnumExpr)>, Diagnostic> {
+        if let Some((written, kind, variant)) =
+            functions::enum_member(expr, &self.definitions.enums)
+            && self.lookup(written, expr.span).is_err()
+        {
+            return Ok(Some((
+                kind.to_owned(),
+                functions::enum_constant(&self.definitions.enums, kind, variant, expr.span)?,
+            )));
+        }
+        match &expr.kind {
+            ast::ExprKind::Name(name) => {
+                let binding = self.lookup(name, expr.span)?;
+                if let Kind::Enum { kind, .. } = binding.kind {
+                    return Ok(Some((kind, ir::EnumExpr::Local(binding.ir_name))));
+                }
+            }
+            ast::ExprKind::Member { .. } => {
+                let (reference, path, kind) = self.projection(expr)?;
+                if let ir::FieldKind::Enum(kind) = kind {
+                    return Ok(Some((kind, ir::EnumExpr::Read { reference, path })));
+                }
+            }
+            _ => {}
+        }
+        Ok(None)
+    }
+
+    /// Require an enum expression of the declared nominal type.
+    pub(super) fn expect_enum(
+        &self,
+        expr: &ast::Expr,
+        expected: &str,
+    ) -> Result<ir::EnumExpr, Diagnostic> {
+        match self.enum_value(expr)? {
+            Some((kind, value)) if kind == expected => Ok(value),
+            Some((kind, _)) => Err(Diagnostic::new(
+                expr.span,
+                format!("expected enum `{expected}`, found `{kind}`"),
+            )),
+            None => Err(Diagnostic::new(
+                expr.span,
+                format!("expected an enum `{expected}` value"),
+            )),
+        }
+    }
+
+    /// Select typed enum equality when either comparison operand denotes an enum.
+    fn enum_comparison(
+        &self,
+        op: ir::Compare,
+        left: &ast::Expr,
+        right: &ast::Expr,
+    ) -> Result<Option<ir::BoolExpr>, Diagnostic> {
+        let lhs = self.enum_value(left)?;
+        let rhs = self.enum_value(right)?;
+        match (&lhs, &rhs) {
+            (None, None) => return Ok(None),
+            (Some((kind, _)), Some((other, _))) if kind == other => {}
+            _ => {
+                return Err(Diagnostic::new(
+                    right.span,
+                    "enum comparison requires two values of the same enum type",
+                ));
+            }
+        }
+        let (_, left_value) = lhs.expect("validated enum operand");
+        let (_, right_value) = rhs.expect("validated enum operand");
+        let equal = ir::BoolExpr::EnumEq {
+            left: Box::new(left_value),
+            right: Box::new(right_value),
+        };
+        match op {
+            ir::Compare::Eq => Ok(Some(equal)),
+            ir::Compare::Ne => Ok(Some(ir::BoolExpr::Not(Box::new(equal)))),
+            _ => Err(Diagnostic::new(
+                right.span,
+                "enum values support only `==` and `!=`",
             )),
         }
     }
@@ -550,7 +687,11 @@ impl Lowerer {
             cursor = base;
         }
         path.reverse();
-        let binding = self.named(cursor)?;
+        let binding = if let ast::ExprKind::EnumRoot { name, .. } = &cursor.kind {
+            self.lookup(name, cursor.span)?
+        } else {
+            self.named(cursor)?
+        };
         let Kind::Reference { record, .. } = binding.kind else {
             return Err(Diagnostic::new(
                 cursor.span,

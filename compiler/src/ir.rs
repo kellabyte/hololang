@@ -32,6 +32,15 @@ pub struct Record {
     pub fields: Vec<Field>,
 }
 
+/// A closed nominal enumeration of payload-free cases.
+#[derive(Clone, Debug)]
+pub struct EnumDef {
+    /// Unique enum type identity.
+    pub name: String,
+    /// Distinct cases in declaration order.
+    pub variants: Vec<String>,
+}
+
 /// One named inline component.
 #[derive(Clone, Debug)]
 pub struct Field {
@@ -46,6 +55,10 @@ pub struct Field {
 pub enum FieldKind {
     /// One unsigned scalar occupying eight bytes.
     U64,
+    /// One boolean stored as the byte zero or one.
+    Bool,
+    /// One byte containing a valid case of the named enum.
+    Enum(String),
     /// Frozen length metadata followed by initialized inline payload.
     Bytes,
     /// Inline instance of the named acyclic schema.
@@ -121,13 +134,31 @@ pub struct Function {
     pub name: String,
     /// Ordered explicit arguments and their lexical identities.
     pub params: Vec<FunctionParameter>,
-    /// Nominal family of a tagged scalar result.
-    pub result: Option<String>,
+    /// Success type and nominal failure family of a tagged result.
+    pub result: Option<FunctionResult>,
     /// Whether this helper returns a boolean instead of an unsigned scalar.
     /// Boolean returns have no result family.
     pub returns_bool: bool,
     /// Checked operations that return the declared type on every completion path.
     pub body: Vec<Op>,
+}
+
+/// Type of one ordinary tagged return.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FunctionResult {
+    /// The closed nominal error family.
+    pub family: String,
+    /// What the caller can observe on success.
+    pub success: ResultSuccess,
+}
+
+/// Success type of an ordinary tagged result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResultSuccess {
+    /// A copied unsigned value.
+    U64,
+    /// Successful completion without a value.
+    Unit,
 }
 
 /// Static declaration of a closed error family whose leaves may carry one scalar.
@@ -185,6 +216,8 @@ pub struct ErrorCase {
 pub enum ResultValue {
     /// Evaluate the entire unsigned success range without a reserved sentinel.
     Ok(Expr),
+    /// Report successful completion without a payload.
+    OkUnit,
     /// Construct a checked case of the declared family.
     Error {
         /// Nominal family identity.
@@ -333,6 +366,20 @@ pub enum Build {
         /// Pure scalar initializer.
         value: Expr,
     },
+    /// Initialize the next boolean field.
+    Bool {
+        /// Expected next field name.
+        field: String,
+        /// Pure boolean initializer.
+        value: BoolExpr,
+    },
+    /// Initialize the next enum field with a case of its declared type.
+    Enum {
+        /// Expected next field name.
+        field: String,
+        /// Pure enum initializer.
+        value: EnumExpr,
+    },
     /// Initialize bytes using a scoped index; each value is explicitly narrowed
     /// to its low eight bits, independently of source-language conversion defaults.
     Bytes {
@@ -389,10 +436,19 @@ pub struct AppendArm {
 pub struct ConstructArm {
     /// Outcome selection and any scalar rejection payload binding.
     pub pattern: AppendPattern,
-    /// Readonly reference to the completed record, allowed only on success.
-    pub reference: Option<String>,
+    /// Reference to the completed record, allowed only on success.
+    pub reference: Option<ConstructReference>,
     /// Operations checked and executed only within the selected outcome scope.
     pub body: Vec<Op>,
+}
+
+/// A lexical path to the record initialized by a scoped constructor.
+#[derive(Clone, Debug)]
+pub struct ConstructReference {
+    /// Name available within the success arm.
+    pub name: String,
+    /// Access through this binding. The binding itself cannot be reassigned.
+    pub access: Access,
 }
 
 /// Recoverable outcomes of the checked publication boundary.
@@ -540,13 +596,41 @@ pub enum Expr {
     Nanoseconds,
 }
 
-/// Boolean expressions for ordinary returns, immutable bindings, and conditions.
+/// Typed enum expressions. Native discriminants are never source values.
+#[derive(Clone, Debug)]
+pub enum EnumExpr {
+    /// A case of a statically named enum.
+    Variant {
+        /// Enum type identity.
+        kind: String,
+        /// Declared case name.
+        variant: String,
+    },
+    /// Current value of an initialized local.
+    Local(String),
+    /// Read an initialized enum field through a live reference.
+    Read {
+        /// Checked reference to the enclosing record.
+        reference: String,
+        /// Nested enum projection.
+        path: Vec<String>,
+    },
+}
+
+/// Typed boolean expressions for bindings, conditions, returns, and fields.
 #[derive(Clone, Debug)]
 pub enum BoolExpr {
     /// Exact boolean constant.
     Const(bool),
-    /// Immutable lexical boolean.
+    /// Current value of a lexical boolean.
     Local(String),
+    /// Read an initialized boolean field through a live reference.
+    Read {
+        /// Checked reference to the enclosing record.
+        reference: String,
+        /// Nested boolean projection.
+        path: Vec<String>,
+    },
     /// Synchronous call to a checked boolean-returning helper.
     Call {
         /// Statically resolved callee identity.
@@ -556,6 +640,13 @@ pub enum BoolExpr {
     },
     /// Compare two unsigned scalars.
     Compare(Condition),
+    /// Compare two values of the same nominal enum.
+    EnumEq {
+        /// Operand evaluated first.
+        left: Box<EnumExpr>,
+        /// Operand evaluated second.
+        right: Box<EnumExpr>,
+    },
     /// Evaluate the right operand only when the left is true.
     And(Box<BoolExpr>, Box<BoolExpr>),
     /// Evaluate the right operand only when the left is false.
@@ -564,9 +655,19 @@ pub enum BoolExpr {
     Not(Box<BoolExpr>),
 }
 
-/// Explicit unsigned arithmetic; storage address/size arithmetic is not wrapping.
+/// Unsigned scalar arithmetic with checked operators and explicit wrapping operations.
 #[derive(Clone, Copy, Debug)]
 pub enum Binary {
+    /// Addition that traps on overflow.
+    AddChecked,
+    /// Subtraction that traps on underflow.
+    SubChecked,
+    /// Multiplication that traps on overflow.
+    MulChecked,
+    /// Unsigned quotient that traps on a zero divisor.
+    DivChecked,
+    /// Unsigned remainder that traps on a zero divisor.
+    RemChecked,
     /// Addition modulo 2^64.
     AddWrapping,
     /// Subtraction modulo 2^64.
@@ -577,6 +678,20 @@ pub enum Binary {
     Xor,
     /// Bitwise conjunction.
     And,
+}
+
+impl Binary {
+    /// Whether this operation can trap even when both operands are valid u64 values.
+    pub(crate) fn is_checked(self) -> bool {
+        matches!(
+            self,
+            Self::AddChecked
+                | Self::SubChecked
+                | Self::MulChecked
+                | Self::DivChecked
+                | Self::RemChecked
+        )
+    }
 }
 
 /// Branch or assertion condition, evaluating the left operand first.
@@ -627,6 +742,8 @@ pub enum Op {
     Function(Function),
     /// Declare a nominal error family at entry's outermost level, with no runtime action.
     ErrorFamily(ErrorFamily),
+    /// Declare a nominal enum at entry's outermost level, with no runtime action.
+    Enum(EnumDef),
     /// Take sole ownership of the TCP stream admitted by the native entry.
     TcpScope {
         /// Opaque lexical binding for the sole descriptor.
@@ -676,8 +793,12 @@ pub enum Op {
         /// Readonly scalar receiving accepted, end, interruption, or errno.
         result: String,
     },
-    /// Repeat a fresh entry scope until an explicit entry completion.
+    /// Repeat a fresh entry scope until a break or entry completion.
     Loop(Vec<Op>),
+    /// Leave the innermost enclosing loop and clean up scopes exited on the way.
+    Break,
+    /// Advance the innermost enclosing loop after cleaning up the iteration.
+    Continue,
     /// Acquire backing once, expose it only on success, and free it once on exit.
     Region {
         /// Binding visible only in the successful body.
@@ -718,6 +839,22 @@ pub enum Op {
         /// Initial boolean value.
         value: BoolExpr,
     },
+    /// Declare and initialize a mutable boolean binding.
+    VarBool {
+        /// New mutable boolean name.
+        name: String,
+        /// Initial boolean value.
+        value: BoolExpr,
+    },
+    /// Declare and initialize an enum local.
+    LetEnum {
+        /// New binding name.
+        name: String,
+        /// Initial value and its nominal type.
+        value: EnumExpr,
+        /// Whether the binding may be reassigned.
+        mutable: bool,
+    },
     /// Capture an initialized byte location and bound for the rest of this scope.
     BindBytes {
         /// New immutable view binding.
@@ -743,6 +880,18 @@ pub enum Op {
     TrySaved {
         /// Immutable success local introduced only after a successful result.
         name: String,
+        /// Existing lexical result whose tag and payload are reused.
+        source: String,
+    },
+    /// Propagate failure of a Unit-result call and continue on success.
+    TryUnit {
+        /// Statically resolved Unit-result callee.
+        function: String,
+        /// Typed actuals evaluated once in their written order.
+        args: Vec<FunctionArgument>,
+    },
+    /// Propagate failure of a saved Unit result and continue on success.
+    TrySavedUnit {
         /// Existing lexical result whose tag and payload are reused.
         source: String,
     },
@@ -778,6 +927,20 @@ pub enum Op {
         /// Replacement unsigned value.
         value: Expr,
     },
+    /// Update an existing mutable boolean binding.
+    SetBool {
+        /// Existing mutable boolean local.
+        name: String,
+        /// Replacement boolean value.
+        value: BoolExpr,
+    },
+    /// Replace a mutable enum local with a value of the same enum.
+    SetEnum {
+        /// Existing mutable enum local.
+        name: String,
+        /// Replacement enum value.
+        value: EnumExpr,
+    },
     /// Attempt destination construction; publish only on success.
     Append {
         /// Receiving batch.
@@ -806,7 +969,7 @@ pub enum Op {
     ConstructHandled {
         /// Live bounded backing with no competing tail owner.
         region: String,
-        /// Typed constructor whose schema defines the success reference.
+        /// Destination constructor whose schema defines the success reference.
         producer: String,
         /// Typed actuals evaluated once after the receiving tail is resolved.
         args: Vec<Argument>,
@@ -848,6 +1011,24 @@ pub enum Op {
         path: Vec<String>,
         /// Replacement value.
         value: Expr,
+    },
+    /// Write one existing boolean field through a writable reference.
+    WriteBool {
+        /// Writable reference binding.
+        reference: String,
+        /// Nested boolean projection.
+        path: Vec<String>,
+        /// Replacement boolean value.
+        value: BoolExpr,
+    },
+    /// Replace an enum field through a writable reference.
+    WriteEnum {
+        /// Writable reference binding.
+        reference: String,
+        /// Nested enum projection.
+        path: Vec<String>,
+        /// Replacement value of the field's nominal enum.
+        value: EnumExpr,
     },
     /// Change one existing payload byte without changing length or shape.
     WriteByte {

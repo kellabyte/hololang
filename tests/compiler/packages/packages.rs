@@ -793,6 +793,59 @@ fn shipped_standard_library_passes_strict_naming() {
     assert!(success(output).is_empty());
 }
 
+/// A public enum survives dependency binding without exposing its representation.
+#[test]
+fn locked_package_public_enum_fields_keep_nominal_identity() {
+    let fixture = Fixture::new();
+    let provider = r#"
+namespace wire.octets
+public enum Command { Get Set }
+public struct Request { command Command }
+public func request returns Request {
+    return Request { command: Command.Get }
+}
+"#;
+    let entry = r#"
+using wire.octets
+func main returns u64 {
+    let storage = core.region(32) else { return 0 }
+    core.construct(storage, octets.request())
+        on ok(readwrite state) then {
+            core.assert(state.command == octets.Command.Get)
+            state.command = octets.Command.Set
+            core.assert(state.command != octets.Command.Get)
+            core.print(1)
+        }
+        on error then { core.assert(false) }
+    return 0
+}
+"#;
+    fixture.write("wire/src/octets.holo", provider);
+    fixture.write("telemetry/src/main.holo", entry);
+    fixture.lock();
+    assert_eq!(
+        success(fixture.command("run").arg("--locked").output().unwrap()),
+        b"1\n"
+    );
+
+    fixture.write(
+        "wire/src/octets.holo",
+        &provider.replace("public enum", "enum"),
+    );
+    fixture.lock();
+    let error = rejection(
+        fixture
+            .metadata_command("check")
+            .arg("--locked")
+            .output()
+            .unwrap(),
+    );
+    assert!(
+        error.contains("cannot expose private enum `Command`"),
+        "{error}"
+    );
+}
+
 /// Prepare an application that imports the shipped standard library. The
 /// temporary fixture owns the dependency link and all generated output.
 fn stdlib_fixture(source: &str) -> Fixture {
@@ -1523,7 +1576,7 @@ public func observe_wait with noalloc, noblock
     returns u64
 {
     return net.wait_result(status)
-        on ok(ready) then ready
+        on ok then 0
         on net.SocketError.Interrupted then 8589934592
         on net.SocketError.WouldBlock then 8589934593
         on net.SocketError.Native(code) then core.add_wrapping(4294967296, code)
@@ -1536,7 +1589,7 @@ public func observe_session with noalloc, noblock
     returns u64
 {
     return net.next_session_result(status)
-        on ok(accepted) then accepted
+        on ok then 0
         on net.SessionError.End then 1
         on net.SessionError.Interrupted then 8589934592
         on net.SessionError.Native(code) then core.add_wrapping(4294967296, code)
@@ -1648,7 +1701,7 @@ func main returns u64 {
 
     let wait_status = core.wait_output()
     let ready = net.wait_result(wait_status)
-        on ok(value) then value
+        on ok then 0
         on error then 99
     let send_status = core.send(prepared.wire, 0, 3)
     let sent = net.send_result(send_status)
