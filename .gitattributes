@@ -1,0 +1,3 @@
+# Use Swift as approximate GitHub highlighting until Linguist supports Holo.
+# This also classifies matching files as Swift in GitHub language statistics.
+*.holo linguist-language=Swift
