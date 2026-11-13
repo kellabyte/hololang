@@ -1,0 +1,10 @@
+# Local hosted telemetry example. The entry path is relative to source.
+[package]
+name = "telemetry"
+version = "0.1.0"
+source = "src"
+entry = "main.holo"
+
+# The checked byte operations come from the repository's local Holo package.
+[dependencies]
+holo = { path = "../../../lib/holo", version = "^0.1" }

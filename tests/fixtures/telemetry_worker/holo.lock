@@ -1,0 +1,12 @@
+format = 1
+root = "telemetry"
+
+[root_dependencies.holo]
+path = "../../../lib/holo"
+version = "^0.1"
+
+[[package]]
+name = "holo"
+version = "0.1.0"
+source = "../../../lib/holo/holo.toml"
+sha256 = "a965b91e72fca369ee685474f6fd6f69c2db93e5459d595ac3163d13998e317b"

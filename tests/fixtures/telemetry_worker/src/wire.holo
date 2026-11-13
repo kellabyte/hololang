@@ -1,0 +1,17 @@
+// Wire integers for the telemetry protocol. The caller passes copied octets
+// and can assemble a field across native reads without retaining a byte view.
+
+namespace telemetry.wire
+
+using holo.bytes
+
+// Decode the low eight bits of each operand into an unsigned LE16 value.
+// The result fits in u64 and the checked byte helper needs no storage or I/O.
+public func little_endian_u16
+    with noalloc, noblock
+    arg low u64 as readonly copy
+    arg high u64 as readonly copy
+    returns u64
+{
+    return bytes.join_low_octets_le(low, high)
+}

@@ -1,0 +1,9 @@
+// A standalone first program that prints a compile-time greeting.
+
+// Print one line and return a successful process status.
+func main
+    returns u64
+{
+    core.print("Hello, world!")
+    return 0
+}

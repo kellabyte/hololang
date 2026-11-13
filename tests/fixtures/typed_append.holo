@@ -1,0 +1,105 @@
+// Construct fixed telemetry records in a batch and recover from a child failure.
+// The append owns the private suffix. The copied error payload survives rollback.
+
+// A child reports the original rejected input without allocating a diagnostic.
+error BuildError {
+    BadChild(value u64)
+}
+
+// The nested destination contains one copied scalar.
+struct Child {
+    value u64
+}
+
+// The sequence is initialized before the child runs in its final field slot.
+struct Parent {
+    sequence u64
+    child Child
+}
+
+// Validate the copied input, then initialize the receiving child field.
+func make_child
+    with noblock
+    arg value u64 as readonly copy
+    returns Result<Child, BuildError>
+{
+    // Values outside the example's domain fail before the child field write.
+    if value >= 100 {
+        return error BuildError.BadChild(value)
+    }
+    return ok Child:
+        value = value
+}
+
+// Build directly into the caller's unpublished parent slot. A child failure
+// returns its error to the owner of the append checkpoint.
+func make_parent
+    with noblock
+    arg sequence u64 as readonly copy
+    arg value u64 as readonly copy
+    returns Result<Parent, BuildError>
+{
+    return ok Parent:
+        sequence = sequence
+        child    = try make_child(value)
+}
+
+// Check publication, failure rollback, reuse, and retained references. The
+// second owner uses the inspected size of one actual record as its limit.
+func main
+    returns u64
+{
+    let memory = core.region(128) else { core.assert(false); return 0 }
+    let rows = core.batch(memory, Parent)
+    let seeded = core.append(rows, make_parent(7, 3))
+        on ok    then true
+        on error then false
+    core.assert(seeded)
+
+    let first = core.borrow_readonly(rows, 0)
+    let saved = core.used(memory)
+    let address = core.address(first)
+
+    // Dispatch only after the append restored the suffix. The error carries all 64 bits.
+    let reason = core.append(rows, make_parent(8, 18446744073709551615))
+        on ok                       then 0
+        on Rejected BadChild(value) then value
+        on Full                     then 1
+        on SizeOverflow             then 2
+    core.assert(reason == 18446744073709551615)
+    core.assert(core.used(memory) == saved)
+    core.assert(core.len(rows) == 1)
+    core.assert(core.address(first) == address)
+    core.assert(first.sequence == 7)
+    core.assert(first.child.value == 3)
+
+    // Retry with the retained reference still live and inspect both records.
+    let retried = core.append(rows, make_parent(8, 4))
+        on ok    then true
+        on error then false
+    core.assert(retried)
+    let second = core.borrow_readonly(rows, 1)
+    core.assert(second.sequence == 8)
+    core.assert(second.child.value == 4)
+    core.assert(core.len(rows) == 2)
+    core.assert(core.address(first) == address)
+
+    // An owner with room for only the seed fails before reaching the child.
+    let limited = core.region(saved) else { core.assert(false); return 0 }
+    let bounded = core.batch(limited, Parent)
+    let filled = core.append(bounded, make_parent(7, 3))
+        on ok    then true
+        on error then false
+    core.assert(filled)
+    let failure = core.append(bounded, make_parent(8, 18446744073709551615))
+        on ok    then 0
+        on Full  then 1
+        on error then 2
+    core.assert(failure == 1)
+    core.assert(core.len(bounded) == 1)
+    core.assert(core.used(limited) == saved)
+    core.print(reason)
+    core.print(second.sequence)
+    core.print(failure)
+    return 0
+}

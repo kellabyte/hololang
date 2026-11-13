@@ -1,0 +1,219 @@
+// Decode length-prefixed frames across arbitrary hosted read boundaries.
+// Two initialized slots hold the latest read and the pending frame. Completed
+// frames own their payloads in a separate bounded batch.
+
+// The decoder either needs a larger prefix or rejects a complete bad header.
+error FrameError {
+    Truncated(required u64)
+    BadMagic
+}
+
+// Inline initialized storage for either incoming or accumulated bytes.
+struct Slot {
+    wire Bytes
+}
+
+// The sequence and payload published only after a complete frame is available.
+struct Frame {
+    sequence u64
+    payload Bytes
+}
+
+// Outer metadata is initialized before the nested decoder can reject.
+struct Received {
+    channel u64
+    frame Frame
+}
+
+// Construct a fixed initialized slot. The caller owns its backing and bounds.
+func make_slot
+    with noblock
+    arg capacity u64 as readonly copy
+    returns Slot
+{
+    return Slot {
+        wire: core.bytes(capacity, 0)
+    }
+}
+
+// Read the fresh extent supplied by the positive native refill.
+func extent
+    with noalloc, noblock
+    arg input Bytes as readonly reference
+    returns u64
+{
+    return core.len(input)
+}
+
+// Read one checked byte from a live received prefix.
+func octet
+    with noalloc, noblock
+    arg input Bytes as readonly reference
+    arg index u64 as readonly copy
+    returns u64
+{
+    return input[index]
+}
+
+// Decode only the bytes the caller assembled for this frame. The remainder of
+// the initialized slot can still contain the tail of an earlier frame.
+func decode_frame
+    with noblock
+    arg input Bytes as readonly reference
+    arg filled u64 as readonly copy
+    returns Result<Frame, FrameError>
+{
+    // Guard the header before reading its fields.
+    if filled < 3 {
+        return error FrameError.Truncated(3)
+    }
+    // A complete malformed header ends this session without publishing.
+    if input[0] != 0x48 {
+        return error FrameError.BadMagic
+    }
+    // The payload length is one byte, so the total extent is at most 258.
+    if filled < core.add_wrapping(3, input[2]) {
+        return error FrameError.Truncated(core.add_wrapping(3, input[2]))
+    }
+    return ok Frame:
+        sequence = input[1]
+        payload = core.bytes(input[2], input[core.add_wrapping(3, core.index())])
+}
+
+// Propagate the child's typed failure to the append boundary. Only the
+// successful child initializes the final field of the outer record.
+func receive
+    with noblock
+    arg input Bytes as readonly reference
+    arg filled u64 as readonly copy
+    returns Result<Received, FrameError>
+{
+    return ok Received:
+        channel = 1
+        frame = try decode_frame(input, filled)
+}
+
+// Sum a published payload without retaining a reference beyond the call.
+func checksum
+    with noalloc, noblock
+    arg payload Bytes as readonly reference
+    returns u64
+{
+    var sum = 0
+    // Each byte comes from the completed record's owned payload.
+    for index in core.range(core.len(payload)) {
+        sum = core.add_wrapping(sum, payload[index])
+    }
+    return sum
+}
+
+// Drive one file or nonblocking connected stream until EOF or a terminal error.
+// At the start of every read, filled is smaller than the next required extent.
+func main
+    returns u64
+{
+    let scratch_memory = core.region(512) else {
+        core.assert(false);
+        return 0
+    }
+    let slots = core.batch(scratch_memory, Slot)
+    let max_frame = 258
+    // The two-byte read limit makes this example exercise short prefixes even
+    // when the file or socket already has all bytes available.
+    let read_slot = core.append(slots, make_slot(2))
+    core.assert(read_slot == 0)
+    let pending_slot = core.append(slots, make_slot(max_frame))
+    core.assert(pending_slot == 0)
+    let incoming = core.borrow_readwrite(slots, 0)
+    let pending = core.borrow_readwrite(slots, 1)
+
+    let frame_memory = core.region(4096) else {
+        core.assert(false);
+        return 0
+    }
+    let frames = core.batch(frame_memory, Received)
+    var filled = 0
+    var required = 3
+    let interrupted = 18446744073709551615
+    let would_block = 18446744073709551614
+
+    // Limit each read to this frame's known boundary. Once the header is
+    // complete the decoder can supply a larger bound for the payload.
+    loop {
+        let remaining = core.sub_wrapping(required, filled)
+        var limit = 2
+        // The header or last body fragment can be shorter than one read slot.
+        if remaining < limit {
+            limit = remaining
+        }
+        refill incoming.wire, limit as chunk {
+            let received = extent(chunk)
+            // Copy only this read's fresh bytes into the initialized pending slot.
+            for index in core.range(received) {
+                pending.wire[core.add_wrapping(filled, index)] = octet(chunk, index)
+            }
+            filled = core.add_wrapping(filled, received)
+
+            let count = core.len(frames)
+            let marker = core.used(frame_memory)
+            // A positive outcome through 258 is the exact extent needed next.
+            // Terminal outcomes use larger values, disjoint from wire lengths.
+            let outcome = core.append(frames, receive(pending.wire, filled))
+                on ok then 0
+                on Rejected Truncated(needed) then needed
+                on Rejected BadMagic then core.add_wrapping(max_frame, 1)
+                on Full then core.add_wrapping(max_frame, 2)
+                on SizeOverflow then core.add_wrapping(max_frame, 3)
+            if outcome == 0 {
+                // The new record owns its payload before the pending slot is reused.
+                let frame = core.borrow_readonly(frames, count)
+                core.print(frame.frame.sequence)
+                core.print(checksum(frame.frame.payload))
+                filled = 0
+                required = 3
+            } else {
+                // A failed nested append leaves both publication and backing unchanged.
+                core.assert(core.len(frames) == count)
+                core.assert(core.used(frame_memory) == marker)
+                // Translate terminal outcomes to public status codes starting at two.
+                if outcome > max_frame {
+                    core.print(core.add_wrapping(core.sub_wrapping(outcome, max_frame), 1))
+                    core.print(count)
+                    core.print(0)
+                    return 0
+                }
+                core.assert(outcome > filled)
+                required = outcome
+            }
+        } else status {
+            var stop = 1
+            var outcome = status
+            // Wait only after WouldBlock and retry after successful readiness.
+            if status == would_block {
+                let readiness = core.wait_input()
+                outcome = readiness
+                if outcome == 0 {
+                    stop = 0
+                }
+            }
+            if outcome == interrupted {
+                stop = 0
+            }
+            // EOF with a partial frame reports the last typed extent. An
+            // independent native error keeps its original status.
+            if stop == 1 {
+                var needed = 0
+                if outcome == 0 {
+                    if filled != 0 {
+                        outcome = 1
+                        needed = required
+                    }
+                }
+                core.print(outcome)
+                core.print(core.len(frames))
+                core.print(needed)
+                return 0
+            }
+        }
+    }
+}

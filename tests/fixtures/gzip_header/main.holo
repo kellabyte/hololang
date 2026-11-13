@@ -1,0 +1,216 @@
+// Inspect the ten-byte fixed prefix of a gzip member from a hosted input.
+// The slot is reused across short reads. Parser state holds only scalar fields
+// and never retains an input reference. See README.md for the output contract.
+
+using holo.bytes
+
+// One initialized slot for the native adapter's bounded writes.
+struct InputSlot {
+    // The adapter lends only the fresh prefix of this ten-byte backing.
+    wire Bytes
+}
+
+// State that survives short reads, including a split modification time.
+struct Header {
+    // Number of validated prefix bytes, from zero through ten.
+    received u64
+    // Low octet of the timestamp halfword currently being assembled.
+    mtime_low_octet u64
+    // Unsigned timestamp seconds. Zero means the timestamp is unavailable.
+    mtime_seconds u64
+    // Gzip flags, including indicators for optional header fields.
+    flags u64
+    // Raw extra flags for the DEFLATE compression method.
+    compression_hint u64
+    // Raw source operating-system identifier.
+    os u64
+}
+
+// Construct the ten-byte slot directly in caller-owned backing.
+func start_input
+    returns InputSlot
+{
+    return InputSlot {
+        wire: core.bytes(10, 0)
+    }
+}
+
+// Construct empty parser state in the caller's fixed record slot.
+func start_header
+    returns Header
+{
+    return Header {
+        received: 0,
+        mtime_low_octet: 0,
+        mtime_seconds: 0,
+        flags: 0,
+        compression_hint: 0,
+        os: 0
+    }
+}
+
+// Validate one copied octet at its absolute offset in the fixed prefix.
+// Accept with zero and update only the relevant scalar field. On malformed
+// input, return its status without consuming later fields. The caller supplies
+// offsets 0 through 9 in order. This operation acquires and waits for nothing.
+func accept_octet
+    with noalloc, noblock
+    arg header Header as readwrite reference
+    arg offset u64 as readonly copy
+    arg octet u64 as readonly copy
+    returns u64
+{
+    // Check the signature in order so an invalid prefix fails on arrival.
+    if offset == 0 {
+        if octet != 0x1f {
+            return 2
+        }
+        return 0
+    }
+    if offset == 1 {
+        if octet != 0x8b {
+            return 2
+        }
+        return 0
+    }
+    // This fixed-header inspector accepts gzip's DEFLATE method.
+    if offset == 2 {
+        if octet != 8 {
+            return 3
+        }
+        return 0
+    }
+    // Reserved bits must be zero. Preserve all defined flags for the caller.
+    if offset == 3 {
+        if core.and(octet, 0xe0) != 0 {
+            return 4
+        }
+        header.flags = octet
+        return 0
+    }
+    // Offsets four through seven encode the unsigned timestamp. The low
+    // octet of either halfword may arrive on an earlier read.
+    if offset < 8 {
+        if core.and(offset, 1) == 0 {
+            header.mtime_low_octet = octet
+            return 0
+        }
+        let halfword = bytes.join_low_octets_le(header.mtime_low_octet, octet)
+        // The lower half arrives before the upper half. The combined value
+        // fits in 32 bits, including timestamps above the signed 32-bit range.
+        if offset == 5 {
+            header.mtime_seconds = halfword
+        } else {
+            let upper = core.mul_wrapping(halfword, 65536)
+            header.mtime_seconds = core.add_wrapping(header.mtime_seconds, upper)
+        }
+        return 0
+    }
+    // The last two positions are metadata. Keep their original values.
+    if offset == 8 {
+        header.compression_hint = octet
+    } else {
+        header.os = octet
+    }
+    return 0
+}
+
+// Process a fresh readonly prefix into caller-owned state. Input length is
+// bounded by the remaining header bytes at the call site. Return zero after
+// advancing received, or return the earliest rejection without publishing
+// success. Provisional scalar fields are used only after the header completes.
+func accept_chunk
+    with noalloc, noblock
+    arg header Header as readwrite reference
+    arg input Bytes as readonly reference
+    returns u64
+{
+    let size = core.len(input)
+    let previous = header.received
+    // The captured extent bounds each load. Each iteration handles one offset.
+    for index in core.range(size) {
+        let offset = core.add_wrapping(previous, index)
+        let status = accept_octet(header, offset, input[index])
+        // Leave all subsequent fields unexamined on malformed input.
+        if status != 0 {
+            return status
+        }
+    }
+    header.received = core.add_wrapping(previous, size)
+    return 0
+}
+
+// Admit one file or connected stream through the native host. Read at most
+// the fixed prefix, then print its fields or a single failure status and
+// release both bounded regions through entry cleanup.
+func main
+    returns u64
+{
+    // The regions cover the inline slot and scalar state in each layout.
+    // Setup exhaustion traps before reading any input.
+    let input_memory = core.region(256) else {
+        core.assert(false)
+        return 0
+    }
+    let slots = core.batch(input_memory, InputSlot)
+    let slot_status = core.append(slots, start_input())
+    core.assert(slot_status == 0)
+    let slot = core.borrow_readwrite(slots, 0)
+
+    let state_memory = core.region(256) else {
+        core.assert(false)
+        return 0
+    }
+    let states = core.batch(state_memory, Header)
+    let state_status = core.append(states, start_header())
+    core.assert(state_status == 0)
+    let header = core.borrow_readwrite(states, 0)
+
+    let interrupted = 18446744073709551615
+    let would_block = 18446744073709551614
+    // A successful attempt either completes the prefix or consumes at least
+    // one of the remaining bytes. Ending the data arm releases its borrow.
+    loop {
+        let remaining = core.sub_wrapping(10, header.received)
+        refill slot.wire, remaining as chunk {
+            let status = accept_chunk(header, chunk)
+            // Invalid input never publishes provisional metadata.
+            if status != 0 {
+                core.print(status)
+                return 0
+            }
+            // Stop at ten bytes, even if the peer keeps the stream open.
+            if header.received == 10 {
+                core.print(0)
+                core.print(header.mtime_seconds)
+                core.print(header.flags)
+                core.print(header.compression_hint)
+                core.print(header.os)
+                return 0
+            }
+        } else status {
+            // EOF here leaves an incomplete fixed prefix.
+            if status == 0 {
+                core.print(1)
+                return 0
+            }
+            // Readiness is explicit and only needed after a would-block result.
+            if status == would_block {
+                let ready = core.wait_input()
+                // A ready or interrupted wait returns to the same read.
+                if ready != 0 {
+                    if ready != interrupted {
+                        core.print(ready)
+                        return 0
+                    }
+                }
+            } else {
+                // Retry interrupted reads and report other native failures.
+                if status != interrupted {
+                    core.print(status)
+                    return 0
+                }
+            }
+        }
+    }
+}

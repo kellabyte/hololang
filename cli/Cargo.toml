@@ -1,0 +1,154 @@
+# The holo executable delegates language work to the single compiler library.
+# Root integration tests are attached here so Cargo supplies CARGO_BIN_EXE_holo
+# and runs each shared test once; no conformance suite is lost at the virtual root.
+[package]
+name = "holo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Command-line interface to the experimental Holo compiler"
+default-run = "holo"
+autotests = false
+
+[dependencies]
+holo = { package = "holo-compiler", path = "../compiler" }
+
+# tests/compiler/frontend
+
+[[test]]
+name = "lex"
+path = "../tests/compiler/frontend/lex.rs"
+
+[[test]]
+name = "parser"
+path = "../tests/compiler/frontend/parser.rs"
+
+[[test]]
+name = "frontend"
+path = "../tests/compiler/frontend/frontend.rs"
+
+[[test]]
+name = "frontend_evaluation"
+path = "../tests/compiler/frontend/frontend_evaluation.rs"
+
+[[test]]
+name = "frontend_native"
+path = "../tests/compiler/frontend/frontend_native.rs"
+
+[[test]]
+name = "format"
+path = "../tests/compiler/frontend/format.rs"
+
+[[test]]
+name = "highlight"
+path = "../tests/compiler/frontend/highlight.rs"
+
+# tests/compiler/check
+
+[[test]]
+name = "check"
+path = "../tests/compiler/check/check.rs"
+
+[[test]]
+name = "check_locations"
+path = "../tests/compiler/check/check_locations.rs"
+
+[[test]]
+name = "byte_input_check"
+path = "../tests/compiler/check/byte_input_check.rs"
+
+[[test]]
+name = "owner_check"
+path = "../tests/compiler/check/owner_check.rs"
+
+# tests/compiler/storage
+
+[[test]]
+name = "layout_plan"
+path = "../tests/compiler/storage/layout_plan.rs"
+
+[[test]]
+name = "layout_native"
+path = "../tests/compiler/storage/layout_native.rs"
+
+[[test]]
+name = "reservation"
+path = "../tests/compiler/storage/reservation.rs"
+
+[[test]]
+name = "byte_initialization"
+path = "../tests/compiler/storage/byte_initialization.rs"
+
+[[test]]
+name = "byte_input_native"
+path = "../tests/compiler/storage/byte_input_native.rs"
+
+# tests/compiler/backend
+
+[[test]]
+name = "staging_copy"
+path = "../tests/compiler/backend/staging_copy.rs"
+
+[[test]]
+name = "uniform_batches"
+path = "../tests/compiler/backend/uniform_batches.rs"
+
+[[test]]
+name = "byte_sum_native"
+path = "../tests/compiler/backend/byte_sum_native.rs"
+
+# tests/compiler/packages
+
+[[test]]
+name = "modules"
+path = "../tests/compiler/packages/modules.rs"
+
+[[test]]
+name = "packages"
+path = "../tests/compiler/packages/packages.rs"
+
+# tests/runtime
+
+[[test]]
+name = "native"
+path = "../tests/runtime/native.rs"
+
+[[test]]
+name = "runtime_bounds"
+path = "../tests/runtime/runtime_bounds.rs"
+
+[[test]]
+name = "entry_exit"
+path = "../tests/runtime/entry_exit.rs"
+
+[[test]]
+name = "owner_lifecycle"
+path = "../tests/runtime/owner_lifecycle.rs"
+
+[[test]]
+name = "hosted_refill"
+path = "../tests/runtime/hosted_refill.rs"
+
+[[test]]
+name = "hosted_tcp"
+path = "../tests/runtime/hosted_tcp.rs"
+
+# tests/cli
+
+[[test]]
+name = "cli"
+path = "../tests/cli/cli.rs"
+
+[[test]]
+name = "source_tools"
+path = "../tests/cli/source_tools.rs"
+
+# tests/semantics
+
+[[test]]
+name = "model"
+path = "../tests/semantics/reference_interpreter.rs"
+
+[[test]]
+name = "model_native"
+path = "../tests/semantics/native_vs_reference.rs"

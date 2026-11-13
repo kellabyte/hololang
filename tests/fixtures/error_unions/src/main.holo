@@ -1,0 +1,15 @@
+// Run the dashboard's success, three named recovery arms, and catch-all.
+// The returned UI codes make each outcome observable without a network or UI.
+using app.dashboard
+
+// Print all five deterministic outcomes in scenario order.
+func main
+    returns u64
+{
+    core.print(dashboard.show_customer_count(0))
+    core.print(dashboard.show_customer_count(1))
+    core.print(dashboard.show_customer_count(2))
+    core.print(dashboard.show_customer_count(3))
+    core.print(dashboard.show_customer_count(4))
+    return 0
+}

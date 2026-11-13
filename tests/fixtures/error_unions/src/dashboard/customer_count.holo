@@ -1,0 +1,25 @@
+// Compose three fallible services into one dashboard result. Each try exits
+// before the next call on failure and propagates the original copied payload.
+namespace app.dashboard
+
+using app.session
+using app.sql
+using app.cache
+
+// Name the child families that may fail while loading a customer count.
+error DashboardError {
+    from session.SessionError as Session
+    from sql.SqlError as Sql
+    from cache.CacheError as Cache
+}
+
+// Load and save the count for a deterministic demo scenario.
+func load_customer_count
+    arg scenario u64 as readonly copy
+    returns Result<u64, DashboardError>
+{
+    let account = try session.account_id(scenario)
+    let count = try sql.count_customers(account)
+    let saved = try cache.save_count(count)
+    return ok saved
+}

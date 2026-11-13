@@ -1,0 +1,19 @@
+# The Rust compiler owns the checked pipeline and native driver. Keeping its
+# existing holo library name preserves the experimental programmatic API during
+# relocation; the workspace package has a distinct component name.
+[package]
+name = "holo-compiler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Experimental Holo frontend, checked construction core, and LLVM backend"
+
+[lib]
+name = "holo"
+path = "src/lib.rs"
+
+[dependencies]
+semver = "1.0.28"
+serde = { version = "=1.0.228", features = ["derive"] }
+sha2 = "0.10.9"
+toml = "=0.9.10"

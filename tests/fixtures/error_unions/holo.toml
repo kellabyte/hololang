@@ -1,0 +1,6 @@
+# Dashboard demo with separate session, SQL, cache, and UI namespaces.
+[package]
+name = "app"
+version = "0.1.0"
+source = "src"
+entry = "main.holo"

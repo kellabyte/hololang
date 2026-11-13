@@ -1,0 +1,90 @@
+// Typed outcomes for the experimental hosted socket ABI. These helpers decode
+// scalars and retain no socket, bytes, or storage. Acquiring descriptors and
+// performing I/O stay at the caller's checked native boundary.
+
+namespace holo.net
+
+// The failures shared by one socket attempt and an explicit readiness wait.
+public error SocketError {
+    // A signal interrupted the call before it reported progress.
+    Interrupted
+    // The nonblocking transfer could not make progress.
+    WouldBlock
+    // Preserve the exact positive native error number.
+    Native(code u64)
+    // The raw status lies outside the selected operation's result domain.
+    InvalidStatus
+}
+
+// Decode a status after the caller has checked its success domain.
+// The two high sentinels take precedence over the tagged errno interval.
+func decode_failure
+    with noalloc, noblock
+    arg status u64 as readonly copy
+    returns Result<u64, SocketError>
+{
+    if status == 18446744073709551615 {
+        return error SocketError.Interrupted
+    }
+    if status == 18446744073709551614 {
+        return error SocketError.WouldBlock
+    }
+
+    // The base tag on its own supplies no errno. Positive native int
+    // values occupy exactly the next 2,147,483,647 statuses.
+    let tag = 9223372036854775808
+    let last_native_error = 9223372039002259455
+    if status <= tag {
+        return error SocketError.InvalidStatus
+    }
+    if status > last_native_error {
+        return error SocketError.InvalidStatus
+    }
+    return error SocketError.Native(core.sub_wrapping(status, tag))
+}
+
+// Decode the result of a receive requested with a positive size.
+// Zero means end of input. Positive success is the reported byte count.
+public func recv_result
+    with noalloc, noblock
+    arg status u64 as readonly copy
+    returns Result<u64, SocketError>
+{
+    if status <= 2147483647 {
+        return ok status
+    }
+    return decode_failure(status)
+}
+
+// Decode the result of a positive-size send. A successful send reports a
+// positive count, which may be shorter than the requested range.
+public func send_result
+    with noalloc, noblock
+    arg status u64 as readonly copy
+    returns Result<u64, SocketError>
+{
+    if status == 0 {
+        return error SocketError.InvalidStatus
+    }
+    if status <= 2147483647 {
+        return ok status
+    }
+    return decode_failure(status)
+}
+
+// Decode the result of an explicit readiness wait. Success reports zero
+// and permits a new transfer attempt. It does not supply a byte count.
+public func wait_result
+    with noalloc, noblock
+    arg status u64 as readonly copy
+    returns Result<u64, SocketError>
+{
+    if status == 0 {
+        return ok 0
+    }
+    // The blocking wait adapter never produces the nonblocking I/O sentinel.
+    if status == 18446744073709551614 {
+        return error SocketError.InvalidStatus
+    }
+    return decode_failure(status)
+}

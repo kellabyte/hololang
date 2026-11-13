@@ -1,0 +1,180 @@
+// Admit a telemetry frame from initialized wire bytes into an inline batch.
+// Decode into the final slot, preserving the published prefix on either
+// a domain rejection or a bounded backing failure.
+
+// Truncation reports the total wire extent needed for a fresh attempt.
+error FrameError {
+    Truncated(required u64)
+    BadMagic
+}
+
+// A caller-owned wire buffer with exactly the supplied extent.
+struct Wire {
+    data Bytes
+}
+
+// A frame owns its copied payload; it has no reference to the wire buffer.
+struct Frame {
+    sequence u64
+    payload Bytes
+}
+
+// Store the channel before running the nested decoder in its final field.
+struct Received {
+    channel u64
+    frame Frame
+}
+
+// Initialize the complete input extent so callers can write wire data safely.
+func empty_wire
+    with noblock
+    arg length u64 as readonly copy
+    returns Wire
+{
+    return Wire {
+        data: core.bytes(length, 0)
+    }
+}
+
+// Check the three-byte header before reading it. The third byte bounds the
+// payload length to 255, so the required extent is at most 258 bytes.
+func decode_frame
+    with noblock
+    arg input Bytes as readonly reference
+    returns Result<Frame, FrameError>
+{
+    // A missing header has priority over reading magic or payload length.
+    if core.len(input) < 3 {
+        return error FrameError.Truncated(3)
+    }
+    // Reject a malformed complete header before considering its payload.
+    if input[0] != 0x48 {
+        return error FrameError.BadMagic
+    }
+    // Validate the full range before any payload writes.
+    if core.len(input) < core.add_wrapping(3, input[2]) {
+        return error FrameError.Truncated(core.add_wrapping(3, input[2]))
+    }
+    return ok Frame:
+        sequence = input[1]
+        payload  = core.bytes(input[2], input[core.add_wrapping(3, core.index())])
+}
+
+// Forward the frame's failure through the same nominal family, leaving
+// rollback of the channel and private frame to the owning append.
+func receive
+    with noblock
+    arg channel u64 as readonly copy
+    arg input Bytes as readonly reference
+    returns Result<Received, FrameError>
+{
+    return ok Received:
+        channel = channel
+        frame   = try decode_frame(input)
+}
+
+// Seed a frame, exercise typed recovery, and retry with the complete extent.
+// Verify address stability, backing reuse, and ownership of the copied bytes.
+func main
+    returns u64
+{
+    let input_memory = core.region(256) else { core.assert(false); return 0 }
+    let wires = core.batch(input_memory, Wire)
+    let seed_status = core.append(wires, empty_wire(3))
+    core.assert(seed_status == 0)
+    let short_status = core.append(wires, empty_wire(4))
+    core.assert(short_status == 0)
+    let complete_status = core.append(wires, empty_wire(6))
+    core.assert(complete_status == 0)
+    let empty_status = core.append(wires, empty_wire(0))
+    core.assert(empty_status == 0)
+
+    // Prepare a zero-payload seed, one short input, and its completed retry.
+    let seed = core.borrow_readwrite(wires, 0)
+    seed.data[0] = 0x48
+    seed.data[1] = 7
+    let short = core.borrow_readwrite(wires, 1)
+    short.data[0] = 0x48
+    short.data[1] = 8
+    short.data[2] = 3
+    short.data[3] = 0xAA
+    let complete = core.borrow_readwrite(wires, 2)
+    complete.data[0] = 0x48
+    complete.data[1] = 8
+    complete.data[2] = 3
+    complete.data[3] = 0xAA
+    complete.data[4] = 0xBB
+    complete.data[5] = 0xCC
+    let empty = core.borrow_readonly(wires, 3)
+
+    let memory = core.region(256) else { core.assert(false); return 0 }
+    let frames = core.batch(memory, Received)
+    let seeded = core.append(frames, receive(1, seed.data))
+        on ok    then true
+        on error then false
+    core.assert(seeded)
+    let first = core.borrow_readonly(frames, 0)
+    let address = core.address(first)
+    let saved = core.used(memory)
+
+    // An empty input returns the header extent without a bounds trap.
+    let header = core.append(frames, receive(1, empty.data))
+        on ok                          then 0
+        on Rejected Truncated(required) then required
+        on error                       then 0
+    core.assert(header == 3)
+    // The channel is already private when the nested decoder rejects this frame.
+    let needed = core.append(frames, receive(1, short.data))
+        on ok                          then 0
+        on Rejected Truncated(required) then required
+        on error                       then 0
+    core.assert(needed == 6)
+    short.data[0] = 0
+    let malformed = core.append(frames, receive(1, short.data))
+        on ok                then false
+        on Rejected BadMagic then true
+        on error             then false
+    core.assert(malformed)
+    core.assert(core.used(memory) == saved)
+    core.assert(core.len(frames) == 1)
+    core.assert(core.address(first) == address)
+    core.assert(first.channel == 1)
+    core.assert(first.frame.sequence == 7)
+    core.assert(core.len(first.frame.payload) == 0)
+
+    // This capacity fits an empty frame. The three-byte payload exhausts it
+    // at the byte-field reservation after both scalar fields were written.
+    {
+        let small = core.region(saved) else { core.assert(false); return 0 }
+        let bounded = core.batch(small, Received)
+        let full = core.append(bounded, receive(1, complete.data))
+            on ok    then false
+            on Full  then true
+            on error then false
+        core.assert(full)
+        core.assert(core.used(small) == 0)
+        core.assert(core.len(bounded) == 0)
+    }
+
+    // Retry after the payload arrives. The record owns its bytes after the call.
+    let retried = core.append(frames, receive(1, complete.data))
+        on ok    then true
+        on error then false
+    core.assert(retried)
+    let second = core.borrow_readonly(frames, 1)
+    complete.data[3] = 0
+    core.assert(second.channel == 1)
+    core.assert(second.frame.sequence == 8)
+    core.assert(core.len(second.frame.payload) == 3)
+    core.assert(second.frame.payload[0] == 0xAA)
+    core.assert(second.frame.payload[1] == 0xBB)
+    core.assert(second.frame.payload[2] == 0xCC)
+    core.assert(core.used(memory) == core.add_wrapping(core.mul_wrapping(2, saved), 3))
+    core.assert(core.len(frames) == 2)
+    core.assert(core.address(first) == address)
+    core.assert(first.frame.sequence == 7)
+    core.print(needed)
+    core.print(second.frame.sequence)
+    core.print(second.frame.payload[2])
+    return 0
+}

@@ -1,0 +1,27 @@
+// Stand-in for a database query with a copied timeout hint. Unrelated
+// services can choose their own names and payloads for their errors.
+namespace app.sql
+
+// Timeout carries the retry delay in milliseconds. Disconnected is tag-only.
+public error SqlError {
+    Timeout(delay u64);
+    Disconnected
+}
+
+// Scenario 2 times out with a retry hint and 4 disconnects. The remaining
+// counts let the cache fixture distinguish its own failure from success.
+public func count_customers
+    arg account u64 as readonly copy
+    returns Result<u64, SqlError>
+{
+    if account == 2 {
+        return error SqlError.Timeout(500)
+    }
+    if account == 4 {
+        return error SqlError.Disconnected
+    }
+    if account == 3 {
+        return ok 43
+    }
+    return ok 42
+}

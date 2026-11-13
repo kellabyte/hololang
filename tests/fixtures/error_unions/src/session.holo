@@ -1,0 +1,19 @@
+// Stand-in for a session store. The fixture passes a copied scenario number
+// through the successful account lookup to select an outcome downstream.
+namespace app.session
+
+// The request lacks a usable session.
+public error SessionError {
+    PermissionDenied
+}
+
+// Scenario 1 requests sign-in. Other scenarios have an active account.
+public func account_id
+    arg scenario u64 as readonly copy
+    returns Result<u64, SessionError>
+{
+    if scenario == 1 {
+        return error SessionError.PermissionDenied
+    }
+    return ok scenario
+}

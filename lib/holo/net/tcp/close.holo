@@ -1,0 +1,27 @@
+// Convert the native close status into the TCP module's terminal result.
+// The helper copies a scalar and does not perform I/O or acquire storage.
+
+namespace holo.net.tcp
+
+// Interpret zero as success and a tagged positive errno as terminal failure.
+// The owner was already consumed before this function is called.
+public func close_result
+    with noalloc, noblock
+    arg status u64 as readonly copy
+    returns Result<u64, CloseError>
+{
+    if status == 0 {
+        return ok 0
+    }
+
+    // The native ABI tags positive signed-int errno values with bit 63.
+    let tag = 9223372036854775808
+    let last_native_error = 9223372039002259455
+    if status <= tag {
+        return error CloseError.InvalidStatus
+    }
+    if status > last_native_error {
+        return error CloseError.InvalidStatus
+    }
+    return error CloseError.Native(core.sub_wrapping(status, tag))
+}

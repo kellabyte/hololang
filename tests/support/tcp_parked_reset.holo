@@ -1,0 +1,160 @@
+// Verify terminal peer events in one checked stream owner. The client keeps
+// a large response unread until the owner parks. Each entry reports one
+// terminal outcome and lets lexical cleanup close its own descriptor.
+// The harness supplies reset_status() for the native target.
+
+// One initialized byte serves as greeting, acknowledgement and echo window.
+struct Marker {
+    // Reused only after the previously accepted byte has been sent.
+    wire Bytes
+}
+
+// The reset-on-output path holds this backing through all write waits.
+struct Reply {
+    // Four MiB exceeds the fixture client's unread receive window.
+    wire Bytes
+}
+
+// Initialize the bounded input window in its final destination.
+func marker_slot
+    with noblock
+    returns Marker
+{
+    return Marker {
+        wire: core.bytes(1, 0)
+    }
+}
+
+// Construct the large reply once and retain the same unsent suffix on retry.
+func reply_slot
+    with noblock
+    returns Reply
+{
+    return Reply {
+        wire: core.bytes(4194304, core.index())
+    }
+}
+
+// Inspect the fresh receive extent within its checked borrow.
+func fresh_count
+    with noalloc, noblock
+    arg fresh Bytes as readonly reference
+    returns u64
+{
+    return core.len(fresh)
+}
+
+// Admit one command. The reset and EOF outcomes remain scoped to this owner.
+func main
+    returns u64
+{
+    with core.tcp_stream() as stream {
+        let memory = core.region(4096) else {
+            core.assert(false)
+            return 0
+        }
+        let markers = core.batch(memory, Marker)
+        let added = core.append(markers, marker_slot())
+        core.assert(added == 0)
+        let marker = core.borrow_readwrite(markers, 0)
+
+        // The client waits for this acknowledgement before terminating a peer.
+        let readable = core.wait_input(stream)
+        core.assert(readable == 0)
+        refill marker.wire, 1 from stream as fresh {
+            let count = fresh_count(fresh)
+            core.assert(count == 1)
+        } else status {
+            core.assert(false)
+        }
+        let command = marker.wire[0]
+        core.assert(command >= 1)
+        core.assert(command <= 3)
+        let acknowledged = core.send(stream, marker.wire, 0, 1)
+        core.assert(acknowledged == 1)
+
+        if command == 2 {
+            let backing = core.region(4198400) else {
+                core.assert(false)
+                return 0
+            }
+            let replies = core.batch(backing, Reply)
+            let added = core.append(replies, reply_slot())
+            core.assert(added == 0)
+            let body = core.borrow_readonly(replies, 0)
+            var cursor = 0
+            var parked = 0
+            loop {
+                // The fixture leaves the full reply unread and expects a reset.
+                core.assert(cursor < 4194304)
+                let remaining = core.sub_wrapping(4194304, cursor)
+                let sent = core.send(stream, body.wire, cursor, remaining)
+                if sent == 18446744073709551614 {
+                    parked = 1
+                    let ready = core.wait_output(stream)
+                    if ready != 0 {
+                        if ready != 18446744073709551615 {
+                            // A subsequent broken pipe can end the reset output.
+                            if ready != reset_status() {
+                                core.assert(ready == 9223372036854775840)
+                            }
+                            core.print(2)
+                            return 0
+                        }
+                    }
+                } else {
+                    if sent != 18446744073709551615 {
+                        // A positive attempt advances only its accepted prefix.
+                        if sent <= remaining {
+                            core.assert(sent > 0)
+                            cursor = core.add_wrapping(cursor, sent)
+                        } else {
+                            core.assert(parked == 1)
+                            if sent != reset_status() {
+                                core.assert(sent == 9223372036854775840)
+                            }
+                            core.print(2)
+                            return 0
+                        }
+                    }
+                }
+            }
+        }
+
+        loop {
+            // Readiness may carry the terminal error, or the receive can
+            // observe it after a successful readiness notification.
+            let ready = core.wait_input(stream)
+            if ready == 0 {
+                refill marker.wire, 1 from stream as fresh {
+                    core.assert(command == 3)
+                    let count = fresh_count(fresh)
+                    core.assert(count == 1)
+                    let sent = core.send(stream, marker.wire, 0, 1)
+                    core.assert(sent == 1)
+                } else status {
+                    if status == 0 {
+                        core.assert(command == 3)
+                        core.print(3)
+                        return 0
+                    }
+                    if status != 18446744073709551615 {
+                        if status != 18446744073709551614 {
+                            core.assert(command == 1)
+                            core.assert(status == reset_status())
+                            core.print(1)
+                            return 0
+                        }
+                    }
+                }
+            } else {
+                if ready != 18446744073709551615 {
+                    core.assert(command == 1)
+                    core.assert(ready == reset_status())
+                    core.print(1)
+                    return 0
+                }
+            }
+        }
+    }
+}

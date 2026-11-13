@@ -1,0 +1,86 @@
+// Executable experimental source example for checked flat region storage.
+// Records are constructed at their destination; references remain stable during
+// supported appends. The explicit scopes end references before marker reset.
+
+// An inline entry with fixed identity and variable-length initialized bytes.
+struct Entry {
+    // An unsigned application identity, independent of storage metadata.
+    id u64
+    // Inline bytes whose length remains fixed after publication.
+    payload Bytes
+}
+
+// Receive one readonly value copy and return addition modulo 2^64.
+// This closed scalar helper allocates no runtime storage and cannot block.
+func increment
+    with noalloc, noblock
+    arg value u64 as readonly copy
+    returns u64
+{
+    return core.add_wrapping(value, 1)
+}
+
+// Construct id and length bytes directly in the receiving append's destination.
+// Byte values are explicitly narrowed to their low eight bits by core.bytes.
+func make_entry
+    with noblock
+    arg id u64 as readonly copy
+    arg length u64 as readonly copy
+    returns Entry
+{
+    return Entry {
+        id: id,
+        payload: core.bytes(length, core.index())
+    }
+}
+
+// Acquire bounded backing, build and scan entries, then reset their shared marker.
+// The initial frontend supports only successful entry completion with return 0.
+func main
+    returns u64
+{
+    // Backing acquisition is fallible; this branch has no memory owner to release.
+    let memory = core.region(8192) else {
+        core.print(1)
+        return 0
+    }
+
+    // The batch owns the remaining region tail until this explicit scope closes.
+    {
+        let entries = core.batch(memory, Entry)
+        let initial = core.append(entries, make_entry(7, 4))
+        core.assert(initial == 0)
+
+        // Retained references end here, before the later reset operation.
+        {
+            let first = core.borrow_readwrite(entries, 0)
+            let original = core.address(first)
+
+            // Appending extends the batch without moving its existing first entry.
+            for index in core.range(3) {
+                let status = core.append(entries, make_entry(increment(index), 2))
+                core.assert(status == 0)
+            }
+
+            first.payload[1] = 77
+            core.assert(core.address(first) == original)
+        }
+
+        var checksum = 0
+        // Each readonly cursor visits the prefix published when this scan begins.
+        for readonly entry in entries {
+            checksum = core.add_wrapping(checksum, entry.id)
+            // Bytes are indexed through checked accesses inside their frozen length.
+            for byte in core.range(core.len(entry.payload)) {
+                checksum = core.add_wrapping(checksum, entry.payload[byte])
+            }
+        }
+        core.print(checksum)
+
+        core.reset(entries)
+        core.print(core.len(entries))
+    }
+
+    core.print(core.used(memory))
+    return 0
+}

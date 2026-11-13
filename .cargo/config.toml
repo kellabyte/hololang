@@ -1,0 +1,3 @@
+# Keep Cargo artifacts with the repository's other generated output.
+[build]
+target-dir = "build/cargo"

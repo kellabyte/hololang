@@ -1,0 +1,5 @@
+# Source package for the Holo standard library. Each leaf declares its namespace.
+[package]
+name = "holo"
+version = "0.1.0"
+source = "."

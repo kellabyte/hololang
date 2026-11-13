@@ -1,0 +1,18 @@
+// Translate a dashboard result into one UI outcome. Only the selected arm
+// runs. The UI actions return numeric codes so the example can run standalone.
+namespace app.dashboard
+
+using app.ui
+
+// Show a count on success or select a recovery action for the failed service.
+public func show_customer_count
+    arg scenario u64 as readonly copy
+    returns u64
+{
+    return load_customer_count(scenario)
+        on ok(count) then ui.show_count(count)
+        on Session.PermissionDenied then ui.sign_in()
+        on Sql.Timeout(delay) then ui.try_again(delay)
+        on Cache.Unavailable then ui.cache_unavailable()
+        on error then ui.query_failed()
+}

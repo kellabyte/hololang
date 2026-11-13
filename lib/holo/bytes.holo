@@ -1,0 +1,19 @@
+// Byte-order operations for holo.bytes. Assemble an integer from octets that
+// may have arrived in separate reads. These operations use scalar arithmetic
+// and hold no buffer or native resource.
+
+namespace holo.bytes
+
+// Join the low eight bits of two copied integers in little-endian order.
+// Return a u64 from 0 through 65,535 for every input. This is an explicit
+// low-bit operation that acquires no backing, performs no I/O, and retains
+// nothing. For example, join_low_octets_le(52, 18) returns 4,660.
+public func join_low_octets_le
+    with noalloc, noblock
+    arg low u64 as readonly copy
+    arg high u64 as readonly copy
+    returns u64
+{
+    // The masks bound the product at 65,280 and the sum at 65,535.
+    return core.add_wrapping(core.and(low, 255), core.mul_wrapping(core.and(high, 255), 256))
+}

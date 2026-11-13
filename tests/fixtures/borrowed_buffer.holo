@@ -1,0 +1,101 @@
+// A synchronous borrowed call consumes the received prefix of a reusable slot.
+// Running counters live in the caller's existing record. An alias can observe
+// each update, and the caller keeps ownership of the initialized byte backing.
+
+// Fixed scalar state retained across separate borrowed calls.
+struct Totals {
+    // Number of logical bytes consumed, modulo 2^64.
+    seen u64
+    // Sum of consumed byte values, modulo 2^64.
+    checksum u64
+}
+
+// One reusable slot whose initialized backing may exceed the received length.
+struct Slot {
+    // The caller writes the next chunk into this published inline field.
+    wire Bytes
+}
+
+// Initialize caller-owned state at the final destination. Append checks capacity.
+func start
+    returns Totals
+{
+    return Totals {
+        seen: 0,
+        checksum: 0
+    }
+}
+
+// Seed the entire slot with a visible poison value outside the consumer call.
+func slot
+    returns Slot
+{
+    return Slot {
+        wire: core.bytes(4, 255)
+    }
+}
+
+// Add each initialized logical byte to existing state, with no storage acquisition.
+// The caller owns both arguments, and the return is a copied consumed count.
+func accumulate
+    arg state Totals as readwrite reference
+    arg input Bytes as readonly reference
+    returns u64
+{
+    let length = core.len(input)
+    // The captured extent bounds every read. An empty input performs no reads.
+    for index in core.range(length) {
+        state.checksum = core.add_wrapping(state.checksum, input[index])
+    }
+    state.seen = core.add_wrapping(state.seen, length)
+    return length
+}
+
+// Forward the same logical extent and caller-owned state through a nested call.
+func consume
+    with noalloc, noblock
+    arg state Totals as readwrite reference
+    arg input Bytes as readonly reference
+    returns u64
+{
+    return accumulate(state, input)
+}
+
+// Feed two prefixes and an empty chunk, then print the count and checksum.
+// Region acquisition is outside the borrowed calls. Failed setup ends entry.
+func main
+    returns u64
+{
+    let state_memory = core.region(64) else {
+        return 0
+    }
+    let states = core.batch(state_memory, Totals)
+    let initialized = core.append(states, start())
+    core.assert(initialized == 0)
+    let state = core.borrow_readwrite(states, 0)
+    let observer = core.alias_readonly(state)
+
+    let input_memory = core.region(64) else {
+        return 0
+    }
+    let slots = core.batch(input_memory, Slot)
+    let allocated = core.append(slots, slot())
+    core.assert(allocated == 0)
+    let buffer = core.borrow_readwrite(slots, 0)
+    buffer.wire[0] = 10
+    buffer.wire[1] = 20
+    let first = consume(state, core.prefix(buffer.wire, 2))
+    core.assert(first == 2)
+    core.assert(observer.checksum == 30)
+
+    // The first call has returned, so the same slot accepts the next chunk.
+    buffer.wire[0] = 7
+    buffer.wire[1] = 255
+    let second = consume(state, core.prefix(buffer.wire, 1))
+    core.assert(second == 1)
+    let empty = consume(state, core.prefix(buffer.wire, 0))
+    core.assert(empty == 0)
+    core.print(observer.seen)
+    core.print(observer.checksum)
+    return 0
+}

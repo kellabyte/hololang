@@ -1,0 +1,275 @@
+// Decode a file or connected stream into counters using one reusable input
+// slot and one long-lived decoder. The wire format is magic, kind, a two-byte
+// little-endian length, and that many payload bytes. All state retained across
+// short reads is copied scalar data. See ../README.md for the hosted contract.
+
+using telemetry.frame
+
+// A fixed initialized slot. The positive refill result lends only its prefix.
+struct InputSlot {
+    // The owner reuses this inline backing for the entire decoding session.
+    wire Bytes
+}
+
+// Initialize one input slot in its final position. The append checks capacity.
+// The extent remains 4,096 bytes through every later read and partial read.
+func start_input
+    returns InputSlot
+{
+    return InputSlot {
+        wire: core.bytes(4096, 0)
+    }
+}
+
+// The entire parser and its long-lived counters fit in one fixed scalar record.
+// Counters and checksum wrap at 64 bits. Only complete frames update frame totals.
+struct Decoder {
+    // Bytes consumed across every positive read.
+    bytes_seen u64
+    // Positive reads delivered to the decoder.
+    chunks_seen u64
+    // Accepted category-zero frames.
+    hits u64
+    // Accepted category-one frames.
+    misses u64
+    // Accepted category-two frames.
+    errors u64
+    // Sum of accepted complete payloads modulo 2^64.
+    checksum u64
+    // Complete frames with invalid magic, after size classification.
+    bad_magic u64
+    // Complete frames with unknown kind, after size and magic classification.
+    bad_kind u64
+    // Complete frames whose payload exceeds the worker's 4,096-byte limit.
+    oversized u64
+    // Wire field expected next, from magic zero through payload four.
+    phase u64
+    // Current frame's copied magic octet.
+    magic u64
+    // Current frame's copied category octet.
+    kind u64
+    // Low length octet retained even when its high octet arrives in another read.
+    length_low u64
+    // Payload bytes still to consume or drain before the frame commits.
+    remaining u64
+    // Frame classification, from accepted zero through oversized three.
+    status u64
+    // Sum for the current accepted body until the frame completes.
+    frame_checksum u64
+}
+
+// Construct initial state directly in the caller's fixed record slot. The
+// returned value starts before the first header and owns no other backing.
+func start_decoder
+    returns Decoder
+{
+    return Decoder {
+        bytes_seen: 0,
+        chunks_seen: 0,
+        hits: 0,
+        misses: 0,
+        errors: 0,
+        checksum: 0,
+        bad_magic: 0,
+        bad_kind: 0,
+        oversized: 0,
+        phase: 0,
+        magic: 0,
+        kind: 0,
+        length_low: 0,
+        remaining: 0,
+        status: 0,
+        frame_checksum: 0
+    }
+}
+
+// Capture one initialized header octet in caller state and return the next
+// phase. The caller invokes this only for phases zero through three. Both
+// octets passed to the library come from checked byte reads.
+func capture_header
+    with noalloc, noblock
+    arg state Decoder as readwrite reference
+    arg octet u64 as readonly copy
+    returns u64
+{
+    // The first octet selects the protocol and is retained until classification.
+    if state.phase == 0 {
+        state.magic = octet
+        return 1
+    }
+    // Keep the category independently so bad magic and bad kind remain distinct.
+    if state.phase == 1 {
+        state.kind = octet
+        return 2
+    }
+    // A short read can end between the two length octets.
+    if state.phase == 2 {
+        state.length_low = octet
+        return 3
+    }
+    // The high octet completes the length without retaining an input view.
+    let length = frame.payload_length(state.length_low, octet)
+    state.remaining = length
+    state.frame_checksum = 0
+    state.status = 0
+    // Size takes precedence. All rejected frames drain the declared extent.
+    if length > frame.payload_limit() {
+        state.status = 3
+        return 4
+    }
+    // The magic distinguishes this format before interpreting its kind.
+    if state.magic != frame.expected_magic() {
+        state.status = 1
+        return 4
+    }
+    // Only the three documented categories reach an accepted counter.
+    if state.kind >= 3 {
+        state.status = 2
+    }
+    return 4
+}
+
+// Commit exactly one complete frame and return phase zero for the next header.
+// A rejected frame contributes one rejection and leaves the accepted sum alone.
+func publish_frame
+    with noalloc, noblock
+    arg state Decoder as readwrite reference
+    returns u64
+{
+    // The classification was fixed before the body was drained.
+    if state.status == 3 {
+        state.oversized = core.add_wrapping(state.oversized, 1)
+        return 0
+    }
+    // Complete invalid magic and kind each contribute their own counter.
+    if state.status == 1 {
+        state.bad_magic = core.add_wrapping(state.bad_magic, 1)
+        return 0
+    }
+    if state.status == 2 {
+        state.bad_kind = core.add_wrapping(state.bad_kind, 1)
+        return 0
+    }
+    state.checksum = core.add_wrapping(state.checksum, state.frame_checksum)
+    // Accepted classification proves the final arm denotes category two.
+    if state.kind == 0 {
+        state.hits = core.add_wrapping(state.hits, 1)
+        return 0
+    }
+    if state.kind == 1 {
+        state.misses = core.add_wrapping(state.misses, 1)
+        return 0
+    }
+    state.errors = core.add_wrapping(state.errors, 1)
+    return 0
+}
+
+// Decode the live logical prefix into caller-owned state and return its length.
+// The function never keeps a reference or grows storage. A frame that ends
+// between reads has copied header fields and a provisional checksum only.
+func decode_chunk
+    with noalloc, noblock
+    arg state Decoder as readwrite reference
+    arg input Bytes as readonly reference
+    returns u64
+{
+    let length = core.len(input)
+    state.bytes_seen = core.add_wrapping(state.bytes_seen, length)
+    state.chunks_seen = core.add_wrapping(state.chunks_seen, 1)
+    // Each trip consumes exactly one initialized byte from the logical prefix.
+    for index in core.range(length) {
+        let octet = input[index]
+        // A zero-length body commits at its header, so phase four here implies
+        // positive remaining bytes. Rejected bodies need no payload sum.
+        if state.phase == 4 {
+            if state.status == 0 {
+                state.frame_checksum = core.add_wrapping(state.frame_checksum, octet)
+            }
+            state.remaining = core.sub_wrapping(state.remaining, 1)
+        } else {
+            state.phase = capture_header(state, octet)
+        }
+        // Complete empty and nonempty frames share the same commit boundary.
+        if state.phase == 4 {
+            if state.remaining == 0 {
+                state.phase = publish_frame(state)
+            }
+        }
+    }
+    return length
+}
+
+// Drive one admitted descriptor from the native host. Acquire the reusable
+// slot and decoder once, then read until EOF or a terminal I/O error. On
+// completion print the terminal outcome and the counters in README order.
+func main
+    returns u64
+{
+    // The allowance covers the slot's metadata in all three tested layouts.
+    let input_memory = core.region(8192) else {
+        core.assert(false)
+        return 0
+    }
+    let slots = core.batch(input_memory, InputSlot)
+    let reserved = core.append(slots, start_input())
+    core.assert(reserved == 0)
+    let slot = core.borrow_readwrite(slots, 0)
+
+    // Parser state owns an independent region and survives every slot refill.
+    let state_memory = core.region(512) else {
+        core.assert(false)
+        return 0
+    }
+    let states = core.batch(state_memory, Decoder)
+    let initialized = core.append(states, start_decoder())
+    core.assert(initialized == 0)
+    let state = core.borrow_readwrite(states, 0)
+    let interrupted = 18446744073709551615
+    let would_block = 18446744073709551614
+
+    // Each attempt either processes its own fresh prefix or handles one native
+    // outcome. Ending the data block ends the borrow before the next attempt.
+    loop {
+        refill slot.wire, 4096 as chunk {
+            decode_chunk(state, chunk)
+        } else status {
+            var finish = 1
+            var outcome = status
+            // A nonblocking read can have no data yet. Wait for readiness only
+            // on this path, then let the next read distinguish data and EOF.
+            if status == would_block {
+                let readiness = core.wait_input()
+                outcome = readiness
+                if outcome == 0 {
+                    finish = 0
+                }
+            }
+            // Retry explicitly after an interrupted read or readiness wait.
+            if outcome == interrupted {
+                finish = 0
+            }
+            // A native failure reports earlier complete frames. EOF alone
+            // finalizes an incomplete frame as truncated.
+            if finish == 1 {
+                var truncated = 0
+                if outcome == 0 {
+                    if state.phase != 0 {
+                        truncated = 1
+                    }
+                }
+                core.print(outcome)
+                core.print(state.bytes_seen)
+                core.print(state.chunks_seen)
+                core.print(state.hits)
+                core.print(state.misses)
+                core.print(state.errors)
+                core.print(state.checksum)
+                core.print(state.bad_magic)
+                core.print(state.bad_kind)
+                core.print(state.oversized)
+                core.print(truncated)
+                return 0
+            }
+        }
+    }
+}

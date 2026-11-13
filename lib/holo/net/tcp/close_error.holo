@@ -1,0 +1,12 @@
+// Terminal errors from releasing a checked hosted TCP stream. The error
+// carries only a scalar and never retains or restores close authority.
+
+namespace holo.net.tcp
+
+// The owner is consumed on either outcome of the native close.
+public error CloseError {
+    // Preserve the exact positive OS error number, including interruption.
+    Native(code u64)
+    // The scalar is outside the native close status domain.
+    InvalidStatus
+}
