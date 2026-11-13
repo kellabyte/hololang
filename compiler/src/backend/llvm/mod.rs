@@ -16,6 +16,7 @@ mod exit;
 mod expression;
 mod function;
 mod input;
+mod literal;
 mod operations;
 mod ordinary;
 mod producer;
@@ -35,13 +36,13 @@ mod storage;
 mod tcp;
 mod uniform_batch;
 
-use std::cell::Cell;
+use std::{cell::Cell, collections::HashSet};
 
 use crate::check::CheckedProgram;
-use crate::ir::{Build, Op};
+use crate::ir::{Build, FunctionParameterKind, Op};
 use crate::layout::{LayoutError, LayoutMode, LayoutPlan};
 
-use context::Lowering;
+use context::{Lowering, Module};
 
 /// Explain each checked producer byte field's initial copy strategy.
 ///
@@ -223,6 +224,11 @@ fn emit_with_options(
 ) -> Result<String, LayoutError> {
     let program = checked.program();
     let layout = LayoutPlan::new(checked, mode)?;
+    let context = Module {
+        program,
+        layout: &layout,
+        byte_literals: literal::ByteLiterals::default(),
+    };
     // Escape unusual configuration characters rather than allowing target text to
     // inject LLVM syntax. An unsupported triple still fails in the native driver.
     let triple = target_triple
@@ -249,16 +255,34 @@ fn emit_with_options(
     // Declare fixed inline transfers only for modules with a guarded copy site.
     if constructor_copies {
         module.push_str(copy::DECLARATIONS);
-        module.push_str(&copy::checked_loop(program, &layout));
+        module.push_str(&copy::checked_loop(&context));
         module.push('\n');
     }
     // Every schema gets the same typed extent/lookup path in every mode. Native
     // optimization can inline constant extents without runtime layout dispatch.
     for index in 0..program.records.len() {
-        module.push_str(&representation::size(program, &layout, index));
+        module.push_str(&representation::size(&context, index));
         module.push('\n');
         module.push_str(&representation::indexed(index));
         module.push('\n');
+    }
+    // Borrowed prefixes add a lookup symbol only for schemas crossing an
+    // ordinary call boundary. Existing owner modules keep their original IR.
+    let mut borrowed_batch_records = HashSet::new();
+    for operation in &program.body {
+        if let Op::Function(function) = operation {
+            for parameter in &function.params {
+                if let FunctionParameterKind::Batch { record, .. } = &parameter.kind {
+                    borrowed_batch_records.insert(record.as_str());
+                }
+            }
+        }
+    }
+    for (index, record) in program.records.iter().enumerate() {
+        if borrowed_batch_records.contains(record.name.as_str()) {
+            module.push_str(&representation::indexed_prefix(index));
+            module.push('\n');
+        }
     }
     let lifts = producer_lifts::ProducerLifts::new(program, &layout);
     let inlining = producer_inline::plan(program, &layout, target_triple, &copy_inline_hints);
@@ -266,8 +290,7 @@ fn emit_with_options(
     // nominal encoding matches it. Emit specialized definitions separately.
     for (index, &inline) in inlining.iter().enumerate() {
         module.push_str(&producer::emit(
-            program,
-            &layout,
+            &context,
             index,
             target_triple,
             inline,
@@ -280,8 +303,7 @@ fn emit_with_options(
     for (index, &inline) in inlining.iter().enumerate() {
         for &lift in lifts.variants(index) {
             module.push_str(&producer::emit(
-                program,
-                &layout,
+                &context,
                 index,
                 target_triple,
                 inline,
@@ -296,8 +318,7 @@ fn emit_with_options(
     for (index, operation) in program.body.iter().enumerate() {
         if let Op::Function(function) = operation {
             module.push_str(&ordinary::emit(
-                program,
-                &layout,
+                &context,
                 index,
                 function,
                 byte_sums.as_ref(),
@@ -329,7 +350,7 @@ fn emit_with_options(
     } else {
         "define i32 @main()"
     };
-    let mut entry = Lowering::new(program, &layout, header.to_owned(), Vec::new());
+    let mut entry = Lowering::new(&context, header.to_owned(), Vec::new());
     entry.byte_sums = byte_sums.as_ref();
     entry.staging_copies = staging_copies.as_ref();
     entry.guarded_staging_copies = matches!(emission, Emission::Guarded | Emission::StableSlots);
@@ -371,6 +392,7 @@ fn emit_with_options(
     entry.operations(&program.body);
     entry.f.line("ret i32 0");
     emit_text_literals(&mut module, &entry.text_literals);
+    context.byte_literals.emit(&mut module);
     module.push_str(&entry.f.finish());
     // Shared metadata is a private optimizer heuristic, not a proof that either
     // failure edge is unreachable. The function builder owns both fixed identities.

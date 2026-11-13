@@ -363,7 +363,7 @@ impl Parser<'_> {
             self.newlines();
             let (argument, _) = self.declared_identifier(NameKind::Parameter)?;
             self.newlines();
-            let (ty, _) = self.type_name()?;
+            let (ty, type_span) = self.argument_type()?;
             self.newlines();
             self.expect_word("as")?;
             self.newlines();
@@ -385,6 +385,7 @@ impl Parser<'_> {
             args.push(Argument {
                 name: argument,
                 ty,
+                type_span,
                 access,
                 passing,
                 span: Span {
@@ -420,20 +421,59 @@ impl Parser<'_> {
         })
     }
 
-    /// Parse the one supported parameterized return spelling and canonicalize its spacing.
-    /// Named returns keep their ordinary grammar. Lowering checks the success and family types.
+    /// Parse a named argument type or a batch of one named record.
+    /// State and batch schemas may use a namespace import qualifier.
+    fn argument_type(&mut self) -> Result<(String, Span), Diagnostic> {
+        if !self.at_word("Batch") || self.tokens[self.position + 1].kind != TokenKind::Symbol('<') {
+            return self.argument_record_name();
+        }
+        let start = self.expect_word("Batch")?.start;
+        self.expect_symbol('<')?;
+        self.newlines();
+        let (record, _) = self.argument_record_name()?;
+        self.newlines();
+        let end = self.expect_symbol('>')?.end;
+        Ok((format!("Batch<{record}>"), Span { start, end }))
+    }
+
+    /// Keep an optional namespace qualifier with the type name for binding.
+    fn argument_record_name(&mut self) -> Result<(String, Span), Diagnostic> {
+        let (mut name, mut span) = self.type_name()?;
+        if self.take_symbol('.') {
+            let (member, member_span) = self.type_name()?;
+            name.push('.');
+            name.push_str(&member);
+            span.end = member_span.end;
+        }
+        Ok((name, span))
+    }
+
+    /// Parse scalar Option and Result return types, canonicalizing their spacing.
+    /// Named returns keep their ordinary grammar. The flag selects Result payload syntax.
     fn return_type(&mut self) -> Result<(String, Span, bool), Diagnostic> {
-        // Only a bracketed Result selects the new syntax; a bare Result still names a type.
-        if !self.at_word("Result") || self.tokens[self.position + 1].kind != TokenKind::Symbol('<')
+        // Bare Option and Result can still name user-defined types.
+        let option = self.at_word("Option");
+        if !(option || self.at_word("Result"))
+            || self.tokens[self.position + 1].kind != TokenKind::Symbol('<')
         {
             let (name, span) = self.type_name()?;
             return Ok((name, span, false));
         }
-        let start = self.expect_word("Result")?.start;
+        let start = self.advance().span.start;
         self.expect_symbol('<')?;
         self.newlines();
-        let (success, _) = self.type_name()?;
+        let (success, success_span) = self.type_name()?;
         self.newlines();
+        if option {
+            if success != "u64" {
+                return Err(Diagnostic::new(
+                    success_span,
+                    "optional function returns currently require `Option<u64>`",
+                ));
+            }
+            let end = self.expect_symbol('>')?.end;
+            return Ok((format!("Option<{success}>"), Span { start, end }, false));
+        }
         self.expect_symbol(',')?;
         self.newlines();
         let (family, _) = self.type_name()?;

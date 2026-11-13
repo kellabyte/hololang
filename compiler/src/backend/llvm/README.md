@@ -26,10 +26,10 @@ not a general effect verifier or a claim that every runtime/target is certified.
 | `cursor_staging.rs` | Exact transfers at entry sites selected by the cursor proof and the opt-in wide-copy leaf. |
 | `uniform_batch.rs` | Bounded opt-in proof of one initialized byte extent across every publication in a lexical batch. |
 | `function.rs` | Unique LLVM values/blocks and fixed entry stack slots. |
-| `input.rs` | Ordered typed argument capture and forwarding of transient readonly byte locations/extents. |
+| `input.rs` | Ordered typed argument capture and forwarding of transient byte locations and extents. |
 | `expression.rs` | Ordered unsigned arithmetic, comparisons, and checked observations. |
 | `operations.rs` | Ordinary scalar/reference operations and dispatch to structured emitters. |
-| `ordinary.rs` | Internal synchronous helpers, ordered typed captures and checked logical prefixes. |
+| `ordinary.rs` | Internal synchronous helpers and ordered capture of byte views and batch prefixes. |
 | `refill.rs` | Hosted input ABI, direct destination capture, bounds and result checks, and explicit readiness wait. |
 | `send.rs` | Hosted output ABI, checked source subrange and result, and explicit writable wait. |
 | `session.rs` | Optional current-client resolution and checked session transition. |
@@ -89,50 +89,65 @@ failed reservation or zero-length output has no initializer payload loads. The
 borrow has no runtime ownership tracking and adds no `noalias` attribute; same-root
 prefix inputs and overlapping input borrows remain valid checked cases.
 
-A checked hosted entry keeps the same storage backend. Refill captures the
-existing field before evaluating the request, validates the positive limit
-against the slot and native cap, and emits one adapter call. A validated native
-count becomes the readonly operand extent. Ordinary calls and destination
-constructors lend these original SSA operands to readonly formals. The capture adds
-no metadata load or payload copy. A producer's `core.bytes` still initializes
+A named byte view captures the same pointer and checked logical length at its
+declaration. Reads, writes through a writable view, and forwarded calls reuse
+those operands, even if the source reference has been rebound. Reads load the
+current payload, so writes through another live path remain visible.
+
+Ordinary calls also use pointer and length operands for writable byte views.
+They check each subrange before advancing the pointer and use the narrowed
+extent for reads and writes. Byte moves validate the destination before
+touching payload and emit a bounded directional loop for overlap. This adds
+no explicit runtime helper. Optimized native code may select a memory helper
+when LLVM proves it is valid, subject to the existing native contract profile.
+
+A checked hosted entry keeps the same storage backend. Refill captures a
+field or reuses a named view's address and extent before evaluating the
+request. It validates the positive limit against that extent and the native
+cap, then emits one adapter call. A validated native count becomes the
+readonly operand extent. Ordinary calls and destination constructors lend
+these original SSA operands to readonly formals without a payload copy or
+metadata load. A producer's `core.bytes` still initializes
 owned output through the usual destination path. Explicit wait emits its own
 adapter call with no payload operand. Successful entry return runs active storage cleanup and returns
 to the native host, which owns descriptor close.
 
-Send captures an initialized byte-field address and extent, then evaluates
-offset and count once. Guards prove the subrange before forming its start
-pointer. A single adapter call returns bounded positive progress or an
-encoded status, which the emitter validates before binding it in SSA.
+Send captures an initialized byte field or reuses a named byte view's address
+and logical extent, then evaluates offset and count once. Guards prove the
+subrange before forming its start pointer. A single adapter call returns
+bounded positive progress or an encoded status, which the emitter validates
+before binding it in SSA.
 Writable waits and session transitions introduce no payload storage.
 Only session-aware entry code resolves descriptors through the current client
 host state. Output and session modules have separate optional C linkage.
 
-The [short-copy investigation](../../../../evidence/short-copy-20261109/README.md)
-confirmed that LLVM already propagates known lengths through these calls and
-published-field projections in the tested cases. The input benchmark's explicit
+The November 9 short-copy investigation confirmed that LLVM already propagates
+known lengths through these calls and published-field projections in the
+tested cases. The input benchmark's explicit
 source-opacity boundary hides that knowledge. A real source length assertion per
 batch restores constant-length optimization while leaving payload opacity intact.
-Neither observation changes readonly permissions or the measurement boundary.
+Readonly permissions and the measurement boundary were unchanged.
+[Known-length investigation](../../../../docs/implementation-plan.md#known-lengths-and-dynamic-short-copy-experiment--november-9)
 
 A general experimental lowering recognized only exact same-input identity
 initializers, used exact chunks for lengths up to 32, and emitted LLVM memcpy for
 larger inputs after the original reservation checks. Two paired campaigns showed
 clear short-copy gains alongside repeated wide-layout median regressions, larger
-code, and an optimized spare-backing read. It was not adopted. Its source, proofs,
-semantic checks, complete measurements and code inspection remain in the archive;
-the ordinary initializer lowering is restored without an alternate compiler path.
-The native boundary sweep remains active. Exact original accesses do not establish
-exact optimized or physical memory traffic.
+code, and an optimized spare-backing read. The ordinary initializer lowering
+was restored. The original accesses and optimized or physical memory traffic
+require separate measurements.
+[Native byte-input checks](../../../../tests/compiler/storage/byte_input_native.rs)
 
-A [whole-input memcpy follow-up](../../../../evidence/copy-and-recovery-20261109/README.md)
-kept the exact captured-extent identity proof but used one bulk intrinsic at all
-lengths. It passed O0/O3/ASan semantic checks, yet two adjacent-pair campaigns showed
-no broad gain and a repeated wide 4096-byte slowdown. It was rejected; this backend
-and runtime are restored to the original inputs. The stronger audit accepts only
+A whole-input memcpy follow-up kept the exact captured-extent identity proof
+and used one bulk intrinsic at all lengths. It passed O0/O3/ASan semantic
+checks. Two adjacent-pair campaigns showed no broad gain and a repeated
+wide 4096-byte slowdown. The backend and runtime returned to their original
+inputs. The stronger audit accepts only
 that reviewed canonical bulk form when supplied, with unchanged reservation
-guards and CFG dominance. No bulk-copy compiler flag or runtime policy remains.
-The final recovery feature changes source acceptance/termination checking only;
-thirteen benchmark sources emit byte-identical LLVM to the old control.
+guards and CFG dominance. Acquisition recovery changed source acceptance and
+termination checking. Thirteen benchmark sources emitted byte-identical LLVM
+to the old control.
+[Whole-input copy trial](../../../../docs/implementation-plan.md#whole-input-copy-trial--november-9)
 
 The guarded subrange policy on macOS arm64 recognizes one direct borrowed-byte
 read at the comprehension index plus a nonzero constant offset. A destination
@@ -159,13 +174,35 @@ Scalar `Apply` expressions capture actuals into SSA operands once, left to right
 and emit the pure body using a fresh scalar parameter frame. They need no runtime
 closure, heap object, or native function dispatch; unused trapping arguments still
 execute. The enclosing byte-input/index frame is restored after body emission.
-Ordinary helpers emit separate internal functions with direct scalar results.
-State references pass a pointer and readonly byte arguments pass a pointer and
-captured length. A prefix check runs after source descriptor capture and before
-later arguments and the call. The bound follows forwarded inputs and controls
-every checked load. State references and scalar locals use fixed frame slots at
+Ordinary helpers emit separate internal functions returning `i64` scalars,
+`i1` booleans, or tagged scalar results. Saved booleans and copied boolean
+parameters remain `i1` SSA values that conditions can test directly.
+Short-circuit operators branch around the skipped operand and merge the
+result as `i1`.
+State references pass a pointer. Byte arguments pass a pointer and captured
+length. Range checks run after source capture and before later
+arguments and the call. The bound follows forwarded inputs and controls
+every checked byte access. State references and scalar locals use fixed frame slots at
 unoptimized levels. Arguments and returns introduce no payload copy or dynamic
 allocation, and the call ABI carries no uniqueness attribute.
+
+A local byte view captures its checked pointer and length in SSA when its
+binding runs. Reads and forwarded calls reuse those operands, even after the
+source reference is rebound. A write checks its destination index before
+evaluating and narrowing the replacement byte.
+
+Byte literals share immutable module storage by exact byte contents. A
+descriptor carries the original byte count, including zero. An empty
+literal has a valid static address and its logical bounds prevent reads.
+
+A borrowed batch passes the first record address, published byte extent, and
+record count captured at that argument's evaluation. Forwarding reuses those
+operands. A cursor scans to the captured end using frozen record extents, and an
+indexed borrow checks the captured count before walking to the record. The
+callee receives no owner metadata and works directly on the existing records.
+Access checking governs writes through the resulting references and permits
+alias-visible updates to their contents.
+
 The macOS arm64 byte-sum selector recognizes counted loops over one live frozen
 field or captured borrowed byte extent. The loop may only read the current index
 and add its unsigned byte to a private scalar modulo 2^64. Parsed argument
@@ -176,8 +213,9 @@ rebind the reference, or change the captured extent. The optimization uses no
 alias promise and preserves writes through any alias before or after the loop.
 The emitted helper reads alignment-1 blocks of sixteen bytes and guarded 8/4/2/1
 byte tails. Empty extents read no payload. Other targets keep scalar lowering.
-An isolated 64-byte helper improved bulk reader scans but regressed short
-scanner and lifecycle workloads. [Outlined 64-byte gate](../../../../evidence/outlined-64-sum-gate-20261111/README.md)
+An isolated 64-byte helper improved bulk reader scans and regressed short
+scanner and lifecycle workloads.
+[Reduction comparison](../../../../docs/implementation-plan.md#broad-reduction-gate-and-bounded-producer-inlining)
 
 An early `ExitZero` emits active batch marker restores and region frees in reverse
 acquisition order before calling host `exit(0)`. Compiler cleanup descriptors remain
@@ -197,25 +235,21 @@ and marker effects while avoiding a temporary `{pointer,status}` helper result
 whose immediate status test produced redundant native branches. No check is
 removed, fused, reordered across a field, or specialized for a benchmark.
 
-A [construction-success branch-layout trial](../../../../evidence/construction-branch-20261110/README.md)
-added fixed 2000:1 LLVM branch weights without changing guards, evaluation order,
-status values or rollback. All nine lifecycle paired medians improved, but a
-wide-layout 4096-byte copy slowdown reproduced in an exact-binary repeat. The
-trial was not adopted: after it, the five emitter inputs were restored byte for
-byte, with no broad hint policy or format-specific workaround retained.
-The archive preserves the complete candidate, tests, code inspection, wins and
-regressions; the successful placement change is not a general performance rule.
+A construction-success branch-layout trial added fixed 2000:1 LLVM branch
+weights without changing guards, evaluation order, status values, or rollback.
+All nine lifecycle paired medians improved. The wide-layout 4096-byte copy
+slowdown reproduced in an exact-binary repeat. The
+trial ended with all five emitter inputs restored byte for byte. The result
+applies to the tested workloads.
+[Branch-layout trial](../../../../docs/implementation-plan.md#construction-success-branch-layout-trial--november-10)
 
-An [accepted narrow follow-up](../../../../evidence/construction-followup-20261110/README.md)
-applies the same fixed 2000:1 layout metadata
-only to producers whose checked signatures contain solely U64 inputs. Checked
-producer byte arguments can only forward Bytes formals, while direct field
-borrows require entry code; therefore this scope excludes transitive borrowed
-payload reads. Unused Bytes inputs are conservatively excluded. Producer guard,
-width, size and nested-status branches use that local scope; an entry append
-chooses independently from its callee, so mixed fresh/copy appends cannot leak
-hint state. Explicit rejection, initializer loops and user branches stay ordinary.
-This selects an optimizer heuristic, never a safety or failure-frequency promise.
+The accepted narrow follow-up applies the same fixed 2000:1 layout metadata
+only to producers whose checked signatures contain solely U64 inputs.
+Those producers receive no caller-borrowed payloads. Unused Bytes inputs
+are conservatively excluded. Producer guard, width, size, and nested-status
+branches use that local scope. An entry append selects hints from its own
+callee. Explicit rejection, initializer loops, and user branches keep their
+ordinary lowering. The metadata guides LLVM block placement.
 Scalar source seeding inside a copy module can still receive hints and perturb
 whole-module inlining/register allocation, so unchanged copy performance requires
 actual paired evidence rather than this classification alone. The mixed-signature
@@ -224,18 +258,17 @@ and alternating eligible/ineligible entry calls; existing O0/O3/ASan fixtures
 remain the separate semantic checks. Default lifecycle paired medians improve
 about 3% at all three measured sizes; full-copy intervals cross zero and ten copy
 native pairs remain unchanged. The broader fixed-weight policy stays rejected.
-Final 191-test/format/Clippy and rebuilt identity validation is recorded with this
-finite selection; metadata alone is not a speed claim or a public language rule.
+The follow-up records 191 passing tests, formatting and Clippy checks, and
+rebuilt identity validation.
+[Narrow construction trial](../../../../docs/implementation-plan.md#narrow-construction-and-vector-follow-up--november-10)
 
 A remaining-capacity experiment proved a one-guard success path using
 `bytes <= capacity - top` under the existing valid-marker invariant, with overflow
 classification only on failure. It preserved behavior but regressed the small
 default-layout workload and lacked a convincing larger-case default gain in paired
-results. The original helper above is retained. Its candidate code, proof, native
-artifacts and unfavorable results remain in the
-[experiment archive](../../../../evidence/remaining-capacity-comparison-20261109/README.md);
-the new native exact-fit/failure-order regressions remain active. No format-specific
-second reservation implementation was introduced to salvage a narrower result.
+results. The original reservation helper remains active across formats.
+[Remaining-capacity trial](../../../../docs/implementation-plan.md#remaining-capacity-guard-experiment--november-9) ·
+[Native reservation checks](../../../../tests/compiler/storage/reservation.rs)
 
 Indexed borrowing of variable-sized records walks from the batch start and costs
 O(index). `ForEach` instead captures the original published prefix and performs one
@@ -266,15 +299,15 @@ do not silently redefine the source `Bytes` default or remove its wider control.
 
 Byte initializer values retain the full-u64 expression path and truncate only the
 stored byte. A private low-byte projection experiment preserved all values and
-exposed a shorter byte-SIMD loop, but its measured construction costs regressed;
-it was not adopted. The original expression/producer lowering is restored without
-an alternate path or experiment flag. Candidate code, proofs, raw results and
-before/after binaries remain in the
-[byte-initializer archive](../../../../evidence/byte-initializer-comparison-20261109/README.md).
-Two additional native fixtures protect all five wrapping/bitwise operations,
-high scalar bits, long physical indices, failure order and retained-reference reuse.
+exposed a shorter byte-SIMD loop. Its measured construction costs regressed,
+so the original expression and producer lowering was restored. Native fixtures
+cover all five wrapping and bitwise operations, high scalar bits, long physical
+indices, failure order, and retained-reference reuse.
 Lengths, indices, scalar fields, calls, guards, numeric rules and source eligibility
-remain unchanged. Smaller SIMD instruction counts alone do not establish a speedup.
+remain unchanged. The instruction counts and elapsed times characterize different
+properties of the generated loop.
+[Width trial](../../../../docs/implementation-plan.md#byte-initializer-width-experiment--november-9) ·
+[Native initializer checks](../../../../tests/compiler/storage/byte_initialization.rs)
 
 A separately tested exact-vector-prefix follow-up preserved the original u64
 scalar expression source and used exact eight-byte prefix stores for closed pure
@@ -282,10 +315,9 @@ trees. Its private end-counter assignment exposed the proved prefix exit without
 an LLVM assumption, but actual scalar machine bodies became five instructions
 instead of four and retained an unreachable u64 vector fallback. Default/compact
 lifecycle gains were less consistent than the selected narrow heuristic and eight
-input/failure review flags remained adverse descriptive observations. This vector
-candidate is not adopted; its module is absent from active source and no unmeasured
-hint/vector combination is enabled. Complete source, tests and results remain in
-the [follow-up archive](../../../../evidence/construction-followup-20261110/README.md).
+input/failure review flags remained adverse descriptive observations. The
+scalar lowering remains active with the selected narrow hint.
+[Vector comparison](../../../../docs/implementation-plan.md#narrow-construction-and-vector-follow-up--november-10)
 
 Explicit clock and opaque-region operations call the native support boundary.
 They are execution-only measurement facilities, not constructor expressions or
@@ -342,7 +374,8 @@ scans, and bounds capture resolution and scalar interval evaluation.
 Reassigned captures, re-created extents that can shrink under a carried
 cursor, separately reinitialized receiver bounds, and unrecognized
 effects decline selection. The plan belongs to entry lowering and is
-compiler-only. [Cursor proof and performance gate](../../../../evidence/staging-cursor-proof-20261111/README.md)
+compiler-only.
+[Cursor proof tests](../../../../tests/compiler/backend/staging_copy.rs)
 
 Ordinary macOS arm64 Derived64 lowering outlines the wide edge when the
 proved maximum transfer is 65–256 bytes. The receiving extent provides the
@@ -354,7 +387,7 @@ blocks and finishes at the checked end. An overlapping tail repeats a write
 from disjoint source storage. Tiny and short arms and typed producer copies
 use their existing lowering. The API `emit_with_outlined_bulk_staging` and
 example flag `--outlined-bulk` also allow larger proved sites for experiments.
-[Packaged staging qualification](../../../../evidence/packaged-reader-gate-20261111/README.md)
+[Packaged staging results](../../../../docs/implementation-plan.md#packaged-wide-staging-default)
 
 The general macOS arm64 byte sum uses the outlined 16-byte loop and
 exact-width tails. A literal checked prefix of at least 256 bytes at a
@@ -364,14 +397,14 @@ The large routine loads at alignment one, reduces each complete block
 into a 16-bit subtotal and adds it to the wrapping 64-bit accumulator.
 A nonempty remainder goes to the general helper. Modules without a
 qualifying literal retain the existing helper and call sites.
-[Large-prefix gate](../../../../evidence/proved-large-sum-20261111/README.md)
+[Native byte-sum tests](../../../../tests/compiler/backend/byte_sum_native.rs)
 
 The ordinary macOS arm64 Derived64 emitter also selects the existing
 wide helper for an exact 192-byte literal. The same pure-callee proof and
 eager prefix check apply. Runtime extents and neighboring literals keep
 their earlier call edges. The selection is compile-time only. Other
 layouts can exercise the policy through `emit_with_exact_three_block_sums`.
-[Release qualification](../../../../evidence/exact-192-default-20261112/README.md)
+[Three-block default evaluation](../../../../docs/implementation-plan.md#exact-three-block-default-on-macos-arm64)
 
 Scalar typed returns and immediate handlers are lowered by `results.rs`. On
 the ordinary call path, the private `{ i64, i8 }` result uses the first
@@ -387,8 +420,13 @@ its selected arm. Actuals remain eager and ordered. A payload with several
 incoming returns uses a phi. A per-site expression budget bounds code growth.
 Forwarding, memory operations, calls inside the callee, and other ineligible
 shapes retain the ordinary ABI and switch.
-`results.rs` lowers `TryLet` through the same ordinary call. A tag test sends
-failures to an immediate return. When a child error family occupies a later
+A scalar `Result` or `Option<u64>` call can bind its tag and payload as an
+immutable SSA value. Both saved handler forms read that value and use the
+ordinary result switch. Only the selected payload arm exposes a copied scalar,
+and the original call runs only at the declaration.
+`results.rs` lowers `TryLet` through the same ordinary call and reads the saved
+tag and payload for `TrySaved`. A tag test sends failures to an immediate
+return. When a child error family occupies a later
 range in the enclosing union, the failure block adds a constant to the tag
 and keeps the payload lane intact. Identity and first-range lifts return the
 original pair. The success block extracts and binds the scalar. Ordinary result
@@ -411,7 +449,7 @@ generic definition and adjusts the error on the caller's failure edge.
 Nested producers write to their final address in the receiving region and use
 no per-call rollback marker. An earlier forwarding trial retained
 per-field marker writes and regressed representative workloads.
-[Forwarding trials](../../../../evidence/error-reservation-20261111/README.md)
+[Typed error and reservation history](../../../../docs/implementation-plan.md#payload-free-typed-errors--november-11)
 
 A whole-result forwarding producer emits its direct call before the usual
 header or empty-unit reservation. The callee receives the original marker
@@ -433,8 +471,9 @@ region descriptor operand and leaves its marker untouched. Within the fixed
 subtree, a final child with a compatible encoding returns the common
 typed pair directly. The encoded pair can come from the original definition or
 a specialized union variant. The macOS arm64 outlined control emits a tail
-branch to the specialized child. [Native union gate](../../../../evidence/union-rejection-lift-20261111/README.md)
-These rules add no LLVM aliasing promises or native storage slots.
+branch to the specialized child. The rules add no LLVM aliasing promises or
+native storage slots.
+[Named error unions](../../../../docs/implementation-plan.md#named-error-unions)
 
 Derived64 and Compact32 typed byte-bearing producers receive the same
 destination, cursor and capacity operands. `DeferredReservations` keeps the
@@ -445,7 +484,7 @@ variable child in the same error family can supply the entire return pair.
 Each reservation keeps its original width, overflow, capacity, and input
 evaluation order. Numeric producers and the Wide comparison keep the
 marker-based convention.
-[Byte-bearing reservation evidence](../../../../evidence/byte-reservation-comparison-20261111/README.md)
+[Byte-bearing reservation evaluation](../../../../docs/implementation-plan.md#byte-bearing-append-reservations)
 
 On macOS arm64 in Derived64, `producer_inline.rs` selects both definitions
 of an eligible terminal typed parent and guarded-copy leaf. Both use the same
@@ -455,7 +494,7 @@ standalone destination call. The pair budget charges checked operations,
 expression nodes, and the copy dispatcher. The module budget weights each pair
 by the number of syntactic entry call sites. Those are compiler cost units. All checks, actual
 evaluation, and publication remain in the checked bodies.
-[Bounded inlining gate](../../../../evidence/bounded-reader-20261111/README.md)
+[Bounded inlining evaluation](../../../../docs/implementation-plan.md#broad-reduction-gate-and-bounded-producer-inlining)
 
 Numeric and typed append use the same publication helper in `publication.rs`.
 It publishes the count and end on success. A successful cursor-based append

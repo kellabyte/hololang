@@ -58,6 +58,9 @@ impl Lowerer {
             ast::StatementKind::Construct { subject, arms } => {
                 self.construct(subject, arms, statement.span, &mut output)?;
             }
+            ast::StatementKind::HandleResult { subject, arms } => {
+                self.handle_result_blocks(subject, arms, statement.span, &mut output)?;
+            }
             ast::StatementKind::WithRegion {
                 capacity,
                 body,
@@ -85,13 +88,18 @@ impl Lowerer {
                     [body.spans],
                 );
             }
-            // Ordinary calls return a scalar to their caller. Entry completion
+            // Ordinary calls return their declared type. Entry completion
             // keeps its separate process cleanup and zero status.
             ast::StatementKind::Return(value) => {
                 // A typed return owns exactly one alternative and retains its nominal identity.
                 if let Some(family) = self.result_family.clone() {
                     let result = self.result_return(value, &family, &mut output)?;
                     output.push(ir::Op::ReturnResult(result), statement.span, []);
+                    return Ok(output);
+                }
+                if self.returns_bool {
+                    let value = self.boolean(value, &mut output)?;
+                    output.push(ir::Op::ReturnBool(value), statement.span, []);
                     return Ok(output);
                 }
                 if self.ordinary_body {
@@ -151,7 +159,7 @@ impl Lowerer {
                 other_body,
             } => {
                 // Only the entry owns the hosted input capability. The verifier
-                // still checks that this byte projection has write access.
+                // still checks that the destination has write access.
                 if self.ordinary_body {
                     return Err(Diagnostic::new(
                         statement.span,
@@ -164,13 +172,7 @@ impl Lowerer {
                     .as_ref()
                     .map(|(name, span)| self.tcp_name(name, *span))
                     .transpose()?;
-                let (reference, path, kind) = self.projection(slot)?;
-                if kind != ir::FieldKind::Bytes {
-                    return Err(Diagnostic::new(
-                        slot.span,
-                        "expected a readwrite Bytes field for refill",
-                    ));
-                }
+                let destination = self.refill_destination(slot)?;
                 // Preserve destination capture before evaluating the request,
                 // including scalar call expressions with checks and state writes.
                 let previous = std::mem::replace(&mut self.deferred_actual, true);
@@ -193,8 +195,7 @@ impl Lowerer {
                     Self::tcp_io(
                         stream,
                         ir::Op::Refill(ir::Refill {
-                            reference,
-                            path,
+                            destination,
                             limit,
                             data_name,
                             data_body: data.ops,
@@ -243,7 +244,7 @@ impl Lowerer {
     }
 
     /// Lower a statement-position operation; status-bearing append cannot be discarded.
-    /// Pure scalar calls may discard a captured result while retaining argument evaluation.
+    /// Scalar and boolean calls may discard their value while retaining evaluation.
     fn operation(&mut self, expr: &ast::Expr, output: &mut Block) -> Result<(), Diagnostic> {
         if let Some((name, args)) = core_call(expr) {
             // The closed helper subset admits assertion traps but no external
@@ -270,7 +271,7 @@ impl Lowerer {
                 }
                 "reset" => {
                     arity(args, 1, expr.span)?;
-                    let (batch, _) = self.batch(&args[0])?;
+                    let (batch, _) = self.owned_batch(&args[0])?;
                     output.push(ir::Op::Reset { batch }, expr.span, []);
                     return Ok(());
                 }
@@ -278,6 +279,20 @@ impl Lowerer {
                     arity(args, 1, expr.span)?;
                     let region = self.region(&args[0])?;
                     output.push(ir::Op::OpaqueRegion(region), expr.span, []);
+                    return Ok(());
+                }
+                "move_bytes" => {
+                    arity(args, 2, expr.span)?;
+                    let destination = self.byte_move_parameter(&args[0], true)?;
+                    let source = self.byte_move_parameter(&args[1], false)?;
+                    output.push(
+                        ir::Op::MoveInputBytes {
+                            destination,
+                            source,
+                        },
+                        expr.span,
+                        [],
+                    );
                     return Ok(());
                 }
                 "append" => {
@@ -295,9 +310,38 @@ impl Lowerer {
                 "expected a supported operation or scalar helper call",
             ));
         }
+        if self.is_bool(expr) {
+            let value = self.boolean(expr, output)?;
+            let name = self.fresh("bool");
+            output.push(ir::Op::LetBool { name, value }, expr.span, []);
+            return Ok(());
+        }
         let value = self.scalar(expr, output)?;
         self.capture(value, expr.span, output);
         Ok(())
+    }
+
+    /// Resolve a captured byte operand and require write authority for the destination.
+    fn byte_move_parameter(
+        &self,
+        operand: &ast::Expr,
+        writable: bool,
+    ) -> Result<usize, Diagnostic> {
+        let binding = self.named(operand)?;
+        if let Kind::InputBytes { param, access } = binding.kind
+            && (!writable || access == ir::Access::Readwrite)
+        {
+            return Ok(param);
+        }
+        let expected = if writable {
+            "a writable Bytes parameter"
+        } else {
+            "a readable Bytes parameter"
+        };
+        Err(Diagnostic::new(
+            operand.span,
+            format!("core.move_bytes requires {expected}"),
+        ))
     }
 
     /// Lower explicit scalar/reference rebinding or fixed-shape field/byte mutation.
@@ -371,15 +415,69 @@ impl Lowerer {
                 );
             }
             ast::ExprKind::Index { base, index } => {
-                // Input descriptors always expose a readonly path, even when
-                // the caller owns a compatible writer for later reuse.
-                if let ast::ExprKind::Name(name) = &base.kind
-                    && matches!(self.lookup(name, base.span)?.kind, Kind::InputBytes { .. })
-                {
+                if matches!(base.kind, ast::ExprKind::Bytes(_)) {
                     return Err(Diagnostic::new(
                         base.span,
-                        "cannot write through a readonly byte parameter",
+                        "cannot write through a readonly byte string literal",
                     ));
+                }
+                if let ast::ExprKind::Name(name) = &base.kind
+                    && let binding = self.lookup(name, base.span)?
+                    && let Kind::BytesView(access) = binding.kind
+                {
+                    if access != ir::Access::Readwrite {
+                        return Err(Diagnostic::new(
+                            base.span,
+                            "cannot write through a readonly local byte view",
+                        ));
+                    }
+                    // Keep operand evaluation inside the store so the destination
+                    // check precedes any evaluation of the replacement.
+                    let previous = std::mem::replace(&mut self.deferred_actual, true);
+                    let mut operands = Block::default();
+                    let lowered = (|| {
+                        Ok(ir::Op::WriteViewByte {
+                            name: binding.ir_name,
+                            index: self.scalar(index, &mut operands)?,
+                            value: self.scalar(value, &mut operands)?,
+                        })
+                    })();
+                    self.deferred_actual = previous;
+                    debug_assert!(operands.ops.is_empty());
+                    output.push(lowered?, span, []);
+                    return Ok(());
+                }
+                if let ast::ExprKind::Name(name) = &base.kind
+                    && let Kind::InputBytes { param, access } = self.lookup(name, base.span)?.kind
+                {
+                    if access != ir::Access::Readwrite {
+                        return Err(Diagnostic::new(
+                            base.span,
+                            "cannot write through a readonly byte parameter",
+                        ));
+                    }
+                    let index_value = self.scalar(index, output)?;
+                    let index = self.capture(index_value, index.span, output);
+                    output.push(
+                        ir::Op::Assert(ir::Condition {
+                            op: ir::Compare::Lt,
+                            left: index.clone(),
+                            right: ir::Expr::InputLen(param),
+                        }),
+                        target.span,
+                        [],
+                    );
+                    let value = self.scalar(value, output)?;
+                    output.push(
+                        ir::Op::WriteInputByte {
+                            param,
+                            index,
+                            value,
+                        },
+                        span,
+                        [],
+                    );
+                    return Ok(());
                 }
                 let (reference, path, kind) = self.projection(base)?;
                 if kind != ir::FieldKind::Bytes {
@@ -465,7 +563,6 @@ impl Lowerer {
             );
             return Ok(());
         }
-        let (batch, record) = self.batch(iterable)?;
         let access = match access {
             // No default reference mode is selected by this experimental adapter.
             Some("readonly") => ir::Access::Readonly,
@@ -477,6 +574,7 @@ impl Lowerer {
                 ));
             }
         };
+        let (batch, record) = self.batch(iterable, access)?;
         self.scopes.push(Default::default());
         let result = (|| {
             let reference = self.bind(

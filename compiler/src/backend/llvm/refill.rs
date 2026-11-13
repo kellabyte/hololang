@@ -40,14 +40,12 @@ impl Lowering<'_> {
 
     /// Emit a checked `refill` using the admitted descriptor and existing slot.
     ///
-    /// Captures the field then evaluates its limit once. Both failure guards
+    /// Captures the destination then evaluates its limit once. Both failure guards
     /// trap without publishing a view. On success, mutates only the adapter's
     /// destination range and emits one of two lexical outcome bodies.
     pub(super) fn refill(&mut self, refill: &Refill) {
-        let Input::Bytes { contents, len } =
-            self.capture_byte_field(&refill.reference, &refill.path)
-        else {
-            unreachable!("checked refill destination is a byte field");
+        let Input::Bytes { contents, len } = self.capture_bytes(&refill.destination) else {
+            unreachable!("checked refill destination has a byte descriptor");
         };
         let limit = self.expression(&refill.limit);
         let positive = self.f.value(format!("icmp ne i64 {limit}, 0"));

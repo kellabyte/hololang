@@ -48,7 +48,7 @@ is accepted under its reviewed Darwin arm64 compiler/target/runtime profile.
 That acceptance covers a restricted single-threaded region implementation.
 It does not establish a complete language, general concurrent ownership,
 device-I/O integration, or portable native effect verification. The next planned
-step is [M2: one measured bottleneck](../implementation-plan.md#m2--improve-one-measured-bottleneck-next-native-campaign).
+step is [M2: one measured bottleneck](../implementation-plan.md#m2--first-finite-compiler-improvement-accepted).
 Writing these notes does not expand that implementation scope.
 
 Examples marked **illustrative** are explanations, not runnable Holo programs or
@@ -139,17 +139,15 @@ Holo libraries in `lib/` when implemented, and executable examples in `examples/
 Follow [repository ownership](../compiler.md#repository-ownership) when a prototype
 becomes a maintained component.
 
-Working campaigns and generated diagnostics belong under a fresh
-`build/benchmarks/<topic>-<date>/` directory. Preserve completed evidence, including
-failed experiments, under `evidence/` and update its
-[categorized index](../../evidence/README.md). The notes remain plans until linked
-evidence establishes what actually happened.
+Keep working campaigns and generated diagnostics in a fresh
+`build/benchmarks/<topic>-<date>/` directory. When documenting a completed
+trial, record its inputs, method, outcomes, and limitations, including failures.
 
 For a documentation-only edit, check local links and heading anchors, balanced
 code fences, reference applicability, current status claims, and the directory's
 README coverage. No compiler build is needed merely to edit these notes. Future
-compiler changes follow the checks in [AGENTS.md](../../AGENTS.md), including
-workspace formatting, warnings-denied Clippy, and offline tests as relevant.
+compiler changes follow workspace formatting, warnings-denied Clippy, and
+offline tests as relevant. [Test guide](../../tests/README.md)
 
 External documentation links may advance. Before a future prototype, recheck the
 relevant primary sources, pin the exact versions used, and record the access date.

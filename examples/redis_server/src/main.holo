@@ -2,6 +2,11 @@
 // extents, the table owns copied keys and values, and the entry sends replies
 // over a host-owned connected stream. Each stage uses finite backing.
 
+using holo.bytes
+using holo.bytes.write
+using holo.buffer
+using holo.decimal
+using holo.net
 using redis_server.store
 
 // Parse a bounded RESP2 GET or SET request from the caller's live byte
@@ -24,7 +29,6 @@ struct Request {
     // Binary value length for SET, or zero for GET.
     value_length u64
 }
-
 // Initialize one metadata record at its receiving destination. The caller
 // keeps this storage across requests. There is no variable-sized field.
 func empty_request
@@ -41,206 +45,166 @@ func empty_request
     }
 }
 
-// Read a canonical unsigned decimal header after the expected marker.
-// Return the value after validating CRLF or a status above 512. All callers
-// bound the input view to 512 bytes and the successful value to 128. The
-// caller selects the over-limit status for shape and payload-size failures.
+// An incomplete request carries the next absolute wire extent. The remaining
+// cases distinguish malformed framing, preview size limits, and u64 overflow.
+error RequestError {
+    NeedMore(required u64)
+    Malformed
+    OverLimit
+    Overflow
+}
+
+// Read a canonical unsigned decimal header after the expected marker. Return
+// the value after validating CRLF. The request parser checks the context's
+// size limit before it uses the value to form any payload offsets.
 func request_decimal
     with noalloc, noblock
     arg wire Bytes as readonly reference
     arg start u64 as readonly copy
     arg marker u64 as readonly copy
-    arg limit u64 as readonly copy
-    arg over_limit u64 as readonly copy
-    returns u64
+    returns Result<u64, RequestError>
 {
     let extent = core.len(wire)
     // An empty suffix can acquire the marker on the next read.
     if start >= extent {
-        return core.add_wrapping(1025, start)
+        return error RequestError.NeedMore(core.add_wrapping(start, 1))
     }
     if wire[start] != marker {
-        return 2048
+        return error RequestError.Malformed
     }
     let first = core.add_wrapping(start, 1)
-    var value = 0
-    // The checked marker ensures first <= extent. Each iteration stays
-    // inside the logical view, and CR ends the scan before any payload read.
-    for index in core.range(core.sub_wrapping(extent, first)) {
-        let position = core.add_wrapping(first, index)
-        let byte = wire[position]
-        if byte == 13 {
-            // Require at least one digit and an available, matching LF.
-            if index == 0 {
-                return 2048
+    if first == extent {
+        return error RequestError.NeedMore(core.add_wrapping(extent, 1))
+    }
+    var length = core.sub_wrapping(extent, first)
+    // Twenty digits exhaust u64. The following byte must be CR or establish
+    // a terminal decimal error, so the search can stop at that position.
+    if length > 21 {
+        length = 21
+    }
+    let line = core.subrange(wire, first, length)
+    let digits = bytes.find(line, 13)
+        on Some(index) then index
+        on None then length
+    decimal.parse_u64(core.prefix(line, digits))
+        on ok(value) then {
+            // Validate the available digits even when CR has yet to arrive.
+            if digits == length {
+                return error RequestError.NeedMore(core.add_wrapping(extent, 1))
             }
-            let line_end = core.add_wrapping(position, 1)
+            let line_end = core.add_wrapping(core.add_wrapping(first, digits), 1)
             if line_end == extent {
-                return core.add_wrapping(1025, extent)
+                return error RequestError.NeedMore(core.add_wrapping(extent, 1))
             }
             if wire[line_end] != 10 {
-                return 2048
+                return error RequestError.Malformed
             }
-            if value > limit {
-                return over_limit
-            }
-            return value
+            return ok value
         }
-        // Request sizes admit ASCII decimal digits and canonical zero only.
-        // Rejecting a second digit after zero also makes header widths derivable.
-        if byte < 48 {
-            return 2048
+        on NeedTerminator then {
+            core.assert(false)
+            return error RequestError.Malformed
         }
-        if byte > 57 {
-            return 2048
+        on Malformed then {
+            return error RequestError.Malformed
         }
-        if index != 0 {
-            if value == 0 {
-                return 2048
-            }
+        on Overflow then {
+            return error RequestError.Overflow
         }
-        let digit = core.sub_wrapping(byte, 48)
-        // UINT64_MAX / 10 and its remainder bound both operations before
-        // applying wrapping primitives to this nonwrapping decimal result.
-        if value > 1844674407370955161 {
-            return 2050
-        }
-        if value == 1844674407370955161 {
-            if digit > 5 {
-                return 2050
-            }
-        }
-        value = core.add_wrapping(core.mul_wrapping(value, 10), digit)
-    }
-    return core.add_wrapping(1025, extent)
 }
 
-// Check a complete bulk string's body extent and trailing CRLF, then return
-// its payload offset or a status above 512. Length is already validated and
-// at most 128. Its canonical decimal width avoids a second scan. Body bytes
-// can be arbitrary.
+// Check a bulk string's body extent and trailing CRLF, then return its payload
+// offset. Length is already validated and at most 128. Its canonical decimal
+// width avoids a second scan. Body bytes can be arbitrary.
 func request_bulk_payload
     with noalloc, noblock
     arg wire Bytes as readonly reference
     arg header u64 as readonly copy
     arg length u64 as readonly copy
-    returns u64
+    returns Result<u64, RequestError>
 {
     // A validated header is dollar, one to three digits, and CRLF.
-    var payload = core.add_wrapping(header, 4)
-    if length >= 10 {
-        payload = core.add_wrapping(payload, 1)
-    }
-    if length >= 100 {
-        payload = core.add_wrapping(payload, 1)
-    }
+    let payload = core.add_wrapping(core.add_wrapping(header, decimal.digit_count(length)), 3)
     let ending = core.add_wrapping(payload, length)
     let next = core.add_wrapping(ending, 2)
     let extent = core.len(wire)
     // Inspect the first trailer byte as soon as it is live. A malformed
     // partial trailer can therefore fail before the next byte arrives.
-    if extent <= ending {
-        return core.add_wrapping(1024, next)
-    }
-    if wire[ending] != 13 {
-        return 2048
+    if ending < extent and wire[ending] != 13 {
+        return error RequestError.Malformed
     }
     if extent < next {
-        return core.add_wrapping(1024, next)
+        return error RequestError.NeedMore(next)
     }
     if wire[core.add_wrapping(ending, 1)] != 10 {
-        return 2048
+        return error RequestError.Malformed
     }
-    return payload
+    return ok payload
 }
 
 // Parse one request starting at an absolute position in the live view. Keep
 // request untouched on every failure. Success returns the positive consumed
 // extent (1–512) and publishes absolute key and value offsets in the supplied
-// record. A status from 1025 through 2047 encodes the absolute extent required
-// plus 1024. 2048 is malformed, 2049 is over limit, and 2050 is decimal overflow.
-// The ordinary writable-state ABI returns u64. It performs no I/O, allocation,
-// payload copy, or retained borrow.
+// record. It performs no I/O, allocation, payload copy, or retained borrow.
 func parse_request
     with noalloc, noblock
     arg request Request as readwrite reference
     arg wire Bytes as readonly reference
     arg start u64 as readonly copy
-    returns u64
+    returns Result<u64, RequestError>
 {
     let extent = core.len(wire)
     // A bounded view limits all cursor arithmetic independently of declared
     // wire lengths. A caller may parse an empty suffix at exactly extent.
     if extent > 512 {
-        return 2049
+        return error RequestError.OverLimit
     }
     if start > extent {
-        return 2048
+        return error RequestError.Malformed
     }
-    let count = request_decimal(wire, start, 42, 3, 2048)
-    // Propagate framing and extent failures before using the array count.
+    let count = try request_decimal(wire, start, 42)
     // Only the canonical one-digit array counts of GET and SET are admitted.
-    if count > 512 {
-        return count
-    }
-    if count < 2 {
-        return 2048
+    if count < 2 or count > 3 {
+        return error RequestError.Malformed
     }
     let command_header = core.add_wrapping(start, 4)
-    let command_length = request_decimal(wire, command_header, 36, 3, 2048)
+    let command_length = try request_decimal(wire, command_header, 36)
     // Both commands have exactly three bytes and the same framing overhead.
-    if command_length > 512 {
-        return command_length
+    if command_length != core.len(b"GET") {
+        return error RequestError.Malformed
     }
-    if command_length != 3 {
-        return 2048
-    }
-    let command_start = request_bulk_payload(wire, command_header, command_length)
-    if command_start > 512 {
-        return command_start
-    }
-    // Clearing ASCII bit five admits only the two cases of each named
-    // command byte. The payload and its delimiter have already been checked.
+    let command_start = try request_bulk_payload(wire, command_header, command_length)
+    let name = core.subrange(wire, command_start, command_length)
     var command = 1
-    var first_letter = 71
     if count == 3 {
+        if not bytes.equal_ignore_ascii_case(name, b"SET") {
+            return error RequestError.Malformed
+        }
         command = 2
-        first_letter = 83
-    }
-    if core.and(wire[command_start], 223) != first_letter {
-        return 2048
-    }
-    if core.and(wire[core.add_wrapping(command_start, 1)], 223) != 69 {
-        return 2048
-    }
-    if core.and(wire[core.add_wrapping(command_start, 2)], 223) != 84 {
-        return 2048
+    } else {
+        if not bytes.equal_ignore_ascii_case(name, b"GET") {
+            return error RequestError.Malformed
+        }
     }
 
     let key_header = core.add_wrapping(command_start, 5)
-    let key_length = request_decimal(wire, key_header, 36, 32, 2049)
+    let key_length = try request_decimal(wire, key_header, 36)
+    if key_length > 32 {
+        return error RequestError.OverLimit
+    }
     // Validate key framing before computing the value's header offset.
-    if key_length > 512 {
-        return key_length
-    }
-    let key_offset = request_bulk_payload(wire, key_header, key_length)
-    if key_offset > 512 {
-        return key_offset
-    }
+    let key_offset = try request_bulk_payload(wire, key_header, key_length)
     let after_key = core.add_wrapping(core.add_wrapping(key_offset, key_length), 2)
     var value_offset = 0
     var value_length = 0
     var after_request = after_key
     // SET admits exactly one value. GET publishes zero in both value fields.
     if command == 2 {
-        let parsed_length = request_decimal(wire, after_key, 36, 128, 2049)
-        if parsed_length > 512 {
-            return parsed_length
+        let parsed_length = try request_decimal(wire, after_key, 36)
+        if parsed_length > 128 {
+            return error RequestError.OverLimit
         }
-        let parsed_offset = request_bulk_payload(wire, after_key, parsed_length)
-        if parsed_offset > 512 {
-            return parsed_offset
-        }
+        let parsed_offset = try request_bulk_payload(wire, after_key, parsed_length)
         value_length = parsed_length
         value_offset = parsed_offset
         after_request = core.add_wrapping(core.add_wrapping(parsed_offset, parsed_length), 2)
@@ -255,10 +219,53 @@ func parse_request
     request.key_length = key_length
     request.value_offset = value_offset
     request.value_length = value_length
-    return consumed
+    return ok consumed
+}
+
+// Encode the typed outcome for the offline replay protocol.
+// Only a successful parse publishes a new request descriptor.
+func parse_request_status
+    with noalloc, noblock
+    arg request Request as readwrite reference
+    arg wire Bytes as readonly reference
+    arg start u64 as readonly copy
+    returns u64
+{
+    return parse_request(request, wire, start)
+        on ok(consumed) then consumed
+        on NeedMore(required) then core.add_wrapping(1024, required)
+        on Malformed then 2048
+        on OverLimit then 2049
+        on Overflow then 2050
 }
 
 // The parser declarations above also serve the offline conformance driver.
+
+// Preserve the writer's typed failures across the frame builder.
+error ReplyError {
+    from write.WriteError as Write
+}
+
+// Format one committed value as a RESP bulk reply in the reusable output slot.
+// The preview reserves enough room for a three-digit length, 128 bytes, and framing.
+func write_bulk_reply
+    with noalloc, noblock
+    arg writer write.Cursor as readwrite reference
+    arg reply Bytes as readwrite reference
+    arg value Bytes as readonly reference
+    returns Result<u64, ReplyError>
+{
+    let length = core.len(value)
+    core.assert(length <= 128)
+    let readwrite output = core.prefix(reply, core.add_wrapping(length, 8))
+    writer.position = 0
+    let _marker = try write.put_u8(writer, output, 36)
+    let _digits = try write.put_decimal(writer, output, length)
+    let _header_end = try write.put_bytes(writer, output, b"\r\n")
+    let _payload = try write.put_bytes(writer, output, value)
+    let _trailer = try write.put_bytes(writer, output, b"\r\n")
+    return ok writer.position
+}
 
 // Buffers remain initialized and retain their physical extent across requests.
 // Logical input/output cursors separately delimit the valid bytes.
@@ -288,21 +295,27 @@ func main
     let value_capacity = 128
     let entries_capacity = 16
 
-    let buffers_memory = core.region(2048) else {
+    let buffers_memory = core.region(1024) else {
         core.assert(false);
         return 0
     }
     let buffers = core.batch(buffers_memory, WireSlot)
-    let input_status = core.append(buffers, wire_slot(wire_capacity))
     let pending_status = core.append(buffers, wire_slot(wire_capacity))
     // A maximum bulk reply has six header bytes, 128 data bytes, and CRLF.
     let output_status = core.append(buffers, wire_slot(136))
-    core.assert(input_status == 0)
     core.assert(pending_status == 0)
     core.assert(output_status == 0)
-    let incoming = core.borrow_readwrite(buffers, 0)
-    let pending = core.borrow_readwrite(buffers, 1)
-    let reply = core.borrow_readwrite(buffers, 2)
+    let pending = core.borrow_readwrite(buffers, 0)
+    let reply = core.borrow_readwrite(buffers, 1)
+
+    let writer_memory = core.region(16) else {
+        core.assert(false)
+        return 0
+    }
+    let writers = core.batch(writer_memory, write.Cursor)
+    let writer_status = core.append(writers, write.start())
+    core.assert(writer_status == 0)
+    let writer = core.borrow_readwrite(writers, 0)
 
     let request_memory = core.region(64) else {
         core.assert(false);
@@ -324,8 +337,6 @@ func main
         core.assert(status == 0)
     }
 
-    let interrupted = 18446744073709551615
-    let would_block = 18446744073709551614
     var filled = 0
     var cursor = 0
     var sent = 0
@@ -337,44 +348,53 @@ func main
         // remains committed even if the peer never read its reply.
         if session_finished == 1 {
             let next = core.next_session()
-            if next == 0 {
-                filled = 0
-                cursor = 0
-                sent = 0
-                reply_length = 0
-                close_after_reply = 0
-                session_finished = 0
-            } else {
-                // An interrupted accept can retry. A borrowed single stream
-                // reports end here and the entry releases all backing.
-                if next != interrupted {
+            net.next_session_result(next)
+                on ok then {
+                    filled = 0
+                    cursor = 0
+                    sent = 0
+                    reply_length = 0
+                    close_after_reply = 0
+                    session_finished = 0
+                }
+                on Interrupted then {
+                    // Keep the session finished so the loop retries accept.
+                }
+                on End then {
                     return 0
                 }
-            }
+                on error then {
+                    // A failed accept leaves no client to serve.
+                    return 0
+                }
         } else {
             // A partially written reply owns the output slot until all its
             // bytes are accepted or the session terminates.
             if sent < reply_length {
-                let remaining = core.sub_wrapping(reply_length, sent)
-                let outcome = core.send(reply.wire, sent, remaining)
-                if outcome <= remaining {
-                    core.assert(outcome != 0)
-                    sent = core.add_wrapping(sent, outcome)
-                } else {
-                    if outcome == would_block {
+                let reply_bytes = core.prefix(reply.wire, reply_length)
+                let remaining = core.sub_wrapping(core.len(reply_bytes), sent)
+                let outcome = core.send(reply_bytes, sent, remaining)
+                net.send_result(outcome)
+                    on ok(count) then {
+                        sent = core.add_wrapping(sent, count)
+                    }
+                    on Interrupted then {
+                        // Retry from the same send offset.
+                    }
+                    on WouldBlock then {
                         let ready = core.wait_output()
-                        if ready != 0 {
-                            if ready != interrupted {
+                        net.wait_result(ready)
+                            on ok then {
+                            }
+                            on Interrupted then {
+                            }
+                            on error then {
                                 session_finished = 1
                             }
-                        }
-                    } else {
-                        // Preserve the pending offset across EINTR.
-                        if outcome != interrupted {
-                            session_finished = 1
-                        }
                     }
-                }
+                    on error then {
+                        session_finished = 1
+                    }
             } else {
                 if close_after_reply == 1 {
                     session_finished = 1
@@ -388,246 +408,123 @@ func main
                     var read_needed = 1
                     var reply_error = 0
                     if cursor < filled {
-                        let outcome = parse_request(request, core.prefix(pending.wire, filled), cursor)
-                        if outcome <= wire_capacity {
-                            core.assert(outcome > 0)
-                            read_needed = 0
-                            cursor = core.add_wrapping(cursor, outcome)
+                        let pending_input = core.prefix(pending.wire, filled)
+                        parse_request(request, pending_input, cursor)
+                            on ok(consumed) then {
+                                core.assert(consumed > 0)
+                                read_needed = 0
+                                cursor = core.add_wrapping(cursor, consumed)
 
-                            // Dispatch one checked request against a preallocated table. The caller
-                            // supplies entries, request, pending.wire, filled, key_capacity, and
-                            // value_capacity. Keep match_index and store_result for reply formatting.
-                            // Statuses are 0 stored, 1 found, 2 missing, 3 table full, and 4 invalid extent.
-                            let slot_count = core.len(entries)
-                            var match_index = slot_count
-                            var free_index = slot_count
-                            var store_result = 4
-                            let key_in_range = store.range_fits(core.prefix(pending.wire, filled), request.key_offset, request.key_length)
-                            // Validate the requested key against both the received extent and the table's
-                            // shape before selecting an entry. Empty keys remain legal.
-                            if key_in_range == 1 {
-                                if request.key_length <= key_capacity {
-                                    var index = 0
-                                    // Search the fixed published prefix. Save scalar indexes, so no
-                                    // reference from a loop iteration can outlive that iteration.
-                                    for readonly entry in entries {
-                                        // Record the first free slot, or compare an occupied key of the
-                                        // same logical length. The published table contains unique keys.
-                                        if entry.occupied == 0 {
-                                            if free_index == slot_count {
-                                                free_index = index
-                                            }
-                                        } else {
-                                            if entry.key_length == request.key_length {
-                                                if store.key_matches(entry.key, pending.wire, request.key_offset, request.key_length) == 1 {
-                                                    match_index = index
+                                let key = core.subrange(pending_input, request.key_offset, request.key_length)
+                                sent = 0
+                                if request.command == 1 {
+                                    let match_index = store.find(entries, key)
+                                    match_index
+                                        on Some(index) then {
+                                            let hit = core.borrow_readonly(entries, index)
+                                            write_bulk_reply(writer, reply.wire, core.prefix(hit.value, hit.value_length))
+                                                on ok(length) then {
+                                                    reply_length = length
                                                 }
-                                            }
-                                        }
-                                        index = core.add_wrapping(index, 1)
-                                    }
-                                    // A GET does not change the table. Its selected value remains live
-                                    // through response formatting, including an occupied empty value.
-                                    if request.command == 1 {
-                                        store_result = 2
-                                        if match_index != slot_count {
-                                            store_result = 1
-                                        }
-                                    }
-                                    // A SET validates its entire value before any destination byte write.
-                                    if request.command == 2 {
-                                        let value_in_range = store.range_fits(core.prefix(pending.wire, filled), request.value_offset, request.value_length)
-                                        if value_in_range == 1 {
-                                            if request.value_length <= value_capacity {
-                                                // Prefer an overwrite even if every slot is occupied.
-                                                var destination_index = match_index
-                                                if destination_index == slot_count {
-                                                    destination_index = free_index
+                                                on error then {
+                                                    core.assert(false)
                                                 }
-                                                store_result = 3
-                                                if destination_index != slot_count {
-                                                    let destination = core.borrow_readwrite(entries, destination_index)
-                                                    // The constructor initialized these fixed capacities
-                                                    // and the range checks prove the source byte accesses.
-                                                    if destination.occupied == 0 {
-                                                        for byte in core.range(request.key_length) {
-                                                            destination.key[byte] = pending.wire[core.add_wrapping(request.key_offset, byte)]
-                                                        }
-                                                        destination.key_length = request.key_length
-                                                    }
-                                                    // Existing keys stay in place. Shrinking a value leaves
-                                                    // an inaccessible stale tail outside the new prefix.
-                                                    for byte in core.range(request.value_length) {
-                                                        destination.value[byte] = pending.wire[core.add_wrapping(request.value_offset, byte)]
-                                                    }
-                                                    destination.value_length = request.value_length
-                                                    destination.occupied = 1
-                                                    store_result = 0
-                                                }
-                                            }
                                         }
-                                    }
+                                        on None then {
+                                            reply_length = bytes.move(reply.wire, b"$-1\r\n")
+                                        }
+                                } else {
+                                    let value = core.subrange(pending_input, request.value_offset, request.value_length)
+                                    store.put(entries, key, value)
+                                        on ok then {
+                                            reply_length = bytes.move(reply.wire, b"+OK\r\n")
+                                        }
+                                        on Full then {
+                                            reply_error = 5
+                                        }
+                                        on OverLimit then {
+                                            reply_error = 3
+                                            close_after_reply = 1
+                                        }
                                 }
                             }
-
-                            // Choose the reply after the table operation completes.
-                            sent = 0
-                            if store_result == 0 {
-                                reply.wire[0] = 43
-                                reply.wire[1] = 79
-                                reply.wire[2] = 75
-                                reply.wire[3] = 13
-                                reply.wire[4] = 10
-                                reply_length = 5
+                            on NeedMore(required) then {
+                                core.assert(required > filled)
                             }
-                            if store_result == 1 {
-                                let hit = core.borrow_readonly(entries, match_index)
-                                let length = hit.value_length
-                                core.assert(length <= value_capacity)
-                                var header = 1
-                                var digits = length
-                                reply.wire[0] = 36
-                                // The 128-byte profile needs at most one hundreds digit.
-                                if digits >= 100 {
-                                    reply.wire[header] = 49
-                                    header = core.add_wrapping(header, 1)
-                                    digits = core.sub_wrapping(digits, 100)
-                                }
-                                var tens = 0
-                                // Bounded subtraction yields the tens and ones.
-                                for digit in core.range(9) {
-                                    if digits >= 10 {
-                                        tens = core.add_wrapping(tens, 1)
-                                        digits = core.sub_wrapping(digits, 10)
-                                    }
-                                }
-                                if length >= 10 {
-                                    reply.wire[header] = core.add_wrapping(48, tens)
-                                    header = core.add_wrapping(header, 1)
-                                }
-                                reply.wire[header] = core.add_wrapping(48, digits)
-                                reply.wire[core.add_wrapping(header, 1)] = 13
-                                reply.wire[core.add_wrapping(header, 2)] = 10
-                                let start = core.add_wrapping(header, 3)
-                                // Only the committed logical value is serialized.
-                                for byte in core.range(length) {
-                                    reply.wire[core.add_wrapping(start, byte)] = hit.value[byte]
-                                }
-                                let end = core.add_wrapping(start, length)
-                                reply.wire[end] = 13
-                                reply.wire[core.add_wrapping(end, 1)] = 10
-                                reply_length = core.add_wrapping(end, 2)
-                            }
-                            if store_result == 2 {
-                                reply.wire[0] = 36
-                                reply.wire[1] = 45
-                                reply.wire[2] = 49
-                                reply.wire[3] = 13
-                                reply.wire[4] = 10
-                                reply_length = 5
-                            }
-                            if store_result == 3 {
-                                reply_error = 5
-                            }
-                            if store_result == 4 {
-                                reply_error = 3
-                                close_after_reply = 1
-                            }
-                        } else {
-                            // Complete terminal errors get one reply. An
-                            // incomplete status leaves the input tail live.
-                            if outcome >= 2048 {
-                                core.assert(outcome <= 2050)
+                            on Malformed then {
                                 read_needed = 0
                                 close_after_reply = 1
-                                reply_error = core.sub_wrapping(outcome, 2046)
+                                reply_error = 2
                             }
-                        }
+                            on OverLimit then {
+                                read_needed = 0
+                                close_after_reply = 1
+                                reply_error = 3
+                            }
+                            on Overflow then {
+                                read_needed = 0
+                                close_after_reply = 1
+                                reply_error = 4
+                            }
                     }
                     if read_needed == 1 {
-                        // Moving the tail left in increasing order preserves
-                        // every input byte even when the ranges overlap.
+                        // The unread tail may overlap its destination at the start of the slot.
                         if cursor > 0 {
-                            let tail = core.sub_wrapping(filled, cursor)
-                            for byte in core.range(tail) {
-                                pending.wire[byte] = pending.wire[core.add_wrapping(cursor, byte)]
-                            }
-                            filled = tail
+                            filled = buffer.compact(pending.wire, cursor, filled)
                             cursor = 0
                         }
-                        if filled == wire_capacity {
+                        let room = buffer.space(pending.wire, filled)
+                        if room == 0 {
                             close_after_reply = 1
                             reply_error = 3
                         } else {
-                            let room = core.sub_wrapping(wire_capacity, filled)
-                            refill incoming.wire, room as chunk {
-                                let received = chunk_length(chunk)
-                                // Copy only the exact initialized received prefix.
-                                for byte in core.range(received) {
-                                    pending.wire[core.add_wrapping(filled, byte)] = chunk_byte(chunk, byte)
-                                }
-                                filled = core.add_wrapping(filled, received)
+                            let readwrite free_tail = core.subrange(pending.wire, filled, room)
+                            refill free_tail, room as chunk {
+                                filled = core.add_wrapping(filled, core.len(chunk))
                             } else status {
-                                if status == 0 {
-                                    // A half-closed peer can still read the truncation reply.
-                                    if filled == 0 {
-                                        session_finished = 1
-                                    } else {
-                                        close_after_reply = 1
-                                        reply_error = 1
+                                net.recv_result(status)
+                                    on ok(count) then {
+                                        // Only EOF reaches this arm. Progress goes to chunk.
+                                        core.assert(count == 0)
+                                        // A half-closed peer can still read the truncation reply.
+                                        if filled == 0 {
+                                            session_finished = 1
+                                        } else {
+                                            close_after_reply = 1
+                                            reply_error = 1
+                                        }
                                     }
-                                } else {
-                                    if status == would_block {
+                                    on Interrupted then {
+                                    }
+                                    on WouldBlock then {
                                         let ready = core.wait_input()
-                                        if ready != 0 {
-                                            if ready != interrupted {
+                                        net.wait_result(ready)
+                                            on ok then {
+                                            }
+                                            on Interrupted then {
+                                            }
+                                            on error then {
                                                 session_finished = 1
                                             }
-                                        }
-                                    } else {
-                                        if status != interrupted {
-                                            session_finished = 1
-                                        }
                                     }
-                                }
+                                    on error then {
+                                        session_finished = 1
+                                    }
                             }
                         }
                     }
                     // A single bounded simple-error frame covers parse and
                     // store failures. Only fatal framing closes the connection.
                     if reply_error != 0 {
-                        reply.wire[0] = 45
-                        reply.wire[1] = 69
-                        reply.wire[2] = 82
-                        reply.wire[3] = 82
-                        reply.wire[4] = 32
-                        reply.wire[5] = core.add_wrapping(48, reply_error)
-                        reply.wire[6] = 13
-                        reply.wire[7] = 10
+                        let prefix = bytes.move(reply.wire, b"-ERR ")
+                        reply.wire[prefix] = core.add_wrapping(48, reply_error)
+                        let ending = core.add_wrapping(prefix, 1)
+                        let trailer = bytes.move(core.subrange(reply.wire, ending, core.len(b"\r\n")), b"\r\n")
                         sent = 0
-                        reply_length = 8
+                        reply_length = core.add_wrapping(ending, trailer)
                     }
                 }
             }
         }
     }
-}
-
-// Observe only the extent that the native adapter lent for the current read.
-func chunk_length
-    with noalloc, noblock
-    arg input Bytes as readonly reference
-    returns u64
-{
-    return core.len(input)
-}
-
-// Copy one byte from a checked readonly view without retaining it.
-func chunk_byte
-    with noalloc, noblock
-    arg input Bytes as readonly reference
-    arg index u64 as readonly copy
-    returns u64
-{
-    return input[index]
 }

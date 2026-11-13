@@ -8,6 +8,7 @@
 //! by the strict adapter to retain the parser's existing statement boundaries.
 
 use crate::source::{Diagnostic, Span};
+use std::sync::Arc;
 
 /// One owned lexical value and its exact source range.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,6 +28,8 @@ pub enum TokenKind {
     Number(u64),
     /// Decoded text for the experimental literal print statement.
     Text(String),
+    /// Decoded bytes for a readonly byte string literal.
+    Bytes(Arc<[u8]>),
     /// One recognized punctuation character.
     Symbol(char),
     /// `==` comparison.
@@ -52,6 +55,8 @@ pub enum LexemeKind {
     Number,
     /// Complete quoted text candidate; strict lexing validates the escapes.
     Text,
+    /// Complete `b"..."` candidate; strict lexing validates bytes and escapes.
+    Bytes,
     /// One recognized punctuation character.
     Symbol(char),
     /// The complete `==` operator.
@@ -145,7 +150,11 @@ impl Iterator for Scanner<'_> {
                 LexemeKind::LineComment
             }
             (b'/', Some(b'*')) => self.block_comment(),
-            (b'"', _) => self.quoted_text(),
+            (b'b', Some(b'"')) => {
+                self.position += 1;
+                self.quoted(LexemeKind::Bytes)
+            }
+            (b'"', _) => self.quoted(LexemeKind::Text),
             (b'a'..=b'z' | b'A'..=b'Z' | b'_', _) => {
                 self.identifier_run();
                 LexemeKind::Identifier
@@ -206,7 +215,7 @@ impl Scanner<'_> {
 
     /// Consume one double-quoted candidate or an invalid prefix up to the line break.
     /// Scan bytes without allocating. Escaped quotes never close the candidate.
-    fn quoted_text(&mut self) -> LexemeKind {
+    fn quoted(&mut self, kind: LexemeKind) -> LexemeKind {
         let bytes = self.source.as_bytes();
         self.position += 1;
         let mut escaped = false;
@@ -218,7 +227,7 @@ impl Scanner<'_> {
             self.position += 1;
             // A backslash protects exactly its next byte from delimiter recognition.
             if byte == b'"' && !escaped {
-                return LexemeKind::Text;
+                return kind;
             }
             escaped = byte == b'\\' && !escaped;
         }
@@ -255,7 +264,7 @@ impl Scanner<'_> {
 
 /// Scan `source`, returning ordered owned tokens or the first byte-precise error.
 /// Source remains unchanged; unsupported Unicode is rejected as a whole scalar,
-/// while UTF-8 text is allowed in comments and quoted literals. Names and output tokens
+/// while UTF-8 text is allowed in comments and text literals. Names and output tokens
 /// allocate compiler memory; lossless scanning itself remains allocation-free.
 pub fn lex(source: &str) -> Result<Vec<Token>, Diagnostic> {
     let mut tokens = Vec::new();
@@ -267,6 +276,7 @@ pub fn lex(source: &str) -> Result<Vec<Token>, Diagnostic> {
             LexemeKind::Identifier => TokenKind::Ident(text.to_owned()),
             LexemeKind::Number => TokenKind::Number(integer(text, span)?),
             LexemeKind::Text => TokenKind::Text(decode_text(text, span)?),
+            LexemeKind::Bytes => TokenKind::Bytes(decode_bytes(text, span)?),
             LexemeKind::Symbol(symbol) => TokenKind::Symbol(symbol),
             LexemeKind::EqualEqual => TokenKind::EqualEqual,
             LexemeKind::NotEqual => TokenKind::NotEqual,
@@ -286,6 +296,9 @@ pub fn lex(source: &str) -> Result<Vec<Token>, Diagnostic> {
                 if text.starts_with('"') {
                     return Err(Diagnostic::new(span, "unterminated text literal"));
                 }
+                if text.starts_with("b\"") {
+                    return Err(Diagnostic::new(span, "unterminated byte string literal"));
+                }
                 let character = text.chars().next().expect("nonempty invalid lexeme");
                 return Err(Diagnostic::new(
                     span,
@@ -303,6 +316,52 @@ pub fn lex(source: &str) -> Result<Vec<Token>, Diagnostic> {
         },
     });
     Ok(tokens)
+}
+
+/// Decode ASCII and explicit byte escapes from a complete byte string candidate.
+fn decode_bytes(text: &str, span: Span) -> Result<Arc<[u8]>, Diagnostic> {
+    let body = &text[2..text.len() - 1];
+    let mut decoded = Vec::with_capacity(body.len());
+    let mut characters = body.chars();
+    while let Some(character) = characters.next() {
+        let byte = match character {
+            '\\' => match characters.next() {
+                Some('"') => b'"',
+                Some('\\') => b'\\',
+                Some('n') => b'\n',
+                Some('r') => b'\r',
+                Some('t') => b'\t',
+                Some('0') => 0,
+                Some('x') => {
+                    let digit = |character: Option<char>| character.and_then(|ch| ch.to_digit(16));
+                    let (Some(high), Some(low)) =
+                        (digit(characters.next()), digit(characters.next()))
+                    else {
+                        return Err(Diagnostic::new(
+                            span,
+                            "byte string `\\x` escape requires two hexadecimal digits",
+                        ));
+                    };
+                    ((high << 4) | low) as u8
+                }
+                _ => {
+                    return Err(Diagnostic::new(
+                        span,
+                        "unsupported byte string literal escape",
+                    ));
+                }
+            },
+            ascii @ ' '..='~' => ascii as u8,
+            _ => {
+                return Err(Diagnostic::new(
+                    span,
+                    "byte string literals require printable ASCII or explicit escapes",
+                ));
+            }
+        };
+        decoded.push(byte);
+    }
+    Ok(decoded.into())
 }
 
 /// Decode one complete quoted candidate, preserving UTF-8 and rejecting NUL.

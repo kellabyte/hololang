@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::{SourceProgram, ast, lower_module, parse};
+use super::{SourceProgram, ast, functions::SCALAR_OPTION, lower_module, parse};
 use crate::source::{Diagnostic, Span};
 
 #[path = "modules/packaged.rs"]
@@ -158,7 +158,7 @@ pub fn parse_experimental_project<'a>(
 
 /// Resolve an entry file against its own imports before joining declarations.
 /// Names of the entry's own helpers stay unchanged for the checked frontend.
-/// Only manifest packages expose imported records as batch schema operands.
+/// Only manifest packages expose imported records as batch schema operands or parameter types.
 fn bind_entry(
     module: &mut ast::Module,
     imports: &Imports<'_>,
@@ -300,26 +300,32 @@ fn check_library_function(
     errors: Option<&ErrorNames>,
 ) -> Result<(), Diagnostic> {
     // A package producer's success and error types must each resolve in its
-    // own namespace. Legacy leaves supply neither type map and remain scalar.
+    // own namespace. A scalar option does not name a namespace-owned type.
     let (success, family) = super::functions::result_parts(&function.result)
         .map_or((function.result.as_str(), None), |(success, family)| {
             (success, Some(family))
         });
-    let supported_result = (success == "u64"
+    let supported_result = (matches!(success, "u64" | SCALAR_OPTION)
+        || (success == "bool" && family.is_none())
         || records.is_some_and(|records| records.contains_key(success)))
         && family.is_none_or(|family| errors.is_some_and(|errors| errors.contains_key(family)));
     if function.name == "main"
         || !supported_result
-        || function
-            .args
-            .iter()
-            .any(|argument| !matches!(argument.ty.as_str(), "u64" | "Bytes"))
+        || function.args.iter().any(|argument| {
+            let ty = argument.ty.as_str();
+            !(matches!(ty, "u64" | "bool" | "Bytes")
+                || records.is_some_and(|records| {
+                    super::functions::batch_record(ty).is_some()
+                        || (argument.access == "readwrite"
+                            && argument.passing == "reference"
+                            && (records.contains_key(ty) || ty.contains('.')))
+                }))
+        })
     {
-        // Preserve the legacy profile's established diagnostic.
         let requirement = if records.is_some() {
-            "a package library requires non-entry functions with u64, namespace-local struct, or Result of either with a namespace-local error family, and u64 or Bytes arguments"
+            "a package library requires non-entry functions with u64, bool, Option<u64>, a namespace-local struct, or Result<u64, E> or Result<Record, E> with a namespace-local error family, and u64, bool, Bytes, Batch<Record>, or writable fixed record state arguments"
         } else {
-            "a leaf library requires non-entry functions with u64 results and u64 or Bytes arguments"
+            "a leaf library requires non-entry functions with u64, bool, or Option<u64> results and u64, bool, or Bytes arguments"
         };
         return Err(Diagnostic::new(function.span, requirement));
     }
@@ -327,7 +333,7 @@ fn check_library_function(
 }
 
 /// Bind all local calls in an imported module and return its functions and
-/// public interface. Only scalar and readonly byte data can cross this slice.
+/// public interface. Scalar results and borrowed byte arguments cross this slice.
 fn bind_library(
     leaf: &str,
     mut library: ast::Module,
@@ -421,17 +427,86 @@ impl Scope<'_> {
         Ok(())
     }
 
-    /// Rewrite one function without altering its source ranges or arguments.
+    /// Bind a function's body and record parameter schemas without altering source ranges.
     fn function(&self, function: &mut ast::Function) -> Result<(), Diagnostic> {
         // Qualifiers remain unambiguous for the entire checked entry file.
-        for arg in &function.args {
+        for arg in &mut function.args {
             self.binding(&arg.name, arg.span)?;
+            self.record_parameter(arg)?;
         }
-        self.statements(&mut function.body)
+        self.statements(&mut function.body, function.result == SCALAR_OPTION)
+    }
+
+    /// Give batch elements and fixed state the same identity as their backing record.
+    fn record_parameter(&self, argument: &mut ast::Argument) -> Result<(), Diagnostic> {
+        let batch = super::functions::batch_record(&argument.ty);
+        let record = batch.unwrap_or(&argument.ty);
+        if batch.is_none() && matches!(record, "u64" | "bool" | "Bytes") {
+            return Ok(());
+        }
+        let identity = if let Some((qualifier, member)) = record.split_once('.') {
+            let imports = match self {
+                Self::Entry {
+                    imports,
+                    package_types: true,
+                } => Some(*imports),
+                Self::Library {
+                    imports,
+                    records: Some(_),
+                    ..
+                } => *imports,
+                _ => None,
+            };
+            let interface = imports.and_then(|imports| imports.get(qualifier)).ok_or_else(|| {
+                Diagnostic::new(
+                    argument.type_span,
+                    format!("no package `using` directive for namespace qualifier `{qualifier}` in this file"),
+                )
+            })?;
+            interface.public_records.get(member).ok_or_else(|| {
+                Diagnostic::new(
+                    argument.type_span,
+                    format!(
+                        "library `{}` has no public struct `{member}`",
+                        interface.qualified
+                    ),
+                )
+            })?
+        } else if let Self::Library {
+            records: Some(records),
+            ..
+        } = self
+        {
+            let Some(identity) = records.get(record) else {
+                let kind = if batch.is_some() {
+                    "batch record"
+                } else {
+                    "state record"
+                };
+                return Err(Diagnostic::new(
+                    argument.type_span,
+                    format!("unknown {kind} schema `{record}`"),
+                ));
+            };
+            identity
+        } else {
+            // Unqualified entry schemas are already named by their written identity.
+            return Ok(());
+        };
+        argument.ty = if batch.is_some() {
+            format!("Batch<{identity}>")
+        } else {
+            identity.clone()
+        };
+        Ok(())
     }
 
     /// Resolve calls throughout a block, retaining every lexical boundary.
-    fn statements(&self, body: &mut [ast::Statement]) -> Result<(), Diagnostic> {
+    fn statements(
+        &self,
+        body: &mut [ast::Statement],
+        option_return: bool,
+    ) -> Result<(), Diagnostic> {
         use ast::StatementKind as Kind;
         // The existing parser bounds nesting before these recursive visits.
         for statement in body {
@@ -447,23 +522,24 @@ impl Scope<'_> {
                     self.expression(value)?;
                     // A recovery branch sees the same module environment.
                     if let Some(otherwise) = otherwise {
-                        self.statements(otherwise)?;
+                        self.statements(otherwise, option_return)?;
                     }
                 }
                 Kind::Assign { target, value } => {
                     self.expression(target)?;
                     self.expression(value)?;
                 }
-                Kind::Expr(expr) | Kind::Return(expr) => self.expression(expr)?,
+                Kind::Expr(expr) => self.expression(expr)?,
+                Kind::Return(expr) => self.return_expression(expr, option_return)?,
                 // A literal print contains no names to resolve.
                 Kind::PrintText(_) => {}
-                Kind::Construct { subject, arms } => {
+                Kind::Construct { subject, arms } | Kind::HandleResult { subject, arms } => {
                     self.expression(subject)?;
                     // The constructor and case qualifiers use this file's imports.
                     // Each arm's introduced name must leave those imports unambiguous.
                     for arm in arms {
                         self.result_pattern(&mut arm.pattern, arm.span)?;
-                        self.statements(&mut arm.body)?;
+                        self.statements(&mut arm.body, option_return)?;
                     }
                 }
                 Kind::WithRegion {
@@ -474,24 +550,24 @@ impl Scope<'_> {
                     // The budget and both lexical paths use this file's imports.
                     // The private backing has no source name to bind here.
                     self.expression(capacity)?;
-                    self.statements(body)?;
-                    self.statements(on_failure)?;
+                    self.statements(body, option_return)?;
+                    self.statements(on_failure, option_return)?;
                 }
                 Kind::TcpScope { stream, body } => {
                     // The lexical owner follows the same qualifier rule as
                     // the other entry bindings and only introduces a name here.
                     self.binding(stream, statement.span)?;
-                    self.statements(body)?;
+                    self.statements(body, option_return)?;
                 }
-                Kind::Scope(body) | Kind::Loop(body) => self.statements(body)?,
+                Kind::Scope(body) | Kind::Loop(body) => self.statements(body, option_return)?,
                 Kind::If {
                     condition,
                     then_body,
                     else_body,
                 } => {
                     self.expression(condition)?;
-                    self.statements(then_body)?;
-                    self.statements(else_body)?;
+                    self.statements(then_body, option_return)?;
+                    self.statements(else_body, option_return)?;
                 }
                 Kind::For {
                     name,
@@ -501,7 +577,7 @@ impl Scope<'_> {
                 } => {
                     self.binding(name, statement.span)?;
                     self.expression(iterable)?;
-                    self.statements(body)?;
+                    self.statements(body, option_return)?;
                 }
                 Kind::Refill {
                     slot,
@@ -518,8 +594,8 @@ impl Scope<'_> {
                     self.binding(status_name, statement.span)?;
                     self.expression(slot)?;
                     self.expression(limit)?;
-                    self.statements(data_body)?;
-                    self.statements(other_body)?;
+                    self.statements(data_body, option_return)?;
+                    self.statements(other_body, option_return)?;
                 }
             }
         }
@@ -577,6 +653,26 @@ impl Scope<'_> {
         Ok(())
     }
 
+    /// Preserve the contextual Some constructor while resolving its payload expressions.
+    /// A function called Some follows ordinary lookup outside this return position.
+    fn return_expression(
+        &self,
+        value: &mut ast::Expr,
+        option_return: bool,
+    ) -> Result<(), Diagnostic> {
+        use ast::ExprKind as Kind;
+        if option_return
+            && let Kind::Call { callee, args } = &mut value.kind
+            && matches!(&callee.kind, Kind::Name(name) if name == "Some")
+        {
+            for argument in args {
+                self.expression(argument)?;
+            }
+            return Ok(());
+        }
+        self.expression(value)
+    }
+
     /// Resolve call targets and nested actuals without changing evaluation order.
     fn expression(&self, expression: &mut ast::Expr) -> Result<(), Diagnostic> {
         use ast::ExprKind as Kind;
@@ -628,7 +724,9 @@ impl Scope<'_> {
                 self.expression(left)?;
                 self.expression(right)?;
             }
-            Kind::Ok(value) | Kind::Try(value) => self.expression(value)?,
+            Kind::Not { value, .. } | Kind::Ok(value) | Kind::Try(value) => {
+                self.expression(value)?;
+            }
             Kind::Error { case, payload } => {
                 self.error_case(case);
                 // Resolve ordinary calls in the payload without changing the case identity.
@@ -644,7 +742,11 @@ impl Scope<'_> {
                     self.expression(&mut arm.value)?;
                 }
             }
-            Kind::Name(_) | Kind::ErrorFamilyRoot { .. } | Kind::Number(_) | Kind::Bool(_) => {}
+            Kind::Name(_)
+            | Kind::ErrorFamilyRoot { .. }
+            | Kind::Number(_)
+            | Kind::Bool(_)
+            | Kind::Bytes(_) => {}
         }
         Ok(())
     }

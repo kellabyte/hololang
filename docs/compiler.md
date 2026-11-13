@@ -60,15 +60,11 @@ in `compiler/src/backend/llvm/`.
 | `examples/` | Runnable Holo programs. Rust API demonstrations live in `compiler/examples/`. |
 | `tests/` | Integration suites organized by compiler, runtime, CLI and reference semantics. The CLI package registers each Cargo target. |
 | `build/` | Disposable Cargo cache, example outputs, benchmark work and failure replay inputs, separated by purpose. |
-| `evidence/` | Preserved campaigns, correctness records and exploratory runs, indexed separately from disposable output. |
 
-The layout separates ownership without introducing another compilation path,
-independent runtime crate, or language semantic change. Cargo's repository
-configuration selects `build/cargo/`; benchmark tooling discovers the effective
-target directory rather than assuming a binary location. Compiler provenance
-retains that configuration alongside manifests and source. Archived source
-identities and original paths inside `evidence/` records remain unchanged,
-including historical references to their former `build/` home.
+Cargo's repository configuration selects `build/cargo/`. Compiler provenance
+retains that configuration alongside manifests and source. The
+[implementation plan](implementation-plan.md) summarizes historical experiments,
+and the [test guide](../tests/README.md) describes maintained validation.
 
 ## 1. Priorities and backend direction
 
@@ -78,9 +74,8 @@ initially and reuse suitable infrastructure without inheriting the old prototype
 heap, aggregate-return, or exclusive-borrow restrictions.
 
 Correctness and soundness are acceptance gates. Pursue native execution speed,
-memory efficiency, compiler responsiveness, and clear diagnostics together. A
-tradeoff that weakens an accepted guarantee requires the review described in
-[AGENTS.md](../AGENTS.md).
+memory efficiency, compiler responsiveness, and clear diagnostics together.
+Review a tradeoff that weakens an accepted guarantee as a design decision.
 
 Two kinds of performance need separate evidence:
 
@@ -150,10 +145,9 @@ These are frontend techniques, not evidence of faster Holo executables.
 
 ### Host source tools
 
-The November 10 user-requested source-tooling increment keeps shared Rust logic
-in `compiler/src/`, command presentation in `cli/src/`, and the VS Code package in
-`editors/vscode/`. No native lowering or storage semantics are changed. The
-lossless `lex::scan` iterator borrows UTF-8 byte extents and preserves trivia;
+The source tools keep shared Rust logic in `compiler/src/` and command
+presentation in `cli/src/`. The lossless `lex::scan` iterator borrows UTF-8
+byte extents and preserves trivia;
 strict parser tokenization adapts that same mechanism, validates numeric values,
 and retains its existing diagnostics. `highlight::highlight` adds fixed-context
 lexical category hints without source-sized collections or name copies. These
@@ -162,9 +156,7 @@ categories are neither semantic resolution nor evidence that an effect is proved
 Terminal styles are finite CSS-like data in `cli/styles/aurora.hss`, compiled once
 into category/chrome ANSI prefixes. The buffered renderer owns colour policy,
 optional headers/numbers/frame and control-character display. Ordinary plain pipe
-output takes a direct byte-preserving path. The editor grammar is a separate
-lexical adapter checked against fixtures; user themes remain authoritative, with
-an optional matching theme generated from the terminal stylesheet.
+output takes a direct byte-preserving path.
 
 `format::format` parses syntax, emits conservative layout, then reparses and
 compares syntax structure plus exact non-whitespace token/comment spelling.
@@ -172,11 +164,8 @@ It preserves identifiers, grouping, declaration order and grammatical newline
 meaning. It allocates parser trees, tokens and output, and sorts selected
 boundaries; it has no allocation-free/strict-linear claim. It is restricted to
 experimental grammar, performs no width reflow, and does not run lifetime/effect
-checking. CLI stdout/check and explicit file replacement share this one engine;
-the TypeScript editor provider transports unsaved text through stdin/stdout.
-The editor bridge has cancellation/failure handling; a full LSP and semantic
-tokens remain unimplemented. See [CLI](../cli/README.md), [extension](../editors/vscode/README.md),
-and [source-tool evidence](../evidence/source-tools-20261110/README.md).
+checking. CLI stdout/check and explicit file replacement share this one engine.
+[CLI source tools](../cli/README.md#highlight-and-format-source)
 
 Compilation collects [naming advisories](spec.md#naming-diagnostics-and-renaming-tools)
 at declaration tokens before resolving package identities. The frontend stores
@@ -193,7 +182,8 @@ The native cleanup stack carries a marker restore through early completion.
 Marked producers restore on a failed arm before user code. Cursor producers
 already leave the marker unchanged on failure. This uses the same checked
 producer and layout machinery as batch publication and skips batch metadata
-and indexed lookup. [Scope and rollback evidence](../evidence/scoped-result-20261111/README.md)
+and indexed lookup.
+[Scoped construction and rollback](implementation-plan.md#fresh-aggregate-locals)
 
 ### Placing one scoped aggregate
 
@@ -296,18 +286,21 @@ or recover a destination-construction obligation discarded earlier. Good input I
 and accurately conveyed facts matter to generated-code quality.
 [LLVM frontend guidance](https://llvm.org/docs/Frontend/PerformanceTips.html)
 
-The [bounded-backing acceptance suite](../benchmarks/region-lifecycle/backing-acceptance/README.md)
-tests the current M1-R3 implementation through actual parsed source. It keeps
-original checked LLVM and a separate diagnostic module that renames only direct
-malloc/free call targets. Fixed owner metadata observes real calls and injects
-NULL at a selected acquisition; record construction, scans and marker resets
-remain compiler-generated. O0/O3/ASan controls validate long refill sequences,
-finite exhaustion, retained prefixes and cleanup after failed acquisition.
+The historical bounded-backing acceptance suite tested M1-R3 through parsed
+source. It kept the original checked LLVM and a diagnostic module that
+renamed only direct malloc and free call targets. Fixed owner metadata observed
+real calls and injected NULL at a selected acquisition. Record construction,
+scans, and marker resets remained compiler-generated. O0/O3/ASan controls
+validated long refill sequences, finite exhaustion, retained prefixes, and
+cleanup after failed acquisition.
 Darwin live-range mapping/page queries and task totals are separate observations,
 with bounded C-owned competing storage kept outside Holo allocation counters.
-The suite changes no production runtime or backing policy. Observation costs are
-not reset timing; generic commitment, genuine OS pressure and Holo trim/recommit
-remain unavailable. Its selected programs terminate after failed acquisition.
+The suite left the production runtime and backing policy intact. Reset latency,
+generic commitment, genuine OS pressure, and Holo trim and recommit remained
+outside the results. The selected programs terminated after failed acquisition.
+[Backing acceptance results](implementation-plan.md#bounded-backing-acceptance--november-9) ·
+[Maintained owner lifecycle tests](../tests/runtime/owner_lifecycle.rs)
+
 The source adapter now separately supports handlers that finish the owner's
 block and resume outside it, preserving the existing Region success/failure
 operation and lexical cleanup. Handler lowering precedes owner binding; main's
@@ -409,7 +402,7 @@ On failure it returns the original pair for the same family, or shifts the
 tag by the direct child's verified leaf-range offset. Eligible immediate handlers of
 small copied-scalar return chains emit direct edges to their arms, preserving
 capture order and lazy arm evaluation. General calls keep the result pair.
-[Dispatch trials](../evidence/error-edges-20261111/README.md)
+[Scalar dispatch implementation](../compiler/src/backend/llvm/results.rs)
 
 The experimental
 [typed append](error-handling.md#typed-append-in-the-checked-compiler)
@@ -447,7 +440,8 @@ the region marker once on success. A failed fixed append leaves the marker at
 the original checkpoint. A last fixed child can return both lanes directly
 because the parent has no remaining field or header to write. LLVM decides
 whether that edge becomes a tail branch and whether the private operands fit in
-registers. [Native comparison](../evidence/error-reservation-20261111/README.md) · [Union specialization](../evidence/union-rejection-lift-20261111/README.md)
+registers.
+[Named error unions](implementation-plan.md#named-error-unions)
 
 Typed byte-bearing producers in Derived64 and Compact32 also inherit the
 cursor, capacity, and destination. Each successful reservation advances
@@ -458,7 +452,7 @@ same family can forward the pair. Append commits the marker once after
 success. On failure the payload lane retains its original meaning and
 the published marker still points to the old end. The ordered checks,
 physical record layouts and readonly input rules are the same.
-[Reservation replay](../evidence/byte-reservation-comparison-20261111/README.md)
+[Byte-bearing reservation evaluation](implementation-plan.md#byte-bearing-append-reservations)
 
 On macOS arm64, the Derived64 backend can inline a headerless typed
 parent and its guarded-copy child as a pair. A checked graph walk counts
@@ -466,7 +460,7 @@ each use, and the compiler charges per-pair and module-wide expansion
 budgets before emitting both attributes. The selected bodies still use
 the same cursor and error ABI. This exposes the full reservation and
 copy sequence to LLVM while preserving failure order.
-[Bounded reader replay](../evidence/bounded-reader-20261111/README.md)
+[Bounded inlining evaluation](implementation-plan.md#broad-reduction-gate-and-bounded-producer-inlining)
 
 The source bytes can alias one another and can live in the destination batch's
 published prefix. A checked prefix/private-suffix range relationship permits
@@ -477,8 +471,8 @@ required receiving writes, and temporary/repeated writes. Inspect actual generat
 code before claiming descriptor elimination, vectorization, or copy-volume bounds.
 External file/network input remains a separate acquisition/lifetime boundary.
 
-The [short-copy follow-up](../evidence/short-copy-20261109/README.md) found that
-the existing backend already propagates constant input lengths through ordinary
+The short-copy follow-up found that the existing backend already propagates
+constant input lengths through ordinary
 producer calls in its finite probes. Explicit source opacity explains the earlier
 dynamic descriptor length; an actual per-batch length assertion also permits
 constant-length lowering with payload opacity retained. A general dynamic
@@ -487,6 +481,7 @@ increased code size. Its original exact-range chunks also became a widened sourc
 read in optimized LLVM. That candidate was rejected. The current work retains
 source opacity and proves disjointness from checked storage ranges. Actual
 native inspection is required to characterize machine access counts.
+[Known-length investigation](implementation-plan.md#known-lengths-and-dynamic-short-copy-experiment--november-9)
 
 The [whole-input memcpy trial](implementation-plan.md#whole-input-copy-trial--november-9)
 also passed its narrow captured-length/disjoint-suffix proof, but repeated paired
@@ -510,7 +505,7 @@ The cutoff belongs to the native backend policy. `inspect-copies` explains the
 selection without LLVM, and the emitted LLVM carries the same decision. The
 compiler emits an ordinary inlining hint for producers reaching the guarded path.
 The tuned head-and-tail variant and the earlier loop variant are measured separately.
-[Implementation and evidence](../evidence/small-copy-followup-20261110/README.md)
+[Guarded copy implementation](../compiler/src/backend/llvm/copy.rs)
 
 The opt-in staging-copy experiment extends these transfer primitives to
 recognized checked assignments between initialized byte fields. On macOS
@@ -520,7 +515,7 @@ before copying. The ordinary loop handles tiny copies, possible overlap,
 and failed bounds proofs. This preserves forward alias behavior and partial
 writes before the original trap. The measured gains depend on fragment
 size, and isolated empty-frame staging still regresses.
-[Staging evaluation](../evidence/staging-copy-20261111/README.md)
+[Native staging correctness tests](../tests/compiler/backend/staging_copy.rs)
 
 The stable-slot follow-up captures two live byte-field descriptors in a
 positive-trip outer loop's preheader. It requires distinct live allocation
@@ -529,13 +524,12 @@ each copy. Dynamic fragment bounds and the scalar trap-order fallback
 still apply. Tiny disjoint transfers use exact inline chunks. The repeat
 recovers the earlier empty-frame regression in both staging and the full
 reader. The proof remains an opt-in lowering.
-[Stable-slot evaluation](../evidence/stable-staging-slots-20261111/README.md)
+[Stable-slot implementation](../compiler/src/backend/llvm/staging_slots.rs)
 
 The proved-only release candidate retains ordinary scalar lowering wherever
 it lacks that live-slot proof. In the wider gate, full empty-frame reads
 with one- and two-byte fragments regress against the scalar baseline. The
 candidate remains opt-in.
-[Widened qualification](../evidence/proved-staging-release-20261111/README.md)
 
 Separate range-proof trials use dominating source assertions on exact
 initialized fields, together with distinct live allocation identities.
@@ -543,7 +537,7 @@ They remove the per-byte checks from eligible copy bodies. The
 checked-endpoint variant also reuses the offsets for cursor updates.
 Wide fragments improve substantially while isolated empty one-byte
 fragments regress. All three trials remain isolated.
-[Range-proof gate](../evidence/staging-range-proof-20261111/README.md)
+[Dominating range experiments](implementation-plan.md#dominating-staging-ranges-and-packaged-checksums)
 
 The ordinary macOS arm64 Derived64 path can recover both range proofs
 from successful slot construction and existing checked cursor updates.
@@ -552,7 +546,7 @@ advance preserves its nonwrapping bound. Live acquisition identities
 prove the source and destination are disjoint. The original assertions
 still govern failure order. The selected native copy starts with the
 one-byte arm, and unsupported forms use the ordinary forward loop.
-[Cursor proof and qualification](../evidence/staging-cursor-proof-20261111/README.md)
+[Cursor induction tests](../tests/compiler/backend/README.md#staging-copies)
 
 In a separate prestaged reader, the timed loop iterates published slots of
 the same initialized extent. Holo still loads each recorded extent and
@@ -562,7 +556,7 @@ producer copy with either an ordinary or a register-preserving private
 call increases wide admission time. The experiment leaves the direct
 copy active. A future extent proof would have to cover each publication
 in the iterated prefix and preserve the checks on received wire bytes.
-[Admission timings and generated code](../evidence/prestaged-admission-current-20261111/README.md)
+[Prestaged admission results](implementation-plan.md#prestaged-admission-and-native-replay)
 
 The opt-in macOS arm64 Derived64 emitter now has a bounded proof for a
 lexical batch whose sole byte field has the same literal initialized
@@ -574,7 +568,7 @@ proved bound. Existing checked reads still guard any narrower received
 prefix. Mixed, computed, or unproved extents retain ordinary lowering.
 The proof adds no native guard or storage, and the ordinary CLI keeps its
 existing policy.
-[Proof scope, native timings and generated code](../evidence/prestaged-extent-20261111/README.md#opt-in-compiler-proof)
+[Uniform-batch conformance](../tests/compiler/backend/README.md#uniform-batches)
 
 Ordinary macOS arm64 Derived64 emission uses a shared outlined leaf on the
 wide edge of a proved staging site whose maximum is 65–256 bytes. The
@@ -587,35 +581,36 @@ idempotent. The older direct-inline trial regressed the two-byte reader.
 The checked outline passes the packaged reader and hosted rollback gates,
 and the ordinary CLI reproduces the measured outline images exactly.
 The `--outlined-bulk` API example continues to expose the wider experiment.
-[Direct-inline trial](../evidence/split-bulk-inline-20261111/README.md) · [Packaged default gate](../evidence/packaged-reader-gate-20261111/README.md)
+[Direct-inline trial](implementation-plan.md#split-reader-wide-staging) ·
+[Packaged staging results](implementation-plan.md#packaged-wide-staging-default)
 
-An isolated [copy-boundary experiment](../benchmarks/telemetry/copy-boundary/README.md)
-adds a 65–128-byte arm to exact archived LLVM while retaining the original
-consumer and checks. It improves the paired median in four tested fixtures.
+An isolated copy-boundary experiment added a 65–128-byte arm to the historical
+LLVM while retaining the original consumer and checks. It improved the paired
+median in four tested fixtures.
 This is a candidate policy with overlapping head and tail transfers and an
 unmeasured broader regression surface. The active backend cutoff is still
-64 bytes. The separate [scan diagnostic](../benchmarks/telemetry/scan/README.md)
-reproduces the 63-to-64-byte timing cliff on prebuilt records, so copy dispatch
-alone cannot explain that earlier end-to-end pattern.
+64 bytes. A separate scan diagnostic reproduced the 63-to-64-byte timing cliff
+on prebuilt records, implicating work beyond copy dispatch.
 
-The [production-shaped regression candidate](../evidence/copy128-regression-20261110/README.md)
-improves eligible 65–128-byte copies and reproducibly regresses the 129-byte
-wide and derived paths. An [upper-bound-first variant](../evidence/copy128-upper-first-20261110/README.md)
-reaches the bulk intrinsic after one size comparison and reduces the 129-byte
-penalty. It moves a second size comparison onto the short inline path and
-reproducibly increases cost at 31 bytes. The active cutoff remains 64 bytes.
+The production-shaped regression candidate improved eligible 65–128-byte copies
+and reproducibly regressed the 129-byte wide and derived paths. An
+upper-bound-first variant reached the bulk intrinsic after one size comparison
+and reduced the 129-byte penalty. It moved a second size comparison onto the
+short inline path and reproducibly increased cost at 31 bytes.
 
-The [rebalanced copy trials](../evidence/copy-dispatch-recovery-20261110/README.md)
-preserve the 31- and 129-byte controls more closely. A narrower 65–80-byte
-arm uses one 64-byte head and one 16-byte tail and lowers 65-byte cost by
-16.07% in the hot worker repeat. It also increases Wide 33- and 64-byte cost.
+The rebalanced copy trials preserved the 31- and 129-byte controls more
+closely. A narrower 65–80-byte arm used one 64-byte head and one 16-byte tail.
+It lowered 65-byte cost by 16.07% in the hot worker repeat and increased
+Wide 33- and 64-byte cost.
 Both revised dispatches remain experiments.
+[Rebalanced copy trials](implementation-plan.md#rebalanced-copies-matched-scans-and-static-tiny-sums--november-10)
 
-The [bounded byte-sum prototype](../evidence/telemetry-byte-sum-20261110/README.md)
-improves the sealed scanner by summing exact subranges with narrower vector
-reductions before widening to u64. It preserves modular arithmetic and bounded
-reads. A future lowering must prove stable source extent and reduction purity
+The bounded byte-sum prototype improved the sealed scanner by summing exact
+subranges with narrower vector reductions before widening to u64.
+It preserved modular arithmetic and bounded reads. A future lowering must
+prove stable source extent and reduction purity
 for any admitted loop, including interactions with compatible aliases.
+[Bounded reduction prototype](implementation-plan.md#copy-regression-review-bounded-byte-sums-and-borrowed-calls--november-10)
 
 Entry lowering emits scalar argument captures as `Let` operations before `Append`,
 while native append resolves its destination before capturing its typed IR actuals.
@@ -656,27 +651,28 @@ partial sums with bounded 8-, 4-, 2-, and 1-byte tails. Each partial sum fits in
 16 bits, and the outer sum keeps modulo-`u64` behavior. Other checked loops use
 ordinary lowering. The proof uses the stable extent and the body operations
 of this loop and requires neither a uniqueness promise nor aligned input.
-The reduction runs in a separate native function. The [inlined trial](../evidence/checked-byte-sum-20261110/README.md)
-improved the scan and increased cost in timed construction and reset phases.
-The [outlined implementation](../evidence/outlined-byte-sum-20261110/README.md)
-keeps the scan improvement with a native call per selected loop. The full gate
-and exact repeats found no reproducible slowdown in the previously affected
-phases. The active compiler reproduces all 132 measured LLVM outputs.
+The reduction runs in a separate native function. The inlined trial improved the
+scan and increased cost in timed construction and reset phases. The outlined
+implementation kept the scan improvement with a native call per selected loop.
+The full gate and exact repeats found no reproducible slowdown in the previously
+affected phases. The compiler reproduced all 132 measured LLVM outputs at adoption.
+[Outlined byte-sum results](implementation-plan.md#outlined-byte-sums-and-checked-refill--november-10)
 
-The [tiny-span trials](../evidence/tiny-byte-sum-bypass-20261110/README.md)
-skip the call at zero or handle spans through two bytes in the caller. Both
-improve their intended fixed sizes. The same extra dispatch increases costs
-in complete input or lifecycle controls, and the scalar path also regresses
-the mixed short-span scanner. The backend keeps the outlined policy.
+The tiny-span trials skipped the call at zero or handled spans through two
+bytes in the caller. Both improved their intended fixed sizes. The same extra
+dispatch increased costs in complete input or lifecycle controls, and the
+scalar path also regressed the mixed short-span scanner. The backend keeps
+the outlined policy.
+[Tiny-span measurements](implementation-plan.md#telemetry-phase-attribution-and-tiny-span-trials--november-10)
 
-The [static tiny-sum specialization](../evidence/static-tiny-byte-sum-20261110/README.md)
-recognizes a pure ordinary byte-sum helper with an exact literal checked prefix
-from zero through two. The caller keeps the original argument evaluation order
-and prefix bounds check. After capture, it returns the seed or performs one
+The static tiny-sum specialization recognizes a pure ordinary byte-sum helper
+with an exact literal checked prefix from zero through two. The caller keeps
+the original argument evaluation order and prefix bounds check. After capture,
+it returns the seed or performs one
 exact-width unaligned load and wrapping addition. Selection occurs during
-compilation. The active compiler reproduces the measured five static/control
-modules and all 190 original dynamic LLVM modules byte for byte.
-[Active acceptance](../evidence/static-tiny-byte-sum-adoption-20261110/README.md)
+compilation. At adoption, the compiler reproduced the five measured static and
+control modules and all 190 original dynamic LLVM modules byte for byte.
+[Native byte-sum tests](../tests/compiler/backend/README.md#byte-sum-lowering)
 
 A literal checked prefix of at least 256 bytes also qualifies the pure
 byte-sum call for a separate outlined 64-byte reduction. Its argument
@@ -685,14 +681,15 @@ complete 64-byte blocks and sends any nonempty remainder to the original
 helper. Dynamic extents use the existing 16-byte reduction. A branch-proved
 trial improved wide spans and added a dispatch cost on short spans, so the
 active policy selects the large helper during compilation from a literal
-prefix. [Qualification](../evidence/proved-large-sum-20261111/README.md)
+prefix.
+[Large checksum evaluation](implementation-plan.md#ordinary-staging-and-large-checksum-qualification)
 
 The locked mixed-span package preserves the dynamic checksum call and
 the narrow helper's LLVM. A wide remainder reaches the same narrow
 helper with a computed seed, which changes native specialization in
 the linked module. Mixed scans and complete processing improve.
 The sparse complete worker takes longer even though its scan improves.
-[Packaged measurement and native code](../evidence/packaged-mixed-checksum-20261111/README.md)
+[Packaged checksum results](implementation-plan.md#dominating-staging-ranges-and-packaged-checksums)
 
 Giving the wide remainder a private copy of the narrow routine restores
 the original constant-seed native instructions on the dynamic path.
@@ -701,38 +698,38 @@ The trial adds 168 bytes of native text and slows short scans by about
 the runs. The shared routine remains active. The added phase clock
 changes the sparse worker's linked code, and its measurements leave
 the uninstrumented slowdown open.
-[Private-tail and phase comparison](../evidence/packaged-checksum-tail-20261111/README.md)
+[Checksum tail comparison](implementation-plan.md#initialized-slot-cursor-induction-and-checksum-tail-isolation)
 
 The exact workers with original clocks reproduce a roughly 2% paired
 sparse slowdown. Separate interrupted-PC observations at two periods do
 not localize it to admission or the checksum. The larger mixed control
 does exercise the wide helper in the sampled executable.
-[Original-clock replay and profile](../evidence/sparse-native-profile-20261111/README.md)
+[Sparse worker profile](implementation-plan.md#exact-sparse-worker-profile)
 
 Separate helper interventions on the exact outlined staging and uniform
 extent readers measure owned scans at the original phase clocks. For a
 wide 192-byte payload the outlined 64-byte reduction accounts for most of
 the measured scan improvement, and inlining supplies a further reduction.
 The checked large-literal selection remains active. The dynamic helper
-interventions are retained as evidence for a future qualified selection.
-[Owned scan and protected-page oracle](../evidence/checked-staging-20261111/README.md#owned-scan-isolation)
+results inform any future selection.
+[Owned scan comparison](implementation-plan.md#checked-outlined-staging-and-owned-consumption)
 
 The locked reader trial places a dynamic guard on the existing initialized
 descriptor and invokes the wide helper at 128 bytes or more. It improves
 the wide scan and complete wide reader. The full 64-byte and empty
 two-byte split controls regress. Ordinary selection retains its
 compile-time literal-prefix proof.
-[Guarded scan and short-input measurements](../evidence/owned-scan-qualification-20261111/README.md#guarded-owned-scan)
+[Guarded scan evaluation](implementation-plan.md#owned-scan-qualification-after-the-error-milestone)
 
 The macOS arm64 Derived64 default uses the existing wide helper for a
 literal 192-byte prefix to the same pure wrapping sum. The prefix bounds
 check establishes all three initialized 64-byte groups before the call.
 The policy adds no runtime size branch and keeps dynamic extents and
 neighboring literals on their existing paths.
-[Default release qualification](../evidence/exact-192-default-20261112/README.md)
+[Three-block default evaluation](implementation-plan.md#exact-three-block-default-on-macos-arm64)
 
-The [Linux code-generation probe](../evidence/byte-sum-linux-codegen-20261110/README.md)
-cross-compiles the exact outlined helper. LLVM emits `uaddlv` for generic
+The historical Linux code-generation probe cross-compiled the exact outlined
+helper. LLVM emitted `uaddlv` for generic
 AArch64 and `psadbw` or `vpsadbw` for the two x86-64 profiles. Native Linux
 correctness and performance acceptance remain open.
 
@@ -903,27 +900,27 @@ toolchain identities, and disclosed representation differences. Require generate
 code and allocation/copy evidence for claimed storage mechanisms. The existing
 scalar controls do not establish region performance or compiler responsiveness.
 
-The first [real-source lifecycle campaign](../evidence/lifecycle-comparison-20261109/report.md)
-now supplies 270 independently validated native observations across three batch
-sizes, with wide/compact C/Rust controls and exact-child process CPU/RSS.
-[Generated-code inspection](../evidence/lifecycle-comparison-20261109/generated-review.md)
-confirms fixed marker restoration and no timed per-object free/copy calls in the
-reviewed programs; Holo component overflow/capacity guards remain. This campaign
-uses common O2/generic builds, distinct from Holo CLI release O3, and discloses
+The first real-source lifecycle campaign supplied 270 independently validated
+native observations across three batch sizes, with Wide and compact C and Rust
+controls and exact-child process CPU and RSS.
+Generated-code inspection confirmed fixed marker restoration and no timed
+per-object free or copy calls in the reviewed programs. Holo's component
+overflow and capacity guards remained. The campaign used common O2/generic
+builds, distinct from Holo CLI release O3, and disclosed
 Rust LLVM 21.1.3 versus Clang LLVM 22.1.2. It measures no compiler responsiveness
 or isolated reset cost and does not establish a whole-language ranking.
 
-The [separate phase suite](../benchmarks/region-lifecycle/README.md#diagnostic-phase-campaign)
-now shares these source algorithms while adding diagnostic construction/scan/scope
-clocks. Its900 measured observations retain original combined controls, independent
-oracles, raw calibration, resources, and actual native placement reviews. All three
-largest-case combined Holo LLVM controls match the preceding campaign byte for
-byte. Clock calls do not constrain private marker updates to a physical reset
+The separate phase suite used the same source algorithms and added clocks for
+construction, scan, and scope. Its 900 measured observations retained original
+combined controls, independent oracles, raw calibration, resources, and native
+placement reviews. All three largest-case combined Holo LLVM controls matched
+the preceding campaign byte for byte. Clock calls do not constrain private
+marker updates to a physical reset
 window: Holo/C/Goose can fold them into next-cycle setup, while Rust's reviewed
 control retains a paired store. Such scope readings remain unresolved, with no
-clock subtraction or release-speed ranking. See the [M1 evidence](implementation-plan.md#constructionscan-phase-diagnostics--november-9)
-for results and remaining memory/reclamation gates. No compiler semantics or
-lowering algorithm changed to add this instrumentation.
+clock subtraction or release-speed ranking. Compiler semantics and lowering
+stayed the same for the diagnostic instrumentation.
+[Phase diagnostics](implementation-plan.md#constructionscan-phase-diagnostics--november-9)
 
 The follow-up [remaining-capacity experiment](implementation-plan.md#remaining-capacity-guard-experiment--november-9)
 tested one general reservation predicate under the valid-marker invariant. It
@@ -1035,22 +1032,20 @@ rollback or physical failed-write volume. Native inspection retains generic copy
 bounds paths before later rejection; source wrappers largely inline in the tested
 header-derived layout. No new optimizer policy or runtime contract is introduced.
 
-The [November 10 matched scorecard](../evidence/native-scorecard-20261110/README.md)
-now supplies 1,680 measured observations and 108 preflights with matched O2/generic,
-SDK 15.5 and macOS 11.0 deployment settings. Real C/Rust controls retain both
-known-length spans and complete-record views; the local modified Goose compiler
-is freshly rebuilt with verified runtime/stdlib correspondence. The
-[independent replay](../evidence/native-scorecard-20261110/review/independent-analysis/analysis.md)
-retains all distributions and nominates lifecycle construction and short-copy
-extent knowledge for investigation, without selecting an optimization or claiming
-a global ranking. No native engine or optimizer changed in this campaign.
-Unrelated lexer/source-tool/CLI work changed the whole compiler before preparation;
-both preparations use identical compiler input inventories, and
-[all 27 actual benchmark LLVM modules](../evidence/native-scorecard-20261110/review/controls-verified.json)
-are byte-identical to emission by the accepted M1 compiler. This is scoped output
-equivalence, not whole-compiler identity or proof for other programs. Optimization
-remained deferred at that stage; existing reset/commitment limits and accepted
-semantics stand.
+The November 10 matched scorecard supplied 1,680 measured observations and
+108 preflights with matched O2/generic, SDK 15.5, and macOS 11.0 deployment
+settings. The C and Rust controls retained both known-length spans and
+complete-record views. The local modified Goose compiler
+was freshly rebuilt with verified runtime and standard-library correspondence.
+The independent replay covered all distributions and nominated lifecycle
+construction and short-copy extent knowledge for investigation. The native
+engine and optimizer stayed the same. Unrelated lexer, source-tool, and CLI work
+changed the compiler before preparation. Both preparations used identical
+compiler input inventories, and
+all 27 actual benchmark LLVM modules matched the accepted M1 compiler's emission
+byte for byte. The equivalence applied to those modules. Optimization remained
+deferred at that stage, and the reset and commitment limits still applied.
+[Matched scorecard results](implementation-plan.md#fresh-matched-scorecard--november-10)
 
 The later [construction branch-layout trial](implementation-plan.md#construction-success-branch-layout-trial--november-10)
 tests fixed success-biased LLVM branch metadata without removing or reordering
@@ -1060,21 +1055,18 @@ preflights, including complete independent replay and an exact-binary copy repea
 Its nine lifecycle paired medians improve 2.04–3.65%, but wide 4,096-byte copy cost
 regresses about 2.24%, then 2.49% in the repeat, with adverse IQRs in both campaigns.
 The candidate was rejected and all 52 compiler-input hashes matched the captured
-baseline after that restoration; final rebuilt checks remain separately recorded in
-the [archive](../evidence/construction-branch-20261110/README.md). No hint flag,
-format-specific workaround or alternate lowering path remains. Branch layout is
-an optimizer heuristic, not a probability, safety or speed guarantee. Diagnostic
-phase differences do not isolate instruction latency or establish the full cause
-of the construction gap; no public semantics or M1 native profile is changed.
+baseline after that restoration. The final rebuild verified the restored
+compiler inputs. The original lowering remained in use. Branch layout is
+an optimizer heuristic. The full cause of the construction gap and individual
+instruction latency remained unresolved after the phase diagnostics. The
+public semantics and M1 native profile stayed the same.
 
 The [narrow/vector follow-up](implementation-plan.md#narrow-construction-and-vector-follow-up--november-10)
 accepts a smaller private heuristic after separate baseline-controlled experiments.
 Only all-U64 producer signatures and appends to them receive construction-success
-weights. Checked producer byte arguments can only forward Bytes formals, so this
-scope excludes transitive borrowed-payload reads; unused Bytes parameters also
-exclude a producer. Entry calls select scope per callee. Every predicate, ordered
-failure and publication/rollback operation stays unchanged, without a source
-attribute, alias assumption or format-specific exception.
+weights. This scope excludes caller-borrowed payload reads, and even an unused
+Bytes parameter excludes a producer. Entry calls select scope per callee. The
+heuristic preserves predicates, failure order, publication, and rollback.
 
 The selected narrow candidate improves default lifecycle paired medians about 3%
 at all three tested sizes. Eight of nine lifecycle IQRs are negative; wide 65,536 is
@@ -1082,17 +1074,12 @@ uncertain. All thirteen full-copy IQRs cross zero and ten native copy pairs are
 byte-identical. The one adverse narrow failure flag also compares identical native
 bytes. The independent vector-only candidate retains full-u64 scalar source but
 changes actual tail/transition code, has less consistent default/compact gains
-and eight descriptive adverse flags, and is not adopted. No hint/vector
-combination is measured or enabled. The
-[complete record](../evidence/construction-followup-20261110/README.md) retains 11,512
-measurements and 752 preflights, including both screenings, ordinary generated-code
-inspection and final rebuilt verification. The maintained
-[optimization gate](../benchmarks/region-lifecycle/optimization-gate/README.md)
-keeps lifecycle, copying and frequent failure in one review with no automatic
-adoption. Final 191-test/format/Clippy validation and source/executable identity
-checks establish the selected implementation; the vector module is absent.
-This advances a finite compiler optimization, not public language rules,
-general native-tail equivalence or a global speed ranking.
+and eight descriptive adverse flags. The selected implementation uses the
+narrow hint with the scalar lowering. The historical review covered 11,512
+measurements and 752 preflights, including both screenings, generated-code
+inspection, and rebuilt verification. The qualification considered lifecycle,
+copying, and frequent failure together. Final validation included 191 tests,
+formatting, Clippy, and source and executable identity checks.
 
 Every source directory must document its actual components, responsibilities,
 invariants, and tradeoffs in a README. Source comments must explain the purposes

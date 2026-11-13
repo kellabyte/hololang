@@ -2,8 +2,9 @@
 
 The dashboard loads a session, queries a count, and saves it. Three named
 children in `DashboardError` retain which service failed. Each `try` binds
-the successful value or returns a failure immediately. The caller matches
-child cases such as `Session.PermissionDenied` and reads the retry delay from
+the successful value or returns a failure immediately. The caller saves the
+result in `let outcome`, then matches child cases such as
+`Session.PermissionDenied` and reads the retry delay from
 `Sql.Timeout(delay)`. `on error` handles the remaining SQL failure.
 
 ```sh

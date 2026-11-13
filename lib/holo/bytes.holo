@@ -1,8 +1,26 @@
-// Byte-order operations for holo.bytes. Assemble an integer from octets that
-// may have arrived in separate reads. These operations use scalar arithmetic
-// and hold no buffer or native resource.
+// Operations on octets and bounded byte views. Borrowed inputs remain owned
+// by their callers, and these operations retain no references.
 
 namespace holo.bytes
+
+// Return the first offset of octet in the borrowed view. Offsets are relative
+// to the start of the view. A value above 255 cannot match an input byte.
+public func find
+    with noalloc, noblock
+    arg input Bytes as readonly reference
+    arg octet u64 as readonly copy
+    returns Option<u64>
+{
+    if octet > 255 {
+        return None
+    }
+    for index in core.range(core.len(input)) {
+        if input[index] == octet {
+            return Some(index)
+        }
+    }
+    return None
+}
 
 // Join the low eight bits of two copied integers in little-endian order.
 // Return a u64 from 0 through 65,535 for every input. This is an explicit
@@ -16,4 +34,71 @@ public func join_low_octets_le
 {
     // The masks bound the product at 65,280 and the sum at 65,535.
     return core.add_wrapping(core.and(low, 255), core.mul_wrapping(core.and(high, 255), 256))
+}
+
+// Return true when both borrowed extents contain the same sequence of octets,
+// including when both are empty. A length mismatch reads no payload bytes.
+public func equal
+    with noalloc, noblock
+    arg left Bytes as readonly reference
+    arg right Bytes as readonly reference
+    returns bool
+{
+    let length = core.len(left)
+    if length != core.len(right) {
+        return false
+    }
+    for index in core.range(length) {
+        if left[index] != right[index] {
+            return false
+        }
+    }
+    return true
+}
+
+// Compare byte views while folding ASCII uppercase letters to lowercase.
+// Every other octet must match exactly, including bytes above 127.
+public func equal_ignore_ascii_case
+    with noalloc, noblock
+    arg left Bytes as readonly reference
+    arg right Bytes as readonly reference
+    returns bool
+{
+    let length = core.len(left)
+    if length != core.len(right) {
+        return false
+    }
+    for index in core.range(length) {
+        let a = left[index]
+        let b = right[index]
+        if a != b and ascii_lower(a) != ascii_lower(b) {
+            return false
+        }
+    }
+    return true
+}
+
+// Fold only the inclusive ASCII range A through Z.
+func ascii_lower
+    with noalloc, noblock
+    arg octet u64 as readonly copy
+    returns u64
+{
+    if octet >= 65 and octet <= 90 {
+        return core.add_wrapping(octet, 32)
+    }
+    return octet
+}
+
+// Replace the destination prefix with the original source octets, including
+// when the views overlap. Return the number of octets moved. A short
+// destination traps before any byte changes.
+public func move
+    with noalloc, noblock
+    arg destination Bytes as readwrite reference
+    arg source Bytes as readonly reference
+    returns u64
+{
+    core.move_bytes(destination, source)
+    return core.len(source)
 }

@@ -11,7 +11,8 @@ use super::CheckError;
 use super::expressions::{self, Context};
 use super::scopes;
 use crate::ir::{
-    Build, ErrorCase, ErrorFamily, FieldKind, Function, Op, Producer, Program, Record,
+    Build, ErrorCase, ErrorFamily, FieldKind, Function, OPTION_U64_FAMILY, Op, Producer, Program,
+    Record,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -167,6 +168,11 @@ pub(super) fn validate(program: &Program) -> Result<Definitions<'_>, CheckError>
         // Typed construction carries its error outside the destination suffix.
         // Both conventions use the same field, input, and construction checks.
         if let Some(family) = producer.error.as_deref() {
+            if family == OPTION_U64_FAMILY {
+                return Err(CheckError::new(
+                    "destination constructors cannot return Option<u64>",
+                ));
+            }
             definitions.error_family(family)?;
         }
         let context = Context::Producer {
@@ -364,6 +370,12 @@ pub(super) fn validate(program: &Program) -> Result<Definitions<'_>, CheckError>
     // validated call and therefore has known effects within this closed graph.
     for operation in &program.body {
         if let Op::Function(function) = operation {
+            if function.returns_bool && function.result.is_some() {
+                return Err(
+                    CheckError::new("boolean return cannot carry a result family")
+                        .in_function(&function.name),
+                );
+            }
             // Even unused typed functions need a valid nominal result family.
             if let Some(family) = &function.result {
                 definitions
@@ -407,6 +419,14 @@ fn validate_error_families<'p>(
                 family.name
             )));
         }
+        if family.name == OPTION_U64_FAMILY
+            && (!family.children.is_empty()
+                || !matches!(family.cases.as_slice(), [case] if case.name == "None" && !case.payload))
+        {
+            return Err(CheckError::new(
+                "Option<u64> requires a single tag-only None case",
+            ));
+        }
         // Ordinary result tags fit in a byte and reserve zero for success.
         if family.cases.is_empty() || family.cases.len() > usize::from(u8::MAX) {
             return Err(CheckError::new(format!(
@@ -435,6 +455,11 @@ fn validate_error_families<'p>(
         let mut children = Vec::new();
         // Each alias identifies one subtree and each source has one possible lift.
         for child in &family.children {
+            if child.family == OPTION_U64_FAMILY {
+                return Err(CheckError::new(
+                    "Option<u64> cannot be an error union child",
+                ));
+            }
             if child.alias.is_empty()
                 || child.alias.contains('.')
                 || !aliases.insert(child.alias.as_str())

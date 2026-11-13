@@ -4,6 +4,7 @@
 // short reads is copied scalar data. See ../README.md for the hosted contract.
 
 using telemetry.frame
+using holo.bytes.read
 
 // A fixed initialized slot. The positive refill result lends only its prefix.
 struct InputSlot {
@@ -83,9 +84,7 @@ func start_decoder
     }
 }
 
-// Capture one initialized header octet in caller state and return the next
-// phase. The caller invokes this only for phases zero through three. Both
-// octets passed to the library come from checked byte reads.
+// Accept one magic or kind octet, or finish a length split across two reads.
 func capture_header
     with noalloc, noblock
     arg state Decoder as readwrite reference
@@ -102,13 +101,17 @@ func capture_header
         state.kind = octet
         return 2
     }
-    // A short read can end between the two length octets.
-    if state.phase == 2 {
-        state.length_low = octet
-        return 3
-    }
-    // The high octet completes the length without retaining an input view.
     let length = frame.payload_length(state.length_low, octet)
+    return finish_header(state, length)
+}
+
+// Classify the complete header and prepare to consume its declared body.
+func finish_header
+    with noalloc, noblock
+    arg state Decoder as readwrite reference
+    arg length u64 as readonly copy
+    returns u64
+{
     state.remaining = length
     state.frame_checksum = 0
     state.status = 0
@@ -165,29 +168,63 @@ func publish_frame
 }
 
 // Decode the live logical prefix into caller-owned state and return its length.
-// The function never keeps a reference or grows storage. A frame that ends
-// between reads has copied header fields and a provisional checksum only.
+// Restart the byte cursor for each prefix. An incomplete frame retains copied
+// header fields and a provisional checksum across refills.
 func decode_chunk
     with noalloc, noblock
     arg state Decoder as readwrite reference
+    arg scan read.Cursor as readwrite reference
     arg input Bytes as readonly reference
     returns u64
 {
     let length = core.len(input)
     state.bytes_seen = core.add_wrapping(state.bytes_seen, length)
     state.chunks_seen = core.add_wrapping(state.chunks_seen, 1)
-    // Each trip consumes exactly one initialized byte from the logical prefix.
-    for index in core.range(length) {
-        let octet = input[index]
-        // A zero-length body commits at its header, so phase four here implies
-        // positive remaining bytes. Rejected bodies need no payload sum.
+    scan.position = 0
+    // Each step consumes at least one byte or returns, so length bounds the work.
+    for _ in core.range(length) {
+        let position = scan.position
+        if position == length {
+            return length
+        }
         if state.phase == 4 {
-            if state.status == 0 {
-                state.frame_checksum = core.add_wrapping(state.frame_checksum, octet)
+            // Consume the part of the body available in this view. Rejected
+            // frames drain that extent without reading individual bytes.
+            var count = core.sub_wrapping(length, position)
+            if count > state.remaining {
+                count = state.remaining
             }
-            state.remaining = core.sub_wrapping(state.remaining, 1)
+            if state.status == 0 {
+                let payload = core.subrange(input, position, count)
+                for index in core.range(count) {
+                    state.frame_checksum = core.add_wrapping(state.frame_checksum, payload[index])
+                }
+            }
+            scan.position = core.add_wrapping(position, count)
+            state.remaining = core.sub_wrapping(state.remaining, count)
         } else {
-            state.phase = capture_header(state, octet)
+            if state.phase == 2 {
+                read.take_u16_le(scan, input)
+                    on ok(value) then {
+                        state.phase = finish_header(state, value)
+                    }
+                    on Short(_) then {
+                        // One octet remains. The failed read leaves its offset
+                        // in place, so copy that octet before the next refill.
+                        state.length_low = input[scan.position]
+                        state.phase = 3
+                        return length
+                    }
+            } else {
+                read.take_u8(scan, input)
+                    on ok(octet) then {
+                        state.phase = capture_header(state, octet)
+                    }
+                    on Short(_) then {
+                        core.assert(false)
+                        return length
+                    }
+            }
         }
         // Complete empty and nonempty frames share the same commit boundary.
         if state.phase == 4 {
@@ -200,7 +237,7 @@ func decode_chunk
 }
 
 // Drive one admitted descriptor from the native host. Acquire the reusable
-// slot and decoder once, then read until EOF or a terminal I/O error. On
+// slot, decoder, and cursor once, then read until EOF or a terminal I/O error. On
 // completion print the terminal outcome and the counters in README order.
 func main
     returns u64
@@ -224,6 +261,15 @@ func main
     let initialized = core.append(states, start_decoder())
     core.assert(initialized == 0)
     let state = core.borrow_readwrite(states, 0)
+
+    let cursor_memory = core.region(128) else {
+        core.assert(false)
+        return 0
+    }
+    let cursors = core.batch(cursor_memory, read.Cursor)
+    let cursor_ready = core.append(cursors, read.start())
+    core.assert(cursor_ready == 0)
+    let scan = core.borrow_readwrite(cursors, 0)
     let interrupted = 18446744073709551615
     let would_block = 18446744073709551614
 
@@ -231,7 +277,7 @@ func main
     // outcome. Ending the data block ends the borrow before the next attempt.
     loop {
         refill slot.wire, 4096 as chunk {
-            decode_chunk(state, chunk)
+            decode_chunk(state, scan, chunk)
         } else status {
             var finish = 1
             var outcome = status

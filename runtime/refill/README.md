@@ -9,8 +9,8 @@ entry code. Ordinary Holo executables retain their existing direct entry.
   FIFO cannot hang before admission. A regular file read may still block.
 - [refill.c](refill.c) admits readable regular files and connected nonblocking
   byte-stream sockets with zero receive timeout. Each refill issues one bounded
-  `read` or `recv` directly into the existing initialized slot. Each explicit
-  wait issues one `poll` on that descriptor and reads no bytes.
+  `read` or `recv` directly into an initialized field or named writable byte
+  view. Each explicit wait issues one `poll` on that descriptor and reads no bytes.
 - [refill.h](refill.h) declares the internal native ABI and status encoding.
 - [send.c](send.c) adds one bounded `send` and one explicit writable wait.
   Output builds pass `-DHOLO_HOSTED_OUTPUT` to compile the adapter and enable
@@ -41,9 +41,11 @@ result. The caller chooses when to wait or retry. Synchronous I/O borrows the
 existing checked range in place and keeps retries explicit. The shipped
 `holo.net` helpers decode the native statuses in manifest packages.
 
-An output-capable entry uses `let sent = core.send(reply.bytes, offset, count)`.
-It sends the checked positive subrange of an initialized field through the
-current nonblocking stream. A positive status is exact progress, and the caller
+An output-capable entry uses `let sent = core.send(source, offset, count)`.
+It sends a checked positive subrange of an initialized field, a named byte
+view, or a byte string literal through the current nonblocking stream.
+Offsets are relative to the source's own extent. A positive status is exact
+progress, and the caller
 keeps the source live while sending any remaining suffix. `core.wait_output()`
 performs one explicit `POLLOUT` wait. A ready status permits another attempt,
 including after hangup or error. Both calls on a file report tagged

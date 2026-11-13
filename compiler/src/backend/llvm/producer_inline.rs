@@ -134,6 +134,9 @@ fn destination_uses(body: &[Op], indices: &HashMap<&str, usize>) -> Vec<usize> {
                     uses[indices[producer.as_str()]] += 1;
                     pending.extend(arms.iter().map(|arm| arm.body.as_slice()));
                 }
+                Op::HandleResult { arms, .. } | Op::HandleSavedResult { arms, .. } => {
+                    pending.extend(arms.iter().map(|arm| arm.body.as_slice()));
+                }
                 Op::Refill(refill) => {
                     pending.push(&refill.data_body);
                     pending.push(&refill.other_body);
@@ -202,8 +205,18 @@ fn pair_cost(prefix: &[Build], args: &[Argument], child: &[Build], target: &str)
         }
     }
     for arg in args {
-        if let Argument::Scalar(expr) = arg {
-            charge(expr, &mut remaining)?;
+        match arg {
+            Argument::Scalar(expr) => charge(expr, &mut remaining)?,
+            Argument::ByteView { ranges, .. } => {
+                for range in ranges {
+                    remaining = remaining.checked_sub(1)?;
+                    if let Some(offset) = &range.offset {
+                        charge(offset, &mut remaining)?;
+                    }
+                    charge(&range.length, &mut remaining)?;
+                }
+            }
+            Argument::Bytes(_) | Argument::Received(_) => {}
         }
     }
     charge(len, &mut remaining)?;

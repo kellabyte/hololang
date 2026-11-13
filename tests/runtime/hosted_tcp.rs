@@ -59,20 +59,21 @@ func main returns u64 {
             core.assert(false)
         } else status { core.assert(status == 0) }
 
+        let output = core.prefix(buffer.output, 8388608)
         var cursor = 0
         var short_writes = 0
         var blocks = 0
         // Keep backing live and retry the suffix the kernel did not accept.
         loop {
-            if cursor == 8388608 {
+            if cursor == core.len(output) {
                 core.assert(short_writes > 0)
                 core.assert(blocks > 0)
                 core.print(short_writes)
                 core.print(blocks)
                 return 0
             }
-            let remaining = core.sub_wrapping(8388608, cursor)
-            let sent = core.send(stream, buffer.output, cursor, remaining)
+            let remaining = core.sub_wrapping(core.len(output), cursor)
+            let sent = core.send(stream, output, cursor, remaining)
             if sent == 18446744073709551614 {
                 blocks = core.add_wrapping(blocks, 1)
                 let writable = core.wait_output(stream)

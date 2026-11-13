@@ -5,6 +5,7 @@
 //! Temporary `core` APIs remain opt-in rather than permanent language decisions.
 
 pub mod ast;
+mod byte_ranges;
 mod functions;
 mod lower;
 mod modules;

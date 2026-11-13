@@ -1,0 +1,183 @@
+// Parse and write canonical ASCII representations of unsigned 64-bit values.
+// All operations borrow caller storage for the duration of the call.
+
+namespace holo.decimal
+
+public error ParseError {
+    Malformed
+    Overflow
+    NeedTerminator
+}
+
+public error WriteError {
+    ShortBuffer(required u64)
+}
+
+// Parse a complete byte view containing one or more ASCII digits. Zero is
+// written as one digit. Signs, leading zeroes, and whitespace are malformed.
+public func parse_u64
+    with noalloc, noblock
+    arg input Bytes as readonly reference
+    returns Result<u64, ParseError>
+{
+    // 256 cannot match a byte. This selects completion at the end of the view.
+    return scan(input, 256)
+}
+
+// Parse the canonical digit prefix ending at the supplied nondigit ASCII
+// byte. Stop at that byte. Report NeedTerminator on an empty or valid but
+// incomplete prefix. Malformed and Overflow report the first invalid byte.
+public func parse_u64_until
+    with noalloc, noblock
+    arg input Bytes as readonly reference
+    arg terminator u64 as readonly copy
+    returns Result<u64, ParseError>
+{
+    if terminator > 127 {
+        return error ParseError.Malformed
+    }
+    if terminator >= 48 {
+        if terminator <= 57 {
+            return error ParseError.Malformed
+        }
+    }
+    return scan(input, terminator)
+}
+
+// Scan digits left to right, stopping at the requested byte or the end when
+// terminator is 256. Guard each digit before the wrapping multiply and add.
+func scan
+    with noalloc, noblock
+    arg input Bytes as readonly reference
+    arg terminator u64 as readonly copy
+    returns Result<u64, ParseError>
+{
+    let length = core.len(input)
+    var value = 0
+    for index in core.range(length) {
+        let byte = input[index]
+        if byte == terminator {
+            if index == 0 {
+                return error ParseError.Malformed
+            }
+            return ok value
+        }
+        if byte < 48 {
+            return error ParseError.Malformed
+        }
+        if byte > 57 {
+            return error ParseError.Malformed
+        }
+        if index != 0 {
+            if value == 0 {
+                return error ParseError.Malformed
+            }
+        }
+        let digit = core.sub_wrapping(byte, 48)
+        // UINT64_MAX divided by ten has remainder five.
+        if value > 1844674407370955161 {
+            return error ParseError.Overflow
+        }
+        if value == 1844674407370955161 {
+            if digit > 5 {
+                return error ParseError.Overflow
+            }
+        }
+        value = core.add_wrapping(core.mul_wrapping(value, 10), digit)
+    }
+    if terminator != 256 {
+        return error ParseError.NeedTerminator
+    }
+    if length == 0 {
+        return error ParseError.Malformed
+    }
+    return ok value
+}
+
+// Return the number of canonical decimal digits, including one digit for zero.
+public func digit_count
+    with noalloc, noblock
+    arg value u64 as readonly copy
+    returns u64
+{
+    return fit_digits(value, 20)
+        on ok(count) then count
+        on ShortBuffer(required) then required
+}
+
+// Check the entire output extent before writing. Success returns the number
+// of bytes written to its prefix. A short buffer reports the required width
+// and leaves every destination byte untouched.
+public func write_u64
+    with noalloc, noblock
+    arg destination Bytes as readwrite reference
+    arg value u64 as readonly copy
+    returns Result<u64, WriteError>
+{
+    let count = try fit_digits(value, core.len(destination))
+    var remaining = value
+    for index in core.range(count) {
+        // The longest u64 has 20 digits, so the place is at most 10^19.
+        var place = 1
+        let exponent = core.sub_wrapping(core.sub_wrapping(count, index), 1)
+        // Five bits select powers whose product is exactly 10^exponent.
+        if core.and(exponent, 1) != 0 {
+            place = core.mul_wrapping(place, 10)
+        }
+        if core.and(exponent, 2) != 0 {
+            place = core.mul_wrapping(place, 100)
+        }
+        if core.and(exponent, 4) != 0 {
+            place = core.mul_wrapping(place, 10000)
+        }
+        if core.and(exponent, 8) != 0 {
+            place = core.mul_wrapping(place, 100000000)
+        }
+        if core.and(exponent, 16) != 0 {
+            place = core.mul_wrapping(place, 10000000000000000)
+        }
+        // The preceding digit left a remainder below ten times this place.
+        var digit = 0
+        for step in core.range(9) {
+            if remaining >= place {
+                remaining = core.sub_wrapping(remaining, place)
+                digit = core.add_wrapping(digit, 1)
+            }
+        }
+        destination[index] = core.add_wrapping(48, digit)
+    }
+    return ok count
+}
+
+// Return the digit width when it fits in the caller's available extent.
+func fit_digits
+    with noalloc, noblock
+    arg value u64 as readonly copy
+    arg capacity u64 as readonly copy
+    returns Result<u64, WriteError>
+{
+    var threshold = 10
+    for index in core.range(19) {
+        if value < threshold {
+            return fit_count(core.add_wrapping(index, 1), capacity)
+        }
+        // The final threshold is 10^19. It needs no successor.
+        if index != 18 {
+            threshold = core.mul_wrapping(threshold, 10)
+        }
+    }
+    return fit_count(20, capacity)
+}
+
+// Validate a known digit count against the caller's writable extent.
+func fit_count
+    with noalloc, noblock
+    arg count u64 as readonly copy
+    arg capacity u64 as readonly copy
+    returns Result<u64, WriteError>
+{
+    if count > capacity {
+        return error WriteError.ShortBuffer(count)
+    }
+    return ok count
+}

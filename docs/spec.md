@@ -24,8 +24,8 @@ The next executable milestone and comparison plan are in
 The [compiler architecture](compiler.md) describes how checked language facts
 should reach LLVM. Compiler source belongs in [compiler](../compiler/README.md),
 Holo libraries in [lib](../lib/README.md), and application demos in
-[examples](../examples/README.md). See the [evidence index](../evidence/README.md)
-for preserved measurements and correctness records.
+[examples](../examples/README.md). See the [source preview notes](releases/unreleased.md)
+for the reproducible checks included in the public source tree.
 
 ## Contents
 
@@ -657,10 +657,11 @@ The [error-handling proposal](error-handling.md) specifies `return ok value`,
 `on … then` clauses. The experimental compiler implements copied `u64`
 successes, [closed nominal error families](packages.md#typed-error-families)
 with optional `u64` payloads, exact forwarding, scalar `let` propagation with
-`try`, and explicit `on` handling. A family may include another through
-`from ChildFamily as Alias`. `try` propagates the same family or a direct
-child, and `on Alias.Case` selects an included leaf. The destination slice
-implements `return ok Record:` and the same propagation rule in nested fields.
+`try`, and `on` expression or statement arms for ordinary calls. A family may
+include another through `from ChildFamily as Alias`. `try` propagates the same
+family or a direct child, and `on Alias.Case` selects an included leaf. The
+destination slice implements `return ok Record:` and the same propagation rule
+in nested fields.
 Typed `core.append` finalizes publication or rollback before its `on` arm runs.
 Byte-bearing destinations reuse the checked byte-range initialization and
 reservation rules. The experimental package binder supports
@@ -938,7 +939,7 @@ nested rejection after a private write, and retry at the same marker. They check
 both early exits, escaped aliases and byte views, competing ownership, and packed
 byte ownership after input mutation across all three layouts. The fixed-record
 LLVM witness checks the single destination and the absence of a batch or indexed
-lookup. [Scoped result conformance](../evidence/scoped-result-20261111/README.md)
+lookup. [Native scoped result tests](../tests/compiler/frontend/frontend_native.rs)
 
 ##### Compiler-selected backing for one scoped aggregate
 
@@ -1224,7 +1225,8 @@ Experimental grammar/semantics and implementation boundaries:
 - Copied scalar arguments require `u64 as readonly copy`. Record constructors
   also admit `Bytes as readonly reference` from complete live published byte fields
   or forwarded byte parameters. The [ordinary borrowed subset](#synchronous-borrowed-buffer-functions)
-  supports scalar returns, readonly bytes, and writable fixed scalar record state.
+  supports scalar or typed scalar results, bounded readonly or writable byte
+  views, and writable fixed scalar record state.
   Pure scalar templates have
   one pure return, with statically resolved nonrecursive calls; they are boundedly
   inlined. Every entry call argument is captured once left to right, including
@@ -1330,10 +1332,11 @@ The new experimental parameter form is:
 arg input Bytes as readonly reference
 ```
 
-Initially, only a record-returning destination producer may declare it. Its caller
-supplies a complete `Bytes` field reached through a live record reference, such as
-`source.payload.data`, or forwards an existing readonly byte parameter. Scalars
-keep `u64 as readonly copy`; scalar-returning helpers remain scalar-only.
+For destination producers, a caller supplies a live `Bytes` field such as
+`source.payload.data`, a fresh received prefix, or a forwarded readonly byte
+parameter. `core.prefix(input, length)` and `core.subrange(input, offset, length)`
+can narrow any of these inputs. Ordinary synchronous helpers also accept byte
+views through the rules below. Copied scalar parameters retain `u64 as readonly copy`.
 No additional keyword or automatic aggregate-copy operation is needed:
 
 ```holo
@@ -1353,6 +1356,10 @@ must not silently interpret those forms as a clone or ownership transfer.
    it does not copy payload bytes or create a snapshot. Destination resolution
    still precedes producer argument evaluation. Native descriptor representation
    is an implementation choice, not a source-level address or an owned buffer.
+   A view checks its offset and length against the preceding initialized extent
+   before the next view or argument is evaluated. A narrowed input stays narrowed
+   when forwarded. At an entry construction, these checks finish before the
+   producer can reserve or write any destination bytes.
 2. The borrow is synchronous and cannot escape the producer call graph. Nested
    producers may forward it without extending its root's lifetime. Inputs cannot
    be stored in records, returned as references, rebound, reset, resized, converted
@@ -1404,19 +1411,17 @@ must not silently interpret those forms as a clone or ownership transfer.
    Constructors still consume dynamic destination storage and cannot claim strict
    `noalloc`. Neither contract promises freedom from page faults or bounded execution time.
 
-Arbitrary subrange views, standalone byte-view bindings, writable byte parameters,
-byte parameters on scalar helpers, reference-valued fields/returns, foreign raw
-pointers, asynchronous retention, and external input acquisition are outside this
-increment. These are implementation-scope boundaries, not full-language bans.
-They must reject clearly rather than fall back to a heap buffer or another runtime.
+The [framed stream reader](../tests/fixtures/typed_stream_reader.holo) gives
+its constructor only the accumulated prefix and uses `core.len(input)` inside
+the decoder. Reference-valued fields or returns, foreign raw pointers, and
+asynchronous retention remain open.
 
 #### Synchronous borrowed-buffer functions
 
-**Implemented experimental subset, November 10.** The user authorized the
-synchronous borrowed-call implementation after reviewing this design. The
-[reusable chunk-buffer decoder](../benchmarks/telemetry/chunked/README.md)
-now calls an ordinary function. This slice extends ordinary calls beyond pure
-scalar templates and keeps the separate destination-producer restrictions above.
+**Implemented experimental subset.** Ordinary functions can consume a reusable
+chunk buffer and update caller-owned state. This slice extends ordinary calls
+beyond pure scalar templates and keeps the separate destination-producer
+restrictions above. [Hosted telemetry worker](../tests/fixtures/telemetry_worker/README.md)
 
 The existing header modes express mutable fixed state and borrowed bytes.
 The [runnable buffer example](../tests/fixtures/borrowed_buffer.holo) exercises the
@@ -1469,16 +1474,35 @@ checksum, and running totals. Each call consumes the supplied logical extent.
 An empty chunk preserves framing state. The caller observes end-of-input after
 the last chunk and reports any incomplete frame separately.
 
+`core.subrange(bytes, offset, length)` lends a view to a synchronous call. The
+offset is relative to the input view, so subranges compose with `core.prefix`.
+Each narrowing captures its source, evaluates its bounds once in order, and
+validates the range before continuing to the next actual. A subrange checks
+`offset <= extent` and `length <= extent - offset`. An empty range at the end
+is valid. An invalid range takes the ordinary bounds trap.
+
+An ordinary `Bytes as readwrite reference` formal accepts a published byte
+field reached through a writable path or a forwarded writable byte formal.
+Prefix and subrange expressions preserve that authority. A readonly formal
+and the received extent of a refill grant only read access. Indexed assignment
+changes one existing byte, checks its index before evaluating the replacement,
+and keeps the low eight bits. The byte extent and its lifetime stay fixed.
+`holo.bytes.move` copies the full source into a destination prefix of the
+same length and works when the views overlap. A short destination traps before
+any payload access. [Byte library](../lib/holo/README.md)
+
 The experimental subset has these rules and scope boundaries.
 
 1. Admit fixed scalar-only record state by `readwrite reference` and initialized
-   bytes by `readonly reference`. The state is already owned by the caller.
-   Calls update that storage directly. Plain copied scalars keep their current
+   byte views by `readonly reference` or `readwrite reference`. The state is
+   already owned by the caller. Calls update that storage directly. Ordinary
+   helpers can return `u64`, `bool`, `Option<u64>`, or `Result<u64, E>`.
+   Plain copied scalars keep their current
    capture rules. General aggregate locals and aggregate returns from this new
    mutable-call category, reference-containing state, recursive calls, callbacks,
    and foreign effects remain later design work. Existing destination-producing
    record returns retain their implemented rules.
-2. Capture actual arguments once in written left-to-right order. A prefix extent
+2. Capture actual arguments once in written left-to-right order. A range bounds
    failure traps before entering this callee and before its state writes. Nested
    helpers receive only the captured extent and checked originating root. A wider
    outer initialized field must not be substituted for a narrower forwarded prefix.
@@ -1506,8 +1530,8 @@ The experimental subset has these rules and scope boundaries.
    must not widen the producer graph's effects or change its failure ordering.
 7. Calls add no transactional rollback. A decoder may update provisional parser
    state while waiting for more bytes, and publish a record tally only at a
-   complete-frame boundary. General error returns and EOF result types need their
-   own design decision. Existing bounds violations retain the accepted target-trap
+   complete-frame boundary. A typed failure leaves any writes already performed
+   visible to the caller. Existing bounds violations retain the accepted target-trap
    behavior and supply no recoverable-state or cleanup promise.
 
 Acceptance cases for a first implementation must cover the following.
@@ -1524,12 +1548,185 @@ Acceptance cases for a first implementation must cover the following.
 | Stateful decoder split after each byte, rejected body drain, partial EOF, and immediate slot poisoning | Match the independent framing oracle and existing reusable fixtures. |
 | Unknown callee reachable from a constrained function | Leave effects unestablished and reject the unsupported contract. |
 
-Source functions enter this subset when a scalar-returning header declares a
-supported reference parameter. Its checked bodies admit scalar locals and
-returns, fixed state writes, branches, counted ranges, assertions, and direct
-closed calls. Compiler-level declarations use a checked separate call graph.
+Source functions enter this subset when an ordinary scalar or scalar-result
+header declares a supported reference parameter. Its checked bodies admit
+scalar locals, returns, fixed state and byte parameter writes, branches, counted
+ranges, assertions, and direct closed calls. Compiler-level declarations use a
+checked separate call graph.
 Stable slice spelling, exported lifetime and effect summaries, ABI, asynchronous
 retention, and reference-return syntax remain open for the full language.
+
+#### Named byte views
+
+Entry code and ordinary helpers can bind a checked byte view with `let`.
+The source can be an initialized field, a byte parameter, a live received
+prefix, a byte string literal, or an earlier view. `core.prefix` and
+`core.subrange` use the source's current logical extent, so a second
+narrowing stays within the first.
+
+```holo
+let input = core.prefix(pending.wire, filled)
+let key = core.subrange(input, key_offset, key_length)
+store.find(entries, key)
+    on Some(index) then { core.print(index) }
+    on None then { core.print("missing") }
+```
+
+The binding captures the byte address and length once, after evaluating and
+checking the bounds in written order. `core.len(key)` reads that length and
+`key[index]` checks it before reading a byte. The view can be passed directly
+to a readonly ordinary or constructor parameter. A later rebinding of the
+source record reference does not redirect the view. Writes through another
+compatible alias remain visible.
+
+Plain `let` creates a readonly view. Use `let readwrite` to request writable
+access through a writable field, byte parameter, or earlier writable view.
+An indexed store checks the index before evaluating the replacement and writes
+its low eight bits. A writable view can also be lent to an ordinary helper
+with a writable `Bytes` parameter. Creating a readonly view from a writable
+source limits access through that view.
+
+```holo
+let readwrite output = core.prefix(reply.wire, capacity)
+output[0] = 36
+let readwrite digits = core.subrange(output, 1, 3)
+decimal.write_u64(digits, length)
+    on ok(_) then {}
+    on ShortBuffer(_) then { core.assert(false) }
+```
+
+The view's address, extent, and access stay fixed for its lexical scope.
+The checker rejects attempts to reassign or return a view, store it in a
+record, or reset its backing batch while the view is live. A view derived
+from a refill is readonly and stays within the refill's data branch. The
+same refill and session restrictions apply to it.
+
+#### Byte string literals
+
+A byte string literal such as `b"+OK\r\n"` is a readonly view of static bytes.
+Its extent is the exact number of bytes written by the literal, including
+embedded zero bytes. `b""` has extent zero. Literal storage requires no
+runtime allocation. A literal can initialize a readonly view or be passed
+directly to a readonly `Bytes` argument or to `core.send`. It supports
+`core.len` and bounds-checked indexing.
+
+Write printable ASCII directly. Escape a quote or backslash as `\"` or
+`\\`, and use `\n`, `\r`, `\t`, or `\0` for newline, carriage return, tab,
+or zero. Use `\xHH` with two hexadecimal digits for any octet, including
+octets above ASCII. To put a literal's bytes in writable storage, copy it
+with `bytes.move` or `write.put_bytes`.
+
+```holo
+let reply = b"+OK\r\n"
+core.assert(core.len(reply) == 5)
+core.assert(reply[3] == 13)
+```
+
+#### Saved scalar results
+
+An ordinary call returning `Result<u64, E>` can initialize an immutable
+`let`. The call runs once when the binding is declared. A later `on` handler
+selects the stored success or error case, and the selected arm can bind its
+original payload. The same local can be handled more than once. The copied
+outcome does not retain references from the call.
+
+A helper with the same result type can forward the complete outcome with
+`return outcome`. The return uses the saved tag and payload. Both the
+success type and the declared error family must match exactly. To propagate
+a declared child error family into its parent, use `try` on the call or a
+saved result. The saved form uses the captured case and payload after any
+intervening work.
+[Result example](error-handling.md#compose-a-result-from-several-services)
+
+#### Optional scalar returns
+
+An ordinary helper can declare `returns Option<u64>` when a value may be
+absent. Return `Some(value)` with any `u64`, return `None`, or forward a call
+or saved local of type `Option<u64>`. A caller handles both cases with `on Some(value)`
+and `on None`. Each arm may contain a block. When used as an expression,
+the arms produce a scalar under the same rules as a `Result` handler.
+The payload belongs to the `Some` arm and can be discarded with `Some(_)`.
+The subject call runs once and only its selected arm runs.
+
+A caller can also save an optional call result in an immutable local. The
+initializer runs once, and handling the saved value can happen more than once.
+The local holds a copied tag and payload, so it can outlive the call's input
+borrows within its lexical scope.
+
+```holo
+let match_index = store.find(entries, key)
+match_index
+    on Some(index) then { core.print(index) }
+    on None then { core.print("missing") }
+```
+
+#### Boolean parameters, returns, and conditions
+
+An ordinary function can declare `returns bool`. It can return `true`,
+`false`, a comparison of `u64` values, a boolean local, or another boolean
+call. A caller can test a boolean call directly in `if` or `core.assert`, or
+save its value with immutable `let`. The initializer runs once. Conditions
+require booleans, and numeric expressions require `u64`.
+
+An ordinary function can take a boolean with `arg enabled bool as readonly copy`.
+The caller evaluates the argument in written order with the other arguments.
+The callee receives an immutable boolean that it can test, return, or forward.
+
+Combine boolean expressions with `and`, `or`, and `not`. Comparisons bind
+more tightly than `not`, followed by `and`, then `or`. Evaluation proceeds
+left to right. `and` evaluates its right operand only if the left is true,
+and `or` evaluates its right operand only if the left is false. Both operands
+are checked at compile time. Write a space after `not` before a parenthesized
+operand, as in `not (first or second)`. Constructor rejection guards can
+combine literals and comparisons over the constructor's admitted inputs
+with the same operators.
+
+```holo
+func starts_with_cr
+    arg input Bytes as readonly reference
+    returns bool
+{
+    return core.len(input) > 0 and input[0] == 13
+}
+```
+
+Use `if starts_with_cr(input) { ... }` to branch immediately, or bind
+`let has_cr = starts_with_cr(input)` and test `has_cr` later. An empty view
+returns false without reading a byte.
+
+```holo
+func should_skip_cr
+    arg skip_cr bool as readonly copy
+    arg input Bytes as readonly reference
+    returns bool
+{
+    return skip_cr and starts_with_cr(input)
+}
+```
+
+#### Synchronous borrowed batches
+
+An ordinary helper can take `Batch<Slot> as readonly reference` or
+`Batch<Slot> as readwrite reference`. `Slot` is the exact nominal record schema,
+including when it resolves through a package qualifier. The caller supplies a
+named live batch or forwards an existing batch parameter. The call captures
+the published records at that point in argument order. The callee can read the
+captured count with `core.len`, borrow a record by checked index, and traverse
+the prefix with `for readonly` or `for readwrite` as its access permits.
+
+The caller retains tail ownership. A helper can update existing scalar fields
+and initialized payload bytes through a writable element reference. It cannot
+append, reset, grow, or return a batch or a reference into it. Forwarding may
+reduce permissions and preserves the captured count and extent. The borrow
+ends on return, including typed failure. Ordinary writes performed before a
+failure remain visible. Compatible aliases may refer to the same records, so
+readonly paths and distinct parameters supply no uniqueness guarantee.
+
+The native call passes a pointer, published byte extent, and record count.
+It copies no records and allocates no backing. Traversal uses the existing
+layout rules and checks. Indexed access retains the existing traversal cost
+for variable-sized layouts. The [RESP2 store](../examples/redis_server/src/store.holo)
+uses these calls to search a fixed table and replace existing slot contents.
 
 #### Synchronous file and stream refill
 
@@ -1547,9 +1744,8 @@ passed directly to a checked readonly `Bytes` parameter of an ordinary helper
 or a destination producer in `core.append`. The view expires at the end of the
 data branch. A producer can forward that same extent through readonly `Bytes`
 formals. This source experiment accepts `loop {` on one line in the
-entry function. The [earlier checked-IR experiment](../evidence/checked-refill-20261110/README.md)
-preserves the prototype evidence. General Holo-owned handles and the public
-outcome and branch syntax are open.
+entry function. General Holo-owned handles and the public outcome and branch
+syntax are open. [Hosted refill tests](../tests/runtime/hosted_refill.rs)
 
 The proposed operation takes a source handle, a live writable projection of the
 slot, and a positive request bound. The following is a sketch of the outcomes
@@ -1566,7 +1762,13 @@ match refill(reader, slot.wire, limit) {
 }
 ```
 
-The driver evaluates the handle, slot, and limit once in written order. It
+The implemented entry accepts a writable `Bytes` field or a named writable
+byte view as the refill destination. With a view, the native read starts at
+the captured offset and uses the view's extent. The data arm receives a readonly
+prefix of the bytes actually read. Redis fills the unused tail of its pending
+buffer and advances its live length by `core.len(chunk)`.
+
+The driver evaluates the handle, destination, and limit once in written order. It
 requires `0 < limit <= initialized_extent` and checks representability under the
 target's native request bound before entering the adapter. A dynamic violation
 uses the existing bounds trap. The positive bound ensures a successful zero
@@ -1585,7 +1787,7 @@ result outside the adapter's contract traps before any prefix is published.
 
 | Native outcome | Driver outcome and decoder action |
 |---|---|
-| `0 < n <= limit` | `Data` binds exactly `[0, n)` in the slot. A short result is valid data and may split a frame anywhere. |
+| `0 < n <= limit` | `Data` binds exactly `[0, n)` relative to the destination. A short result is valid data and may split a frame anywhere. |
 | Zero on a positive request | `End` exposes no bytes. It observes EOF at the current file position or the peer's orderly end of input after queued stream bytes. The caller finalizes this decoding session once. |
 | Failure with `EINTR` | `Interrupted` exposes no bytes. The caller chooses whether to retry. A positive native result goes through `Data`, even if shorter than requested. |
 | Failure with `EAGAIN` or `EWOULDBLOCK` on a supported nonblocking stream | `WouldBlock` exposes no bytes. The caller retains parser state and chooses when to try again. Admitted sockets have receive timeouts disabled, since Darwin can use `EAGAIN` for receive timeout too. |
@@ -1597,8 +1799,9 @@ is fixed for that scope, and forwarding it preserves the same checked root and
 extent. A saved count from an earlier attempt cannot create a received view for
 a later attempt, even if the counts match. Ordinary `core.prefix` can still view
 initialized storage. The slot can be refilled again after the scope ends. The
-checker rejects refill, reset, or owner release while a received view is usable,
-including through another projection of the same storage. It also rejects
+checker rejects reset or owner release while a received view is usable. It
+also rejects another refill through the same batch and field path, even
+through a narrower view, because those ranges can overlap. It rejects
 attempts to return or store the view. Ordinary initialized-byte aliases retain
 M1-R1 access semantics. The `Data` binding establishes extent and leaves bytes
 subject to writes through compatible aliases.
@@ -1640,20 +1843,22 @@ requirements.
 
 #### Synchronous stream output and loopback sessions
 
-The experimental hosted entry admits `let sent = core.send(record.bytes, offset, count)`
-and `let ready = core.wait_output()`. Send captures the address and initialized
-extent of a live `Bytes` field before evaluating offset and count once in
-written order. A readonly reference suffices. It checks that offset is within
-the extent and that count is positive, fits the remaining suffix, and fits the
-native signed-int request cap. A dynamic range violation traps before forming
+The experimental hosted entry admits `let sent = core.send(source, offset, count)`
+and `let ready = core.wait_output()`. The source can be a live `Bytes` field,
+a named byte view, or a byte string literal. Send captures its address and
+logical extent before evaluating offset and count once in written order. Both operands are relative
+to that source, so a view limits the send to its captured range. The offset
+must be within the extent. The count must be positive and fit both the
+remaining suffix and the native signed-int request cap. A range violation traps before forming
 the subrange pointer. The adapter makes one native send from that range and
 retains no pointer or descriptor.
 
 The immutable send status reports the exact positive number accepted by the
 socket, including a short send. The caller retains the source for any later
-attempt and advances only by the reported progress. Interruption is
-`u64::MAX`, would-block is `u64::MAX - 1`, and other errors are bit 63 OR-ed
-with positive native errno. The adapter rejects a zero result on a positive
+attempt and advances only by the reported progress. Redis names a view of
+the finished reply and uses its sent count as the offset for each attempt.
+Interruption is `u64::MAX` and would-block is `u64::MAX - 1`. Other errors
+set bit 63 on a positive native errno. The adapter rejects a zero result on a positive
 send. `core.wait_output()` performs an explicit writable wait that can block.
 Its zero result permits another attempt, including after a hangup or an error
 event. Either output operation reports tagged `ENOTSOCK` in file mode.
@@ -2200,14 +2405,12 @@ free-form prose. A formatter and a small canonical grammar are part of this work
 **Experimental tooling status, November 10:** the Rust compiler library now
 provides lossless source ranges, lexical highlight categories and syntax-preserving
 formatting. `holo highlight` adds optional terminal headers, line numbers/frame and
-CSS-like style overrides; `holo fmt` shares its engine with the VS Code formatting
-provider. Formatting preserves identifiers and exact non-whitespace token/comment
+CSS-like style overrides. Formatting preserves identifiers and exact non-whitespace token/comment
 spelling, reparses output, and checks syntax structure without spans. It applies
 four-space indentation and the existing vertical-header working layout to the
 current experimental grammar. Formatting has no line-width reflow and
 validates syntax alone. Naming advisories run on the compilation path.
-See [architecture](compiler.md#host-source-tools)
-and [editor integration](../editors/vscode/README.md).
+See the [source tool architecture](compiler.md#host-source-tools).
 
 The current header may improve comprehension, but that is a hypothesis to test.
 More explicit text also has token and familiarity costs. Grammar-aware generation
@@ -2281,28 +2484,25 @@ are linked from [the source guide](../compiler/src/README.md) and [M1 plan](impl
 | Bulk release | Scope/reset paths restore fixed markers without record walks. The ten-shape one-marker matrix validates release/reuse at O0/O2; the [cleanup-path audit](implementation-plan.md#generated-cleanup-path-acceptance--november-9) adds original/optimized/native explicit reset, rollback, multi-owner exits and acquisition recovery, with 252 native and 45 independent model outcomes. Native checkpoint/spill work, eliminated private stores, construction-inclusive failure windows and allocator frees are distinguished. The retained-backing diagnostic observes unchanged resident pages across all 384 full/reset pairs. Physical latency, helper-effect contracts, pressure/trim policies and general commitment remain separate limits. |
 | Compact metadata / relative links | Explicit header-derived u64 and compact u32 byte-length modes are implemented through checked schema planning and one backend. Native/model tests cover zero/max/over-width, rollback, complex retained headers, and empty units. Relative links, general narrow scalars, alignment alternatives, and automatic width inference remain deferred. |
 | Tagged alternatives | Deferred beyond this plain-data slice. |
-| Static abstractions / optimized checks | Statically resolved constructor calls and LLVM O3. The [macOS arm64 byte-sum lowering](../evidence/outlined-byte-sum-20261110/README.md) proves exact bounds for a full-span wrapping reduction and replaces per-byte checks with checked-width loads in a separate native function. Eligible [tiny literal prefixes](../evidence/static-tiny-byte-sum-adoption-20261110/README.md) select exact-width reductions after argument capture and validation. The [macOS arm64 Derived64 default](../evidence/exact-192-default-20261112/README.md) admits the checked exact 192-byte prefix to its existing wide helper. General generics, source callbacks, checkfree contracts, and target multiversioning are pending. |
+| Static abstractions / optimized checks | Statically resolved constructor calls and LLVM O3. The macOS arm64 byte-sum lowering proves exact bounds for a full-span wrapping reduction and replaces per-byte checks with checked-width loads in a separate native function. Eligible tiny literal prefixes select exact-width reductions after argument capture and validation. The macOS arm64 Derived64 default admits the checked exact 192-byte prefix to its existing wide helper. General generics, source callbacks, checkfree contracts, and target multiversioning are pending. [Native byte-sum tests](../tests/compiler/backend/byte_sum_native.rs) |
 | Failure paths | Small construction statuses and append rollback tested at field boundaries. Experimental acquisition handlers can now finish their failed owner block and resume an enclosing continuation, with explicit retry and exact cleanup checked at O0/O3/ASan. The [ordinary sequence campaign](implementation-plan.md#ordinary-construction-failure-and-retry-costs--november-9) covers actual attempt/conditional-retry/consumption without output barriers, all layouts and nested calls. Its costs include caller accounting and successful construction; isolated rollback/error bounds, general errors/unwinding, owned-error payloads and streaming-byte failures remain outside the evidence. |
 | Messages / images / pools | Deferred; internal flatness does not establish queue eligibility, validated serialization, or stable-handle semantics. |
 
-The [first matched lifecycle campaign](../evidence/lifecycle-comparison-20261109/report.md)
-and [generated-code/stability review](../evidence/lifecycle-comparison-20261109/generated-review.md)
-support these scoped observations. All 270 native samples validate, but working-set
-timing drift, different trust/check boundaries and backing policies, and Rust's
-different LLVM version limit conclusions. Holo's matched-Rust gap is inconclusive;
-Goose is consistently faster in this local workload. Neither outcome settles
-overall language performance, automatic storage assignment, or unimplemented
-mechanisms. The later [finite M1 acceptance](implementation-plan.md#m1-acceptance-decision--november-10)
-distinguishes demonstrated cases and the reviewed native profile from measurement
-limits and deferred features. It does not update these historical timings or
-establish overall language performance.
+All 270 native samples in the first matched lifecycle campaign passed their
+correctness checks. Working-set timing drift, different trust and checking
+boundaries and backing policies, and Rust's different LLVM version limited the
+comparison. The gap between Holo and matched Rust was inconclusive. Goose was
+consistently faster in that local workload. Conclusions were limited to the
+measured profiles. The later acceptance review distinguishes demonstrated
+cases and the reviewed native profile from measurement limits and deferred
+features. [Finite M1 acceptance](implementation-plan.md#m1-acceptance-decision--november-10)
 
-The later [phase campaign](../evidence/lifecycle-phases-20261109/report.md) adds900
-validated measurements with unchanged combined controls and separate diagnostic
-clocks. These diagnostics point to construction for the remaining local Goose gap;
-scan costs are close. Its scope-exit windows remain unresolved: clocks can dominate and private
-marker updates can move or disappear. This neither changes the baseline guarantees
-nor completes isolated reset scaling or dynamic memory-accounting acceptance.
+The later phase campaign added 900 validated measurements with unchanged
+combined controls and separate diagnostic clocks. Construction accounted for
+most of the remaining local Goose gap, while scan costs were close. The
+scope-exit windows remained unresolved because clocks can dominate and private
+marker updates can move or disappear. Isolated reset scaling and dynamic memory
+accounting still required separate validation. [Construction and scan phase diagnostics](implementation-plan.md#constructionscan-phase-diagnostics--november-9)
 
 The later [populated scoped-release matrix](implementation-plan.md#populated-scoped-release-scaling--november-9)
 adds real count/payload/inline-depth variation and actual reuse under one owner,
@@ -2383,11 +2583,11 @@ not a public annotation, uniqueness claim, layout rule or new performance contra
 Its default lifecycle paired costs improve about 3% across the three tested sizes,
 while full-copy intervals cross zero and ten native copy pairs are unchanged.
 The vector-only alternative is not adopted: original scalar source and exact
-prefix stores do not guarantee identical or faster native tails. Both independent
-full matrices and screenings retain 11,512 measurements and 752 preflights in the
-[record](../evidence/construction-followup-20261110/README.md), with final rebuilt
-validation separately established. The Goose mechanism ledger and deferred
-sharing, queues/images, pools, backing and asynchronous features are unchanged.
+prefix stores do not guarantee identical or faster native tails. The two
+independent matrices and screenings included 11,512 measurements and 752
+preflights. Final rebuilt validation was separate. The Goose mechanism ledger
+and deferred sharing, queues/images, pools, backing and asynchronous features
+are unchanged.
 
 The subsequent [retained-binary profile](implementation-plan.md#retained-binary-cpu-attribution--november-9)
 adds exact-PC sampling of the production and rejected byte-width outputs. Its 36

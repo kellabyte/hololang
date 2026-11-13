@@ -11,7 +11,7 @@
 mod hosted_stream;
 
 use holo::driver::{NativeToolchain, TempDir};
-use holo::frontend::parse_experimental;
+use holo::frontend::{parse_experimental, parse_experimental_project};
 use holo::layout::LayoutMode;
 use hosted_stream::read_stream;
 use std::fs;
@@ -20,6 +20,7 @@ use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
+use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -44,6 +45,44 @@ func main returns u64 {
 }
 "#;
 
+/// A short read into a named window exposes only its fresh bytes. The
+/// initialized bytes before and after that write keep their original values.
+#[test]
+fn hosted_refill_writes_directly_into_a_named_view() {
+    let source = SOURCE.replace(
+        "    refill buffer.wire, 2 as input { core.print(extent(input)) } else status { core.print(status) }",
+        r#"    let readwrite tail = core.subrange(buffer.wire, 1, 2)
+    refill tail, core.len(tail) as input {
+        core.print(extent(input))
+        let fresh = core.prefix(input, core.len(input))
+        core.print(fresh[0])
+    } else status { core.print(status) }
+    core.print(buffer.wire[0])
+    core.print(buffer.wire[1])
+    core.print(buffer.wire[2])
+    core.print(buffer.wire[3])"#,
+    );
+    let tools = NativeToolchain::discover().unwrap();
+    let scratch = TempDir::new().unwrap();
+    let binary = scratch.path().join("refill-view");
+    tools.build(&llvm(&source, &tools), &binary, true).unwrap();
+    let output = read_stream(&binary, &[42], true);
+    assert_eq!(output.stdout, b"1\n42\n99\n42\n99\n99\n");
+
+    // A limit that fits the field but exceeds the view traps before any read.
+    let invalid = source.replace("refill tail, core.len(tail)", "refill tail, 3");
+    let binary = scratch.path().join("refill-outside-view");
+    tools.build(&llvm(&invalid, &tools), &binary, true).unwrap();
+    let file = scratch.path().join("file");
+    fs::write(&file, [42]).unwrap();
+    let output = Command::new(&binary)
+        .arg("file")
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert_trap(&output);
+}
+
 /// A live readonly payload and explicit suffix bound for one hosted send.
 const SEND_SOURCE: &str = r#"
 // Store the wire bytes inline, including zero and a byte outside ASCII.
@@ -66,6 +105,16 @@ func main returns u64 {
     return 0
 }
 "#;
+
+/// Use a view that starts inside the field and ends before its initialized tail.
+fn named_send_source(offset: &str, count: &str) -> String {
+    SEND_SOURCE.replace(
+        "let sent = core.send(prepared.wire, 1, 3)",
+        &format!(
+            "let wire = core.subrange(prepared.wire, 1, 3)\n    let sent = core.send(wire, {offset}, {count})"
+        ),
+    )
+}
 
 /// Test two successive clients, preserving ordinary Holo state and resetting
 /// the receive capability at each iteration of the explicit session loop.
@@ -122,6 +171,77 @@ fn assert_trap(output: &Output) {
     let signal = if cfg!(target_arch = "aarch64") { 5 } else { 4 };
     assert_eq!(output.status.signal(), Some(signal), "{output:?}");
     assert!(output.stdout.is_empty(), "{output:?}");
+}
+
+/// Check the shipped bounded-buffer helpers against an exact borrowed view.
+/// Compaction keeps the unread tail, and invalid cursors or a full append trap.
+#[test]
+fn byte_buffer_handles_overlap_and_rejects_invalid_bounds() {
+    let tools = NativeToolchain::discover().unwrap();
+    let scratch = TempDir::new().unwrap();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let entry = scratch.path().join("buffer.holo");
+    let library = root.join("lib/holo");
+    let source = r#"
+using holo.buffer
+
+struct Slot { data Bytes }
+func slot with noblock returns Slot {
+    return Slot { data: core.bytes(6, core.index()) }
+}
+
+func main returns u64 {
+    let memory = core.region(128) else { core.assert(false); return 0 }
+    let slots = core.batch(memory, Slot)
+    let status = core.append(slots, slot())
+    core.assert(status == 0)
+    let slot = core.borrow_readwrite(slots, 0)
+    @BODY@
+    return 0
+}
+"#;
+    let append_and_compact = r#"
+    let filled = buffer.append(slot.data, 1, core.subrange(slot.data, 2, 3))
+    core.assert(filled == 4)
+    core.assert(buffer.space(slot.data, filled) == 2)
+    let unread = buffer.compact(slot.data, 2, filled)
+    core.assert(unread == 2)
+    core.assert(slot.data[0] == 3)
+    core.assert(slot.data[1] == 4)
+    core.assert(slot.data[5] == 5)
+    let unchanged = buffer.append(slot.data, 6, core.subrange(slot.data, 6, 0))
+    core.assert(unchanged == 6)
+    core.assert(buffer.compact(slot.data, unread, unread) == 0)
+    core.assert(slot.data[0] == 3)
+"#;
+    for (name, body, traps) in [
+        ("append-and-compact", append_and_compact, false),
+        (
+            "full-append",
+            "core.print(buffer.append(slot.data, 6, core.prefix(slot.data, 1)))",
+            true,
+        ),
+        (
+            "invalid-cursor",
+            "core.print(buffer.compact(slot.data, 4, 3))",
+            true,
+        ),
+    ] {
+        let source = source.replace("@BODY@", body);
+        let project = parse_experimental_project(&entry, &source, &library).unwrap();
+        let checked = project.program().check().unwrap();
+        let ir = holo::llvm::emit(&checked, tools.target_triple());
+        for optimized in [false, true] {
+            let binary = scratch.path().join(format!("{name}-{optimized}"));
+            tools.build(&ir, &binary, optimized).unwrap();
+            let output = Command::new(&binary).output().unwrap();
+            if traps {
+                assert_trap(&output);
+            } else {
+                assert!(output.status.success(), "{output:?}");
+            }
+        }
+    }
 }
 
 /// Compile the real adapter against deterministic syscall witnesses. Both the
@@ -292,13 +412,53 @@ fn hosted_send_writes_exact_suffix_at_native_boundary() {
     }
 }
 
+/// A named view and a literal send only their own suffixes. Invalid counts
+/// trap before reaching the file or socket adapter.
+#[test]
+fn hosted_send_uses_named_view_and_literal_extents() {
+    let tools = NativeToolchain::discover().unwrap();
+    let scratch = TempDir::new().unwrap();
+    let literal_source = |operands| SEND_SOURCE.replace("prepared.wire, 1, 3", operands);
+    for (name, source) in [
+        ("send-view", named_send_source("1", "2")),
+        ("send-literal", literal_source(r#"b"\xFF\0\x01", 1, 2"#)),
+    ] {
+        let binary = scratch.path().join(name);
+        tools.build(&llvm(&source, &tools), &binary, true).unwrap();
+        let (output, payload) = receive_sent_bytes(&binary);
+        assert_eq!(output.stdout, b"0\n2\n");
+        assert_eq!(payload, [0, 1]);
+    }
+
+    let file = scratch.path().join("file");
+    fs::write(&file, [42]).unwrap();
+    for (name, source) in [
+        ("send-outside-view", named_send_source("1", "3")),
+        ("send-outside-literal", literal_source(r#"b"abc", 1, 3"#)),
+        ("send-empty-literal", literal_source(r#"b"", 0, 1"#)),
+        ("send-zero-count", literal_source(r#"b"", 0, 0"#)),
+    ] {
+        let invalid = scratch.path().join(name);
+        tools.build(&llvm(&source, &tools), &invalid, true).unwrap();
+        let result = Command::new(&invalid)
+            .arg("file")
+            .arg(&file)
+            .output()
+            .unwrap();
+        assert_trap(&result);
+    }
+}
+
 /// Invalid source shape or an unsupported owner is rejected before emission.
 /// A checked field still needs the runtime range guard for all scalar operands.
 #[test]
 fn hosted_send_rejects_unchecked_source_and_ranges() {
     // Neither an unsigned scalar nor a mutable status may bypass source checking.
     for (source, reason) in [
-        (SEND_SOURCE.replace("prepared.wire, 1, 3", "3, 1, 3"), "binding name"),
+        (
+            SEND_SOURCE.replace("prepared.wire, 1, 3", "3, 1, 3"),
+            "initialized Bytes field, a named byte view, or a byte string literal",
+        ),
         (SEND_SOURCE.replace("let sent =", "var sent ="), "with let"),
         (
             "func invalid with noblock arg bytes Bytes as readonly reference returns u64 { let wait = core.wait_output(); return wait }\nfunc main returns u64 { return 0 }".into(),
@@ -817,8 +977,10 @@ fn typed_stream_reader_assembles_frames_across_refills() {
     let tools = NativeToolchain::discover().unwrap();
     let scratch = TempDir::new().unwrap();
     let source = include_str!("../fixtures/typed_stream_reader.holo");
-    let parsed = parse_experimental(source).unwrap();
-    let checked = parsed.check().unwrap();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let entry = root.join("tests/fixtures/typed_stream_reader.holo");
+    let project = parse_experimental_project(&entry, source, &root.join("lib/holo")).unwrap();
+    let checked = project.program().check().unwrap();
     // A frame prints sequence and payload sum. The last three lines are the
     // terminal status, published frame count and partial frame's required extent.
     let cases: &[(&[u8], &[u8])] = &[

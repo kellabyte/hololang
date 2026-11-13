@@ -15,10 +15,13 @@ pub(super) fn lower(module: &ast::Module) -> Result<Vec<ir::Record>, Diagnostic>
     let mut records = HashMap::new();
     // Builtin type identities cannot be shadowed, because fields use their fixed scalar meanings.
     for record in &module.records {
-        if matches!(record.name.as_str(), "u64" | "Bytes") {
+        if matches!(record.name.as_str(), "u64" | "bool" | "Bytes") {
             return Err(Diagnostic::new(
                 record.span,
-                "a struct cannot redefine the builtin `u64` or `Bytes` type",
+                format!(
+                    "a struct cannot redefine the builtin `{}` type",
+                    record.name
+                ),
             ));
         }
         if records.insert(record.name.as_str(), record).is_some() {

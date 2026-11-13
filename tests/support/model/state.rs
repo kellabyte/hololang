@@ -10,20 +10,40 @@ use super::ordinary::Outcome;
 use super::value::Record;
 use holo::ir::{Access, Op, Program};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// One lexical binding with its independent semantic value.
 #[derive(Clone, Debug)]
 pub(super) enum Binding {
     /// An unsigned scalar, including copied status/address observations.
     Scalar(u64),
+    /// An immutable boolean value.
+    Boolean(bool),
+    /// A saved ordinary outcome, retaining its semantic alternative and payload.
+    SavedResult(Outcome),
     /// An arm-local named error cannot supply a scalar or a storage reference.
     Error,
     /// Index into the model's owned region table.
     Region(usize),
     /// Index into the model's owned batch table.
     Batch(usize),
+    /// Captured published prefix lent to an ordinary call.
+    BorrowedBatch(BatchView),
+    /// A byte view with a captured origin, logical extent, and access permission.
+    ByteView(ByteInput),
     /// Rooted record identity and path access permission.
     Reference(Reference),
+}
+
+/// Batch identity, published count, and access captured at an ordinary call.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct BatchView {
+    /// Active generation owning the existing records.
+    pub batch: usize,
+    /// Number of published records the callee can observe.
+    pub count: usize,
+    /// Permission to access fields in the borrowed prefix.
+    pub access: Access,
 }
 
 /// A checked semantic reference, independent of native backing addresses.
@@ -37,20 +57,33 @@ pub(super) struct Reference {
     pub access: Access,
 }
 
-/// One captured byte borrow into already-published semantic model storage.
-///
-/// This is a stable logical identity and extent, not a clone of source bytes or
-/// a Rust/native pointer. Forwarding it clones only the bounded field path.
+/// Storage identity of an immutable literal or captured published byte field.
+#[derive(Clone, Debug)]
+pub(super) enum ByteOrigin {
+    /// Shared literal contents independent of any region.
+    Literal(Arc<[u8]>),
+    /// Stable logical address within a live published batch.
+    Field {
+        /// Exact batch generation owning the initialized source record.
+        batch: usize,
+        /// Published source record within that batch, stable across later appends.
+        index: usize,
+        /// Nested logical field path ending at the borrowed Bytes payload.
+        path: Vec<String>,
+    },
+}
+
+/// One captured byte borrow into literal or published semantic model storage.
 #[derive(Clone, Debug)]
 pub(super) struct ByteInput {
-    /// Exact batch lifetime/generation owning the initialized source record.
-    pub batch: usize,
-    /// Published source record within that batch, stable across later appends.
-    pub index: usize,
-    /// Nested logical field path ending at the borrowed Bytes payload.
-    pub path: Vec<String>,
-    /// Extent captured at call-argument evaluation, never a payload snapshot.
+    /// Storage retained even when the source name is rebound or hidden.
+    pub origin: ByteOrigin,
+    /// First byte relative to the underlying literal or field.
+    pub offset: u64,
+    /// Extent captured when binding or lending the view.
     pub len: u64,
+    /// Permission granted through this view.
+    pub access: Access,
 }
 
 /// One evaluated typed argument in a synchronous model producer call frame.
@@ -242,6 +275,15 @@ impl<'a> State<'a> {
         }
     }
 
+    /// Resolve a named byte view and check that its original storage is live.
+    pub fn byte_view(&self, name: &str) -> Result<ByteInput, ModelError> {
+        let Binding::ByteView(input) = self.binding(name)? else {
+            return Err(ModelError::new(format!("{name} is not a local byte view")));
+        };
+        self.input_bytes(&input)?;
+        Ok(input)
+    }
+
     /// Resolve a currently active backing owner by lexical name.
     pub fn region_id(&self, name: &str) -> Result<usize, ModelError> {
         // An ended owner is never silently revived by a retained integer ID.
@@ -251,7 +293,7 @@ impl<'a> State<'a> {
         }
     }
 
-    /// Resolve a currently active published collection by lexical name.
+    /// Resolve an active batch owner for publication or reset.
     pub fn batch_id(&self, name: &str) -> Result<usize, ModelError> {
         // Batch IDs distinguish generations even if their physical backing is
         // reused; this is a model identity check rather than a runtime counter.
@@ -259,6 +301,24 @@ impl<'a> State<'a> {
             Binding::Batch(id) if self.batches[id].active => Ok(id),
             _ => Err(ModelError::new(format!("{name} is not a live batch"))),
         }
+    }
+
+    /// Capture an owner or recover the original view when forwarding a borrow.
+    pub fn batch_view(&self, name: &str, access: Access) -> Result<BatchView, ModelError> {
+        let mut view = match self.binding(name)? {
+            Binding::Batch(batch) if self.batches[batch].active => BatchView {
+                batch,
+                count: self.batches[batch].records.len(),
+                access: Access::Readwrite,
+            },
+            Binding::BorrowedBatch(view) if self.batches[view.batch].active => view,
+            _ => return Err(ModelError::new(format!("{name} is not a live batch"))),
+        };
+        if view.access == Access::Readonly && access == Access::Readwrite {
+            return Err(ModelError::new("readonly batch access upgrade"));
+        }
+        view.access = access;
+        Ok(view)
     }
 
     /// Resolve a reference whose batch and element remain published and active.

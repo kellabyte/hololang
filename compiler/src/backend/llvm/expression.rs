@@ -4,7 +4,7 @@
 //! use separate checked reservation helpers. Reference observations load actual
 //! memory on each evaluation and carry no immutability or uniqueness annotation.
 
-use crate::ir::{Binary, Compare, Condition, Expr};
+use crate::ir::{Binary, BoolExpr, Compare, Condition, Expr};
 
 use super::{
     context::{Binding, Lowering},
@@ -21,6 +21,7 @@ impl Lowering<'_> {
         // Every branch returns the native unsigned representation of one IR form.
         match expression {
             Expr::Const(value) => value.to_string(),
+            Expr::Bool(_) => unreachable!("checked boolean is not an unsigned expression"),
             Expr::Apply { args, body } => {
                 let mut captured = Vec::with_capacity(args.len());
                 // All actuals evaluate once before replacing the enclosing frame;
@@ -41,6 +42,7 @@ impl Lowering<'_> {
                 args,
                 arms,
             } => self.handle_result(function, args, arms),
+            Expr::HandleSavedResult { name, arms } => self.handle_saved_result(name, arms),
             Expr::Local(name) => match self.binding(name) {
                 Binding::Scalar(slot) => self.f.value(format!("load i64, ptr {slot}")),
                 Binding::ScalarValue(value) => value,
@@ -48,20 +50,26 @@ impl Lowering<'_> {
             },
             Expr::Param(index) => match &self.params[*index] {
                 Input::Scalar(value) => value.clone(),
-                Input::Bytes { .. } | Input::State(_) => {
+                Input::Boolean(_) | Input::Bytes { .. } | Input::State(_) | Input::Batch(_) => {
                     panic!("checked scalar formal has wrong lowering kind")
                 }
             },
             Expr::InputLen(param) => self.byte_input(*param).1,
             Expr::InputByte { param, index } => {
                 let (contents, len) = self.byte_input(*param);
-                let index = self.expression(index);
-                let valid = self.f.value(format!("icmp ult i64 {index}, {len}"));
-                // Bounds failure traps before pointer formation or any payload load.
-                self.f.line(format!("call void @holo.assert(i1 {valid})"));
-                let pointer = storage::advance(&mut self.f, &contents, &index);
-                let byte = self.f.value(format!("load i8, ptr {pointer}, align 1"));
-                self.f.value(format!("zext i8 {byte} to i64"))
+                self.read_view_byte(&contents, &len, index)
+            }
+            Expr::LiteralByte { bytes, index } => {
+                let (contents, len) = self.byte_literals.capture(bytes);
+                self.read_view_byte(&contents, &len, index)
+            }
+            Expr::ViewLen(name) => match self.binding(name) {
+                Binding::ByteView { len, .. } | Binding::Received { len, .. } => len,
+                _ => unreachable!("checked view length has a live byte view"),
+            },
+            Expr::ViewByte { name, index } => {
+                let (contents, len) = self.local_bytes(name);
+                self.read_view_byte(&contents, &len, index)
             }
             Expr::Index => self.byte_index.clone().expect("checked byte index scope"),
             Expr::Binary { op, left, right } => {
@@ -103,11 +111,7 @@ impl Lowering<'_> {
                     }
                 }
             }
-            Expr::BatchLen(name) => {
-                let (batch, _) = self.batch(name);
-                let slot = storage::member(&mut self.f, "%holo.batch", &batch, 3);
-                self.f.value(format!("load i64, ptr {slot}"))
-            }
+            Expr::BatchLen(name) => self.batch_count(name),
             Expr::Used(name) => {
                 let region = self.region(name);
                 storage::top(&mut self.f, &region)
@@ -120,10 +124,75 @@ impl Lowering<'_> {
         }
     }
 
-    /// Emit a checked unsigned comparison, returning an i1 SSA name.
+    /// Read a byte through a captured descriptor after checking its logical extent.
+    fn read_view_byte(&mut self, contents: &str, len: &str, index: &Expr) -> String {
+        let pointer = self.view_byte_pointer(contents, len, index);
+        let byte = self.f.value(format!("load i8, ptr {pointer}, align 1"));
+        self.f.value(format!("zext i8 {byte} to i64"))
+    }
+
+    /// Evaluate and check an index against a captured byte view before forming its address.
+    pub(super) fn view_byte_pointer(&mut self, contents: &str, len: &str, index: &Expr) -> String {
+        let index = self.expression(index);
+        let valid = self.f.value(format!("icmp ult i64 {index}, {len}"));
+        self.f.line(format!("call void @holo.assert(i1 {valid})"));
+        storage::advance(&mut self.f, contents, &index)
+    }
+
+    /// Evaluate one checked boolean, returning an i1 constant or SSA name.
+    pub(super) fn boolean(&mut self, expression: &BoolExpr) -> String {
+        match expression {
+            BoolExpr::Const(value) => value.to_string(),
+            BoolExpr::Local(name) => {
+                let Binding::Boolean(value) = self.binding(name) else {
+                    unreachable!("checked boolean local")
+                };
+                value
+            }
+            BoolExpr::Call { function, args } => self.ordinary_call(function, args),
+            BoolExpr::Compare(condition) => self.condition(condition),
+            BoolExpr::And(left, right) => self.short_circuit(left, right, false),
+            BoolExpr::Or(left, right) => self.short_circuit(left, right, true),
+            BoolExpr::Not(value) => {
+                let value = self.boolean(value);
+                self.f.value(format!("xor i1 {value}, true"))
+            }
+        }
+    }
+
+    /// Evaluate the right operand only when the left differs from the decisive value.
+    fn short_circuit(&mut self, left: &BoolExpr, right: &BoolExpr, decisive: bool) -> String {
+        let left = self.boolean(left);
+        let skip_from = self.f.current_label().to_owned();
+        let evaluate = self.f.fresh_label();
+        let done = self.f.fresh_label();
+        let (if_true, if_false) = if decisive {
+            (&done, &evaluate)
+        } else {
+            (&evaluate, &done)
+        };
+        self.f
+            .line(format!("br i1 {left}, label %{if_true}, label %{if_false}"));
+        self.f.label(&evaluate);
+        let right = self.boolean(right);
+        let evaluated_from = self.f.current_label().to_owned();
+        self.f.line(format!("br label %{done}"));
+        self.f.label(&done);
+        self.f.value(format!(
+            "phi i1 [ {decisive}, %{skip_from} ], [ {right}, %{evaluated_from} ]"
+        ))
+    }
+
+    /// Emit a checked condition, returning an i1 constant or SSA name.
     ///
     /// The left operand is evaluated before the right, preserving observable reads.
     pub(super) fn condition(&mut self, condition: &Condition) -> String {
+        if matches!(condition.op, Compare::Truth) {
+            let Expr::Bool(value) = &condition.left else {
+                unreachable!("checked truth condition")
+            };
+            return self.boolean(value);
+        }
         let left = self.expression(&condition.left);
         let right = self.expression(&condition.right);
         let predicate = match condition.op {
@@ -133,6 +202,7 @@ impl Lowering<'_> {
             Compare::Le => "ule",
             Compare::Gt => "ugt",
             Compare::Ge => "uge",
+            Compare::Truth => unreachable!("truth tested above"),
         };
         self.f
             .value(format!("icmp {predicate} i64 {left}, {right}"))

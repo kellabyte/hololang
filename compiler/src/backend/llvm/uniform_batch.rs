@@ -120,6 +120,11 @@ impl Proof<'_> {
                         self.visit(&arm.body)?;
                     }
                 }
+                Op::HandleResult { arms, .. } | Op::HandleSavedResult { arms, .. } => {
+                    for arm in arms {
+                        self.visit(&arm.body)?;
+                    }
+                }
                 Op::ForEach { body, .. }
                 | Op::Loop(body)
                 | Op::Repeat { body, .. }
@@ -135,18 +140,26 @@ impl Proof<'_> {
                 | Op::TcpClose { .. }
                 | Op::Send { .. }
                 | Op::Let { .. }
+                | Op::LetBool { .. }
+                | Op::BindBytes { .. }
+                | Op::BindResult { .. }
                 | Op::TryLet { .. }
+                | Op::TrySaved { .. }
                 | Op::Set { .. }
                 | Op::Borrow { .. }
                 | Op::Alias { .. }
                 | Op::AssignRef { .. }
                 | Op::Write { .. }
                 | Op::WriteByte { .. }
+                | Op::WriteInputByte { .. }
+                | Op::WriteViewByte { .. }
+                | Op::MoveInputBytes { .. }
                 | Op::Reset { .. }
                 | Op::Assert(_)
                 | Op::Print(_)
                 | Op::PrintText(_)
                 | Op::Return(_)
+                | Op::ReturnBool(_)
                 | Op::ReturnResult(_)
                 | Op::ExitZero
                 | Op::OpaqueRegion(_) => {}

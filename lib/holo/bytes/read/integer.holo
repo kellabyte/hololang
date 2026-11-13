@@ -1,0 +1,101 @@
+// Read unsigned binary integers from the leading bytes of borrowed views.
+// The result fits in the current scalar ABI for every supported width.
+
+namespace holo.bytes.read
+
+public error ReadError {
+    // The source view must contain at least this many bytes.
+    Short(required u64)
+}
+
+// Read the leading two bytes, least significant first.
+public func u16_le
+    with noalloc, noblock
+    arg input Bytes as readonly reference
+    returns Result<u64, ReadError>
+{
+    return little_endian(input, 2)
+}
+
+// Read the leading two bytes, most significant first.
+public func u16_be
+    with noalloc, noblock
+    arg input Bytes as readonly reference
+    returns Result<u64, ReadError>
+{
+    return big_endian(input, 2)
+}
+
+// Read the leading four bytes, least significant first.
+public func u32_le
+    with noalloc, noblock
+    arg input Bytes as readonly reference
+    returns Result<u64, ReadError>
+{
+    return little_endian(input, 4)
+}
+
+// Read the leading four bytes, most significant first.
+public func u32_be
+    with noalloc, noblock
+    arg input Bytes as readonly reference
+    returns Result<u64, ReadError>
+{
+    return big_endian(input, 4)
+}
+
+// Read the leading eight bytes, least significant first.
+public func u64_le
+    with noalloc, noblock
+    arg input Bytes as readonly reference
+    returns Result<u64, ReadError>
+{
+    return little_endian(input, 8)
+}
+
+// Read the leading eight bytes, most significant first.
+public func u64_be
+    with noalloc, noblock
+    arg input Bytes as readonly reference
+    returns Result<u64, ReadError>
+{
+    return big_endian(input, 8)
+}
+
+// Read a little-endian field by accumulating its digits in reverse order.
+// Each caller supplies a width of two, four, or eight bytes.
+func little_endian
+    with noalloc, noblock
+    arg input Bytes as readonly reference
+    arg width u64 as readonly copy
+    returns Result<u64, ReadError>
+{
+    if core.len(input) < width {
+        return error ReadError.Short(width)
+    }
+    let last = core.sub_wrapping(width, 1)
+    var value = 0
+    for index in core.range(width) {
+        let octet = input[core.sub_wrapping(last, index)]
+        value = core.add_wrapping(core.mul_wrapping(value, 256), octet)
+    }
+    return ok value
+}
+
+// Read a big-endian field by accumulating its digits in wire order.
+// Each caller supplies a width of two, four, or eight bytes.
+func big_endian
+    with noalloc, noblock
+    arg input Bytes as readonly reference
+    arg width u64 as readonly copy
+    returns Result<u64, ReadError>
+{
+    if core.len(input) < width {
+        return error ReadError.Short(width)
+    }
+    var value = 0
+    for index in core.range(width) {
+        value = core.add_wrapping(core.mul_wrapping(value, 256), input[index])
+    }
+    return ok value
+}

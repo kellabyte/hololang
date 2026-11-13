@@ -99,6 +99,14 @@ Compile and run the hello world Holo program with the Holo compiler.
 Hello, world!
 ```
 
+Run `make check` to verify Hello World and the Redis demo from a fresh
+source snapshot.
+
+### Build output
+
+Cargo writes compiler artifacts under `build/cargo/`. Use `build/examples/`
+for native examples and `build/failures/` for test replay inputs.
+
 ## Finding your way
 
 ```text

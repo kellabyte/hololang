@@ -28,6 +28,12 @@ const MAX_DEPTH: usize = 64;
 /// Shared budget for generated definition nodes, including intermediate scalar templates.
 const MAX_NODES: usize = 100_000;
 
+/// The optional return type supported by the scalar calling convention.
+pub(super) const SCALAR_OPTION: &str = "Option<u64>";
+pub(super) use ir::OPTION_U64_FAMILY as OPTION_FAMILY;
+/// The sole tag for a missing optional value.
+pub(super) const OPTION_NONE: &str = "None";
+
 /// Checked source definitions awaiting the existing IR verifier and storage planner.
 pub(super) struct Definitions {
     /// Ordered, resolved inline record schemas.
@@ -38,7 +44,9 @@ pub(super) struct Definitions {
     pub scalars: HashMap<String, ScalarTemplate>,
     /// Ordinary borrowed signatures available before checking any of their bodies.
     pub ordinary: HashMap<String, Vec<ir::FunctionParameterKind>>,
-    /// Nominal result families of fallible ordinary functions.
+    /// Ordinary functions with a boolean return type.
+    pub bools: HashSet<String>,
+    /// Nominal result families and the private identity of optional returns.
     pub results: HashMap<String, String>,
     /// Resolved error graphs and their ordered, scalar-payload leaves.
     pub errors: HashMap<String, ir::ErrorFamily>,
@@ -59,6 +67,8 @@ struct Lowerer<'m> {
     records: HashMap<&'m str, &'m ast::RecordDecl>,
     /// Statically resolved source functions, including the separately handled entry point.
     functions: HashMap<&'m str, &'m ast::Function>,
+    /// Functions lowered as checked bodies instead of scalar templates or producers.
+    ordinary: HashSet<&'m str>,
     /// Declared error families for validating result headers.
     errors: &'m HashMap<String, ir::ErrorFamily>,
     /// Fully lowered scalar helpers; entries are inserted only after success.
@@ -94,7 +104,24 @@ pub(super) fn lower(module: &ast::Module) -> Result<Definitions, Diagnostic> {
             })?;
     }
     let records = schema::lower(module)?;
-    let errors = errors::lower(module, &mut budget)?;
+    let mut errors = errors::lower(module, &mut budget)?;
+    if module
+        .functions
+        .iter()
+        .any(|function| function.result == SCALAR_OPTION)
+    {
+        errors.insert(
+            OPTION_FAMILY.to_owned(),
+            ir::ErrorFamily {
+                name: OPTION_FAMILY.to_owned(),
+                cases: vec![ir::ErrorCase {
+                    name: OPTION_NONE.to_owned(),
+                    payload: false,
+                }],
+                children: Vec::new(),
+            },
+        );
+    }
     let mut lowerer = Lowerer {
         records: module
             .records
@@ -102,6 +129,7 @@ pub(super) fn lower(module: &ast::Module) -> Result<Definitions, Diagnostic> {
             .map(|record| (record.name.as_str(), record))
             .collect(),
         functions: HashMap::new(),
+        ordinary: HashSet::new(),
         errors: &errors,
         scalars: HashMap::new(),
         producers: Vec::new(),
@@ -123,7 +151,9 @@ pub(super) fn lower(module: &ast::Module) -> Result<Definitions, Diagnostic> {
             lowerer.header(function)?;
         }
     }
+    lowerer.ordinary = ordinary_functions(module, &lowerer.functions);
     let mut ordinary = HashMap::new();
+    let mut bools = HashSet::new();
     let mut results = HashMap::new();
     // Source order gives deterministic diagnostics. Ordinary calls keep their
     // signatures without expanding their bodies into the pure definition graph.
@@ -131,17 +161,34 @@ pub(super) fn lower(module: &ast::Module) -> Result<Definitions, Diagnostic> {
         if function.name == "main" {
             continue;
         }
-        if ordinary_function(function) {
+        if lowerer.ordinary.contains(function.name.as_str()) {
+            if function.result == "bool" {
+                bools.insert(function.name.clone());
+            }
             // A fallible call keeps its exact nominal result through checking.
-            if let Some(family) = result_family(&function.result) {
+            if let Some(family) = ordinary_result(&function.result) {
                 results.insert(function.name.clone(), family.to_owned());
             }
             let params = function.args.iter().map(|argument| {
-                // The header establishes that the remaining type is fixed record state.
+                // The header establishes that every nonbuiltin type names a known schema.
                 match argument.ty.as_str() {
                     "u64" => ir::FunctionParameterKind::U64,
+                    "bool" => ir::FunctionParameterKind::Bool,
+                    "Bytes" if argument.access == "readwrite" => {
+                        ir::FunctionParameterKind::WritableBytes
+                    }
                     "Bytes" => ir::FunctionParameterKind::Bytes,
-                    record => ir::FunctionParameterKind::State(record.to_owned()),
+                    ty => match batch_record(ty) {
+                        Some(record) => ir::FunctionParameterKind::Batch {
+                            record: record.to_owned(),
+                            access: if argument.access == "readwrite" {
+                                ir::Access::Readwrite
+                            } else {
+                                ir::Access::Readonly
+                            },
+                        },
+                        None => ir::FunctionParameterKind::State(ty.to_owned()),
+                    },
                 }
             });
             ordinary.insert(function.name.clone(), params.collect());
@@ -154,6 +201,7 @@ pub(super) fn lower(module: &ast::Module) -> Result<Definitions, Diagnostic> {
         producers: lowerer.producers,
         scalars: lowerer.scalars,
         ordinary,
+        bools,
         results,
         errors,
     })
@@ -165,6 +213,20 @@ pub(super) fn result_family(result: &str) -> Option<&str> {
     result.strip_prefix("Result<u64,")?.strip_suffix('>')
 }
 
+/// Resolve the source return to its checked two-lane scalar representation.
+fn ordinary_result(result: &str) -> Option<&str> {
+    if result == SCALAR_OPTION {
+        Some(OPTION_FAMILY)
+    } else {
+        result_family(result)
+    }
+}
+
+/// Borrow the record component of a batch parameter's canonical type spelling.
+pub(super) fn batch_record(ty: &str) -> Option<&str> {
+    ty.strip_prefix("Batch<")?.strip_suffix('>')
+}
+
 /// Borrow the success and nominal family names from a canonical Result header.
 /// The parser has already excluded malformed or nested type arguments.
 pub(super) fn result_parts(result: &str) -> Option<(&str, &str)> {
@@ -174,52 +236,252 @@ pub(super) fn result_parts(result: &str) -> Option<(&str, &str)> {
         .split_once(',')
 }
 
-/// Select ordinary checked bodies for borrows, typed results, and result dispatch.
-/// The parser admits `on` directly on return/let operands. Scan structured blocks
-/// for those operands without changing the existing scalar-template path.
-fn ordinary_function(function: &ast::Function) -> bool {
-    if result_family(&function.result).is_some() {
-        return true;
+/// Borrow the callee name and actuals from a statically named call.
+pub(super) fn named_call(value: &ast::Expr) -> Option<(&str, &[ast::Expr])> {
+    let ast::ExprKind::Call { callee, args } = &value.kind else {
+        return None;
+    };
+    let ast::ExprKind::Name(name) = &callee.kind else {
+        return None;
+    };
+    Some((name, args))
+}
+
+/// Map only the six comparisons, retaining unsigned scalar operands.
+pub(super) fn comparison(op: ast::BinaryOp) -> Option<ir::Compare> {
+    Some(match op {
+        ast::BinaryOp::Eq => ir::Compare::Eq,
+        ast::BinaryOp::Ne => ir::Compare::Ne,
+        ast::BinaryOp::Lt => ir::Compare::Lt,
+        ast::BinaryOp::Le => ir::Compare::Le,
+        ast::BinaryOp::Gt => ir::Compare::Gt,
+        ast::BinaryOp::Ge => ir::Compare::Ge,
+        _ => return None,
+    })
+}
+
+/// Identify boolean literals and operators before names and call results resolve.
+pub(super) fn boolean_syntax(expr: &ast::Expr) -> bool {
+    use ast::ExprKind;
+    match expr.kind {
+        ExprKind::Bool(_) => true,
+        ExprKind::Binary { op, .. } if comparison(op).is_some() => true,
+        _ => logical_operator(expr),
+    }
+}
+
+fn logical_operator(expr: &ast::Expr) -> bool {
+    use ast::{BinaryOp, ExprKind};
+    matches!(
+        expr.kind,
+        ExprKind::Not { .. }
+            | ExprKind::Binary {
+                op: BinaryOp::LogicalAnd | BinaryOp::LogicalOr,
+                ..
+            }
+    )
+}
+
+/// Ordinary bodies need no template. Boolean-dependent scalar bodies also
+/// require ordinary lowering for their scalar-template callers.
+enum OrdinaryFunction {
+    Standard,
+    ScalarBody,
+}
+
+/// Classify ordinary bodies once, then propagate newly supported scalar bodies to
+/// scalar-template callers without repeatedly scanning declarations.
+fn ordinary_functions<'m>(
+    module: &'m ast::Module,
+    functions: &HashMap<&str, &ast::Function>,
+) -> HashSet<&'m str> {
+    let mut ordinary = HashSet::new();
+    let mut pending = Vec::new();
+    for function in &module.functions {
+        if function.name != "main"
+            && let Some(kind) = ordinary_function(function, functions)
+        {
+            ordinary.insert(function.name.as_str());
+            if matches!(kind, OrdinaryFunction::ScalarBody) {
+                pending.push(function.name.as_str());
+            }
+        }
+    }
+    if pending.is_empty() {
+        return ordinary;
+    }
+
+    // Index only single-return scalar candidates. Constructor calls and the
+    // preexisting boundary around ordinary functions stay as before.
+    let mut callers = HashMap::<&str, Vec<&str>>::new();
+    for function in &module.functions {
+        if function.name == "main"
+            || function.result != "u64"
+            || ordinary.contains(function.name.as_str())
+        {
+            continue;
+        }
+        let [statement] = function.body.as_slice() else {
+            continue;
+        };
+        let ast::StatementKind::Return(value) = &statement.kind else {
+            continue;
+        };
+        // Templates admit named/core calls and literal byte reads. Infix
+        // operations and member projections are rejected.
+        let mut expressions = vec![value];
+        while let Some(expression) = expressions.pop() {
+            match &expression.kind {
+                ast::ExprKind::Call { callee, args } => {
+                    if let ast::ExprKind::Name(name) = &callee.kind {
+                        callers.entry(name).or_default().push(&function.name);
+                    }
+                    expressions.extend(args);
+                }
+                ast::ExprKind::Index { base, index }
+                    if matches!(base.kind, ast::ExprKind::Bytes(_)) =>
+                {
+                    expressions.push(index);
+                }
+                _ => {}
+            }
+        }
+    }
+    // Visit the reverse graph once, including forward source references.
+    while let Some(name) = pending.pop() {
+        if let Some(callers) = callers.remove(name) {
+            for caller in callers {
+                if ordinary.insert(caller) {
+                    pending.push(caller);
+                }
+            }
+        }
+    }
+    ordinary
+}
+
+/// Select ordinary bodies for borrows, typed returns, and boolean or result dispatch.
+fn ordinary_function(
+    function: &ast::Function,
+    functions: &HashMap<&str, &ast::Function>,
+) -> Option<OrdinaryFunction> {
+    if function.result == "bool" || ordinary_result(&function.result).is_some() {
+        return Some(OrdinaryFunction::Standard);
     }
     if function.result != "u64" {
-        return false;
+        return None;
+    }
+    if has_bool_parameter(function) {
+        return Some(OrdinaryFunction::ScalarBody);
     }
     if function
         .args
         .iter()
         .any(|argument| argument.passing == "reference")
     {
-        return true;
+        return Some(OrdinaryFunction::Standard);
     }
+    let target = |value: &ast::Expr| {
+        let (name, _) = named_call(value)?;
+        functions.get(name).copied()
+    };
+    let boolean_condition = |value: &ast::Expr| {
+        logical_operator(value) || target(value).is_some_and(|callee| callee.result == "bool")
+    };
+    let mut ordinary_scalar_body = false;
     let mut pending = vec![function.body.as_slice()];
-    // Only body positions allowed to contain a handling or propagation operand
-    // affect this classification.
     while let Some(body) = pending.pop() {
         for statement in body {
             use ast::StatementKind as Kind;
-            match &statement.kind {
+            let operand = match &statement.kind {
                 Kind::Return(value) | Kind::Let { value, .. }
                     if matches!(
                         value.kind,
                         ast::ExprKind::Handle { .. } | ast::ExprKind::Try(_)
                     ) =>
                 {
-                    return true;
+                    return Some(OrdinaryFunction::Standard);
                 }
-                Kind::Scope(body) | Kind::For { body, .. } => pending.push(body),
-                // The ordinary lowerer diagnoses this entry-only operation at
-                // its statement, rather than treating the body as a pure template.
-                Kind::Construct { .. } => return true,
+                Kind::Let { value, .. } => {
+                    let callee = target(value);
+                    if callee.is_some_and(|callee| ordinary_result(&callee.result).is_some()) {
+                        return Some(OrdinaryFunction::Standard);
+                    }
+                    ordinary_scalar_body |= callee.is_some_and(|callee| callee.result == "bool")
+                        || boolean_syntax(value)
+                        || super::byte_ranges::split(value)
+                            .is_ok_and(|(root, _)| matches!(root.kind, ast::ExprKind::Bytes(_)));
+                    Some(value)
+                }
+                Kind::Expr(value) => {
+                    ordinary_scalar_body |= target(value)
+                        .is_some_and(|callee| callee.result == "bool")
+                        || matches!(&value.kind, ast::ExprKind::Call { callee, args }
+                            if core_name(callee) == Some("assert")
+                                && matches!(args.as_slice(), [condition] if boolean_condition(condition)));
+                    Some(value)
+                }
+                Kind::Return(value) | Kind::Assign { value, .. } => Some(value),
+                Kind::Scope(body) => {
+                    pending.push(body);
+                    None
+                }
+                Kind::For { iterable, body, .. } => {
+                    pending.push(body);
+                    Some(iterable)
+                }
+                // Both forms use structured lowering, which diagnoses entry-only
+                // construction when it occurs in an ordinary helper.
+                Kind::Construct { .. } | Kind::HandleResult { .. } => {
+                    return Some(OrdinaryFunction::Standard);
+                }
                 Kind::If {
+                    condition,
                     then_body,
                     else_body,
-                    ..
                 } => {
+                    ordinary_scalar_body |= boolean_condition(condition);
                     pending.push(then_body);
                     pending.push(else_body);
+                    Some(condition)
                 }
-                _ => {}
+                _ => None,
+            };
+            ordinary_scalar_body |= !ordinary_scalar_body
+                && operand.is_some_and(|value| calls_bool_parameter(value, &target));
+        }
+    }
+    ordinary_scalar_body.then_some(OrdinaryFunction::ScalarBody)
+}
+
+fn has_bool_parameter(function: &ast::Function) -> bool {
+    function.args.iter().any(|argument| argument.ty == "bool")
+}
+
+/// Find calls that need ordinary lowering even inside a comparison or scalar actual.
+fn calls_bool_parameter<'m>(
+    operand: &ast::Expr,
+    target: &impl Fn(&ast::Expr) -> Option<&'m ast::Function>,
+) -> bool {
+    use ast::ExprKind as Kind;
+    let mut pending = vec![operand];
+    while let Some(value) = pending.pop() {
+        match &value.kind {
+            Kind::Call { args, .. } => {
+                if target(value).is_some_and(has_bool_parameter) {
+                    return true;
+                }
+                pending.extend(args);
             }
+            Kind::Binary { left, right, .. }
+            | Kind::Index {
+                base: left,
+                index: right,
+            } => {
+                pending.extend([left.as_ref(), right.as_ref()]);
+            }
+            Kind::Not { value, .. } => pending.push(value),
+            _ => {}
         }
     }
     false
@@ -227,10 +489,15 @@ fn ordinary_function(function: &ast::Function) -> bool {
 
 impl Lowerer<'_> {
     /// Validate one non-entry header's explicit modes, result type, and contracts.
-    /// Ordinary borrowed helpers may also receive writable record state.
+    /// Ordinary borrowed helpers may also receive byte views, record state, and batches.
     fn header(&self, function: &ast::Function) -> Result<(), Diagnostic> {
         let result = result_parts(&function.result);
-        let success = result.map_or(function.result.as_str(), |(success, _)| success);
+        let success = if function.result == SCALAR_OPTION {
+            "u64"
+        } else {
+            result.map_or(function.result.as_str(), |(success, _)| success)
+        };
+        let ordinary_return = success == "u64" || function.result == "bool";
         // Every typed signature must name a declaration, even if no caller uses it.
         if let Some((_, family)) = result
             && !self.errors.contains_key(family)
@@ -257,20 +524,51 @@ impl Lowerer<'_> {
                     format!("duplicate argument `{}`", argument.name),
                 ));
             }
+            if argument.ty == "bool" {
+                if argument.access != "readonly" || argument.passing != "copy" {
+                    return Err(Diagnostic::new(
+                        argument.span,
+                        "bool parameters require `as readonly copy`",
+                    ));
+                }
+                if !ordinary_return {
+                    return Err(Diagnostic::new(
+                        argument.type_span,
+                        "bool parameters are supported only by ordinary functions",
+                    ));
+                }
+                continue;
+            }
             let scalar =
                 argument.ty == "u64" && argument.access == "readonly" && argument.passing == "copy";
             let bytes = argument.ty == "Bytes"
-                && argument.access == "readonly"
-                && argument.passing == "reference";
-            let state = function.result == "u64"
+                && argument.passing == "reference"
+                && (argument.access == "readonly"
+                    || (argument.access == "readwrite" && ordinary_return));
+            let state = ordinary_return
                 && argument.access == "readwrite"
                 && argument.passing == "reference"
                 && self.records.contains_key(argument.ty.as_str());
+            if let Some(record) = batch_record(&argument.ty) {
+                if !ordinary_return || argument.passing != "reference" {
+                    return Err(Diagnostic::new(
+                        argument.span,
+                        "`Batch<Record>` arguments require reference passing and an ordinary `u64`, `bool`, `Option<u64>`, or `Result<u64, E>` return",
+                    ));
+                }
+                if !self.records.contains_key(record) {
+                    return Err(Diagnostic::new(
+                        argument.type_span,
+                        format!("unknown batch record schema `{record}`"),
+                    ));
+                }
+                continue;
+            }
             // The IR verifier independently checks the state schema's fixed shape.
             if !scalar && !bytes && !state {
                 return Err(Diagnostic::new(
                     argument.span,
-                    "experimental helper arguments support `u64 as readonly copy` and `Bytes as readonly reference`; ordinary scalar-returning functions also accept fixed record state `as readwrite reference`",
+                    "experimental helper arguments support `u64 as readonly copy` and `Bytes as readonly reference`; ordinary functions also accept `bool as readonly copy`, `Bytes as readwrite reference`, and writable fixed record state",
                 ));
             }
         }
@@ -290,7 +588,7 @@ impl Lowerer<'_> {
                 ));
             }
             // Existing constructor lowering advances dynamic region storage, even for fixed records.
-            if name == "noalloc" && success != "u64" {
+            if name == "noalloc" && !ordinary_return {
                 return Err(Diagnostic::new(
                     *span,
                     "record constructors obtain fresh dynamic destination storage and cannot satisfy strict `noalloc` in this experimental adapter",
@@ -298,7 +596,7 @@ impl Lowerer<'_> {
             }
         }
         // The constructor verifier independently checks fixed layouts and nested calls.
-        if success != "u64" && !self.records.contains_key(success) {
+        if !ordinary_return && !self.records.contains_key(success) {
             return Err(Diagnostic::new(
                 function.span,
                 format!("unsupported or unknown return type `{}`", function.result),
@@ -406,7 +704,9 @@ pub(super) fn instantiate(
                 pending.push((right, depth + 1, substitute));
                 pending.push((left, depth + 1, substitute));
             }
-            ir::Expr::Byte { index, .. } | ir::Expr::InputByte { index, .. } => {
+            ir::Expr::Byte { index, .. }
+            | ir::Expr::InputByte { index, .. }
+            | ir::Expr::LiteralByte { index, .. } => {
                 pending.push((index, depth + 1, substitute));
             }
             ir::Expr::Apply { args, body } => {
@@ -444,6 +744,10 @@ fn copy_template(template: &ir::Expr, args: &[ir::Expr]) -> ir::Expr {
         },
         ir::Expr::InputByte { param, index } => ir::Expr::InputByte {
             param: *param,
+            index: Box::new(copy_template(index, args)),
+        },
+        ir::Expr::LiteralByte { bytes, index } => ir::Expr::LiteralByte {
+            bytes: bytes.clone(),
             index: Box::new(copy_template(index, args)),
         },
         ir::Expr::Apply { args: inputs, body } => ir::Expr::Apply {

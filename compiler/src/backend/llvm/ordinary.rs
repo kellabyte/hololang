@@ -1,26 +1,35 @@
-//! Native lowering for checked synchronous scalar-returning helpers.
+//! Native lowering for checked synchronous ordinary helpers.
 //!
-//! The checker admits fixed state references and borrowed initialized byte
-//! ranges. Each call captures operands once and passes only pointers, extents,
-//! and copied scalars. Fixed local slots follow the existing function builder.
+//! The checker admits fixed state references, initialized byte views and
+//! borrowed batch prefixes. Each call captures operands once and passes only
+//! pointers, bounds and copied scalars or booleans. Fixed locals use the function builder.
 
-use crate::ir::{Function, FunctionArgument, FunctionParameterKind, Op, Program};
-use crate::layout::LayoutPlan;
+use crate::ir::{Function, FunctionArgument, FunctionParameterKind, Op};
 
 use super::{
     byte_sum,
-    context::{Binding, Lowering},
+    context::{BatchPrefix, Binding, Lowering, Module},
     input::Input,
     results::RESULT_TYPE,
     static_byte_sum::{self, Seed},
 };
 
+/// The checked ordinary result determines the private LLVM return type.
+fn result_type(function: &Function) -> &'static str {
+    if function.returns_bool {
+        "i1"
+    } else if function.result.is_some() {
+        RESULT_TYPE
+    } else {
+        "i64"
+    }
+}
+
 /// Emit one checked helper using its generated `index` as an internal symbol.
 /// `byte_sums` shares the supported module's helper-use flag with entry lowering.
 /// This adds only fixed frame slots for bindings and makes no alias promise.
 pub(super) fn emit(
-    program: &Program,
-    layout: &LayoutPlan,
+    module: &Module<'_>,
     index: usize,
     function: &Function,
     byte_sums: Option<&byte_sum::Helpers>,
@@ -35,11 +44,28 @@ pub(super) fn emit(
                 operands.push(format!("i64 {name}"));
                 Input::Scalar(name)
             }
+            FunctionParameterKind::Bool => {
+                operands.push(format!("i1 {name}"));
+                Input::Boolean(name)
+            }
             FunctionParameterKind::State(_) => {
                 operands.push(format!("ptr {name}"));
                 Input::State(name)
             }
-            FunctionParameterKind::Bytes => {
+            FunctionParameterKind::Batch { .. } => {
+                let contents = format!("{name}.data");
+                let extent = format!("{name}.extent");
+                let count = format!("{name}.count");
+                operands.push(format!("ptr {contents}"));
+                operands.push(format!("i64 {extent}"));
+                operands.push(format!("i64 {count}"));
+                Input::Batch(BatchPrefix {
+                    contents,
+                    extent,
+                    count,
+                })
+            }
+            FunctionParameterKind::Bytes | FunctionParameterKind::WritableBytes => {
                 let contents = format!("{name}.data");
                 let len = format!("{name}.len");
                 operands.push(format!("ptr {contents}"));
@@ -49,16 +75,12 @@ pub(super) fn emit(
         };
         inputs.push(input);
     }
-    let result_type = if function.result.is_some() {
-        RESULT_TYPE
-    } else {
-        "i64"
-    };
+    let result_type = result_type(function);
     let header = format!(
         "define internal {result_type} @holo.function.{index}({})",
         operands.join(", ")
     );
-    let mut lowering = Lowering::new(program, layout, header, inputs);
+    let mut lowering = Lowering::new(module, header, inputs);
     lowering.byte_sums = byte_sums;
     lowering.result_family = function.result.as_deref();
     // Locals and state reuse the existing binding representation. Bytes are
@@ -69,6 +91,9 @@ pub(super) fn emit(
                 let slot = lowering.f.slot("i64");
                 lowering.f.line(format!("store i64 {value}, ptr {slot}"));
                 lowering.bind(&parameter.name, Binding::Scalar(slot));
+            }
+            (FunctionParameterKind::Bool, Input::Boolean(value)) => {
+                lowering.bind(&parameter.name, Binding::Boolean(value));
             }
             (FunctionParameterKind::State(record), Input::State(pointer)) => {
                 let slot = lowering.f.slot("ptr");
@@ -83,7 +108,19 @@ pub(super) fn emit(
                     },
                 );
             }
-            (FunctionParameterKind::Bytes, Input::Bytes { .. }) => {}
+            (FunctionParameterKind::Batch { record, .. }, Input::Batch(prefix)) => {
+                lowering.bind(
+                    &parameter.name,
+                    Binding::BorrowedBatch {
+                        prefix,
+                        record: record.clone(),
+                    },
+                );
+            }
+            (
+                FunctionParameterKind::Bytes | FunctionParameterKind::WritableBytes,
+                Input::Bytes { .. },
+            ) => {}
             _ => unreachable!("ordinary input constructed from its parameter kind"),
         }
     }
@@ -151,9 +188,23 @@ impl<'a> Lowering<'a> {
                     }
                     operands.push(format!("i64 {value}"));
                 }
+                FunctionArgument::Bool(value) => {
+                    let value = self.boolean(value);
+                    operands.push(format!("i1 {value}"));
+                }
                 FunctionArgument::State(name) => {
                     let (pointer, _) = self.reference(name);
                     operands.push(format!("ptr {pointer}"));
+                }
+                FunctionArgument::Batch(name) => {
+                    let BatchPrefix {
+                        contents,
+                        extent,
+                        count,
+                    } = self.capture_batch(name);
+                    operands.push(format!("ptr {contents}"));
+                    operands.push(format!("i64 {extent}"));
+                    operands.push(format!("i64 {count}"));
                 }
                 FunctionArgument::Received(name) => {
                     // This fresh dynamic extent already passed the refill
@@ -162,18 +213,11 @@ impl<'a> Lowering<'a> {
                     operands.push(format!("ptr {contents}"));
                     operands.push(format!("i64 {len}"));
                 }
-                FunctionArgument::Bytes { source, prefix } => {
-                    let Input::Bytes { contents, mut len } = self.capture_bytes(source) else {
+                FunctionArgument::Bytes { source, ranges } => {
+                    let Input::Bytes { contents, len } = self.capture_byte_view(source, ranges)
+                    else {
                         unreachable!("checked ordinary Bytes argument has a byte source");
                     };
-                    // Narrow only after evaluating the requested length once.
-                    // An empty prefix forms no additional pointer or byte load.
-                    if let Some(prefix) = prefix {
-                        let requested = self.expression(prefix);
-                        let valid = self.f.value(format!("icmp ule i64 {requested}, {len}"));
-                        self.f.line(format!("call void @holo.assert(i1 {valid})"));
-                        len = requested;
-                    }
                     // Save the borrowed location after its original eager bounds check.
                     if specialized.is_some_and(|sum| sum.input == position) {
                         sum_contents = Some(contents.clone());
@@ -193,11 +237,7 @@ impl<'a> Lowering<'a> {
                 sum_seed.expect("proved scalar seed was captured"),
             );
         }
-        let result_type = if function.result.is_some() {
-            RESULT_TYPE
-        } else {
-            "i64"
-        };
+        let result_type = result_type(function);
         self.f.value(format!(
             "call {result_type} @holo.function.{index}({})",
             operands.join(", ")

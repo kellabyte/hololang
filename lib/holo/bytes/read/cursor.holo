@@ -1,0 +1,128 @@
+// Advance through caller-owned byte views by complete unsigned fields.
+// Cursor state holds only an offset. Each call borrows its input anew.
+
+namespace holo.bytes.read
+
+public struct Cursor {
+    // Offset relative to the beginning of the view passed to each read.
+    position u64
+}
+
+// Start at the beginning of the input view.
+public func start
+    with noblock
+    returns Cursor
+{
+    return Cursor {
+        position: 0
+    }
+}
+
+// Read one unsigned byte and advance by one.
+public func take_u8
+    with noalloc, noblock
+    arg state Cursor as readwrite reference
+    arg input Bytes as readonly reference
+    returns Result<u64, ReadError>
+{
+    return take_integer(state, input, 1, false)
+}
+
+// Read two bytes, least significant first, and advance by two.
+public func take_u16_le
+    with noalloc, noblock
+    arg state Cursor as readwrite reference
+    arg input Bytes as readonly reference
+    returns Result<u64, ReadError>
+{
+    return take_integer(state, input, 2, true)
+}
+
+// Read two bytes, most significant first, and advance by two.
+public func take_u16_be
+    with noalloc, noblock
+    arg state Cursor as readwrite reference
+    arg input Bytes as readonly reference
+    returns Result<u64, ReadError>
+{
+    return take_integer(state, input, 2, false)
+}
+
+// Read four bytes, least significant first, and advance by four.
+public func take_u32_le
+    with noalloc, noblock
+    arg state Cursor as readwrite reference
+    arg input Bytes as readonly reference
+    returns Result<u64, ReadError>
+{
+    return take_integer(state, input, 4, true)
+}
+
+// Read four bytes, most significant first, and advance by four.
+public func take_u32_be
+    with noalloc, noblock
+    arg state Cursor as readwrite reference
+    arg input Bytes as readonly reference
+    returns Result<u64, ReadError>
+{
+    return take_integer(state, input, 4, false)
+}
+
+// Read eight bytes, least significant first, and advance by eight.
+public func take_u64_le
+    with noalloc, noblock
+    arg state Cursor as readwrite reference
+    arg input Bytes as readonly reference
+    returns Result<u64, ReadError>
+{
+    return take_integer(state, input, 8, true)
+}
+
+// Read eight bytes, most significant first, and advance by eight.
+public func take_u64_be
+    with noalloc, noblock
+    arg state Cursor as readwrite reference
+    arg input Bytes as readonly reference
+    returns Result<u64, ReadError>
+{
+    return take_integer(state, input, 8, false)
+}
+
+// Check the exact field extent before decoding. Commit the position only
+// after success, so a short view can be extended and passed again.
+func take_integer
+    with noalloc, noblock
+    arg state Cursor as readwrite reference
+    arg input Bytes as readonly reference
+    arg width u64 as readonly copy
+    arg least_significant_first bool as readonly copy
+    returns Result<u64, ReadError>
+{
+    let position = state.position
+    let length = core.len(input)
+    if position > length {
+        return error ReadError.Short(width)
+    }
+    if core.sub_wrapping(length, position) < width {
+        return error ReadError.Short(width)
+    }
+    let field = core.subrange(input, position, width)
+    let value = try read_field(field, width, least_significant_first)
+    state.position = core.add_wrapping(position, width)
+    return ok value
+}
+
+// Decode a complete field with the byte library's fixed-width readers.
+// The public take functions supply a supported width and byte order.
+func read_field
+    with noalloc, noblock
+    arg field Bytes as readonly reference
+    arg width u64 as readonly copy
+    arg least_significant_first bool as readonly copy
+    returns Result<u64, ReadError>
+{
+    if least_significant_first {
+        return little_endian(field, width)
+    }
+    return big_endian(field, width)
+}

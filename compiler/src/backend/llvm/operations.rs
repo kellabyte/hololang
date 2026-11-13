@@ -5,10 +5,11 @@
 //! operations separate from storage ownership. Access rights and lifetime roots
 //! are validated before any native instruction is emitted.
 
-use crate::ir::Op;
+use crate::ir::{Expr, Op};
 
 use super::{
     context::{Binding, Lowering},
+    input::Input,
     storage,
 };
 
@@ -22,6 +23,59 @@ impl Lowering<'_> {
         for operation in operations {
             self.operation(operation);
         }
+    }
+
+    /// Check the byte destination before evaluating and narrowing its replacement.
+    fn write_view_byte(&mut self, contents: &str, len: &str, index: &Expr, value: &Expr) {
+        let pointer = self.view_byte_pointer(contents, len, index);
+        let value = self.expression(value);
+        let byte = self.f.value(format!("trunc i64 {value} to i8"));
+        self.f
+            .line(format!("store i8 {byte}, ptr {pointer}, align 1"));
+    }
+
+    /// Move the captured source into an existing destination, including overlap.
+    /// Validate the full destination extent before emitting any payload access.
+    fn move_input_bytes(&mut self, destination: usize, source: usize) {
+        let (destination, capacity) = self.byte_input(destination);
+        let (source, length) = self.byte_input(source);
+        let valid = self.f.value(format!("icmp ule i64 {length}, {capacity}"));
+        self.f.line(format!("call void @holo.assert(i1 {valid})"));
+        let same = self.f.value(format!("icmp eq ptr {destination}, {source}"));
+        let count = self
+            .f
+            .value(format!("select i1 {same}, i64 0, i64 {length}"));
+        // Walking backward whenever the destination starts higher preserves
+        // unread bytes on rightward overlap, even across separate formals.
+        let backward = self
+            .f
+            .value(format!("icmp ugt ptr {destination}, {source}"));
+        let entry = self.f.current_label().to_owned();
+        let test = self.f.fresh_label();
+        let copy = self.f.fresh_label();
+        let done = self.f.fresh_label();
+        let next = self.f.fresh_value();
+        self.f.line(format!("br label %{test}"));
+        self.f.label(&test);
+        let index = self
+            .f
+            .value(format!("phi i64 [ 0, %{entry} ], [ {next}, %{copy} ]"));
+        let more = self.f.value(format!("icmp ult i64 {index}, {count}"));
+        self.f
+            .line(format!("br i1 {more}, label %{copy}, label %{done}"));
+        self.f.label(&copy);
+        let remaining = self.f.value(format!("sub i64 {count}, {index}"));
+        let reverse = self.f.value(format!("sub i64 {remaining}, 1"));
+        let offset = self
+            .f
+            .value(format!("select i1 {backward}, i64 {reverse}, i64 {index}"));
+        let from = storage::advance(&mut self.f, &source, &offset);
+        let to = storage::advance(&mut self.f, &destination, &offset);
+        let byte = self.f.value(format!("load i8, ptr {from}, align 1"));
+        self.f.line(format!("store i8 {byte}, ptr {to}, align 1"));
+        self.f.line(format!("{next} = add i64 {index}, 1"));
+        self.f.line(format!("br label %{test}"));
+        self.f.label(&done);
     }
 
     /// Emit one checked operation, delegating ownership/control-flow transitions.
@@ -45,12 +99,11 @@ impl Lowering<'_> {
             Op::Refill(refill) => self.refill(refill),
             Op::WaitInput { result } => self.wait_input(result),
             Op::Send {
-                reference,
-                path,
+                source,
                 offset,
                 count,
                 result,
-            } => self.send(reference, path, offset, count, result),
+            } => self.send(source, offset, count, result),
             Op::WaitOutput { result } => self.wait_output(result),
             Op::NextSession { result } => self.next_session(result),
             Op::Loop(body) => self.repeat_forever(body),
@@ -82,11 +135,45 @@ impl Lowering<'_> {
                 self.f.line(format!("store i64 {value}, ptr {slot}"));
                 self.bind(name, Binding::Scalar(slot));
             }
+            Op::LetBool { name, value } => {
+                let value = self.boolean(value);
+                self.bind(name, Binding::Boolean(value));
+            }
+            Op::BindBytes {
+                name,
+                source,
+                ranges,
+                ..
+            } => {
+                let Input::Bytes { contents, len } = self.capture_byte_view(source, ranges) else {
+                    unreachable!("checked view declaration has a byte source");
+                };
+                self.bind(name, Binding::ByteView { contents, len });
+            }
             Op::TryLet {
                 name,
                 function,
                 args,
             } => self.try_binding(name, function, args),
+            Op::TrySaved { name, source } => self.try_saved_binding(name, source),
+            Op::BindResult {
+                name,
+                function,
+                args,
+            } => {
+                let (index, callee) = self.ordinary_definition(function);
+                let family = callee.result.clone().expect("checked saved result family");
+                let value = self.ordinary_call_resolved(index, callee, args);
+                self.bind(name, Binding::SavedResult { value, family });
+            }
+            Op::HandleResult {
+                function,
+                args,
+                arms,
+            } => {
+                self.handle_result_blocks(function, args, arms);
+            }
+            Op::HandleSavedResult { name, arms } => self.handle_saved_result_blocks(name, arms),
             Op::Set { name, value } => {
                 let value = self.expression(value);
                 match self.binding(name) {
@@ -119,12 +206,26 @@ impl Lowering<'_> {
                 name, batch, index, ..
             } => {
                 let origin = self.batch_origin(batch);
-                let (batch, record) = self.batch(batch);
+                let batch = self.binding(batch);
                 let index = self.expression(index);
-                let schema = self.record_index(&record);
-                let pointer = self.f.value(format!(
-                    "call ptr @holo.record_at.{schema}(ptr {batch}, i64 {index})"
-                ));
+                let (record, pointer) = match batch {
+                    Binding::Batch { slot, record, .. } => {
+                        let schema = self.record_index(&record);
+                        let pointer = self.f.value(format!(
+                            "call ptr @holo.record_at.{schema}(ptr {slot}, i64 {index})"
+                        ));
+                        (record, pointer)
+                    }
+                    Binding::BorrowedBatch { prefix, record } => {
+                        let schema = self.record_index(&record);
+                        let pointer = self.f.value(format!(
+                            "call ptr @holo.prefix_record_at.{schema}(ptr {}, i64 {}, i64 {index})",
+                            prefix.contents, prefix.count
+                        ));
+                        (record, pointer)
+                    }
+                    _ => unreachable!("checked indexed reference requires a batch"),
+                };
                 let slot = self.f.slot("ptr");
                 self.f.line(format!("store ptr {pointer}, ptr {slot}"));
                 self.bind_reference(name, slot, record, origin, None);
@@ -180,6 +281,24 @@ impl Lowering<'_> {
                 self.f
                     .line(format!("store i8 {byte}, ptr {pointer}, align 1"));
             }
+            Op::WriteInputByte {
+                param,
+                index,
+                value,
+            } => {
+                let (contents, len) = self.byte_input(*param);
+                self.write_view_byte(&contents, &len, index, value);
+            }
+            Op::WriteViewByte { name, index, value } => {
+                let (contents, len) = self.local_bytes(name);
+                self.write_view_byte(&contents, &len, index, value);
+            }
+            Op::MoveInputBytes {
+                destination,
+                source,
+            } => {
+                self.move_input_bytes(*destination, *source);
+            }
             Op::Reset { batch } => self.reset(batch),
             Op::Repeat { count, index, body } => self.repeat(count, index, body),
             Op::ForEach {
@@ -219,6 +338,12 @@ impl Lowering<'_> {
                 self.f.line(format!("ret i64 {value}"));
                 // A checked ordinary body owns no region or marker cleanup. A
                 // predecessor-free block lets structured siblings finish normally.
+                let continuation = self.f.fresh_label();
+                self.f.label(&continuation);
+            }
+            Op::ReturnBool(expression) => {
+                let value = self.boolean(expression);
+                self.f.line(format!("ret i1 {value}"));
                 let continuation = self.f.fresh_label();
                 self.f.label(&continuation);
             }

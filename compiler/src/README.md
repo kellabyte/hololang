@@ -54,8 +54,9 @@ target/runtime profile, not arbitrary libc versions or interposed environments.
 - Acyclic schemas containing unsigned 64-bit fields, inline bytes, and nested records.
 - Acyclic destination constructors with typed scalar/readonly-byte parameters,
   field-order initialization, byte comprehensions, nested calls, and recoverable rejection.
-- Synchronous ordinary functions with copied scalars, readonly byte prefixes,
-  writable fixed scalar-record state, and a scalar return.
+- Synchronous ordinary functions with copied scalars, checked readonly or
+  writable byte ranges, writable fixed scalar-record state, and scalar or
+  typed scalar results.
 - Entry-body `core.print` supports decimal scalars and double-quoted UTF-8
   literals. A text literal lowers to static bytes and a host output call.
 - Explicit bounded regions and one active batch per region; backing is acquired
@@ -82,9 +83,10 @@ from complete live published fields or forwarded byte parameters. Typed byte inp
 retain their source root and extent without payload snapshots. Internal scalar
 `Apply` frames preserve once-only eager helper arguments, including unused bounds
 checks. Ordinary calls capture a live byte field or a forwarded byte formal,
-optionally check a `core.prefix` extent, and invoke a closed helper graph without
-region acquisition or external effects. The callee can mutate existing fixed
-state and return a scalar. The adapter checks `noalloc`/`noblock` on those closed
+optionally narrow it with `core.prefix` or `core.subrange`, and invoke a closed
+helper graph without region acquisition or external effects. The callee can
+mutate existing fixed state or a writable byte range. The adapter checks
+`noalloc`/`noblock` on those closed
 forms, rejects `noalloc` on allocating constructors, and supports cleanup-aware
 early `return 0` from main. General parameter modes, generics, and automatic
 source-to-data-stack assignment remain unsupported.

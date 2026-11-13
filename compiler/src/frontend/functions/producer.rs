@@ -10,6 +10,7 @@ use super::{
     Lowerer, MAX_DEPTH, ast, case_path, core_name, parameter_kinds, parameters, result_parts,
     scalar,
 };
+use crate::frontend::byte_ranges;
 use crate::ir;
 use crate::source::{Diagnostic, Span};
 
@@ -450,9 +451,28 @@ fn constructor_arguments(
                 ir::Argument::Scalar(scalar::expression(lowerer, argument, context, 0)?)
             }
             ir::Parameter::Bytes => {
-                let index = scalar::byte_parameter(argument, context)?;
+                let (root, windows) = byte_ranges::split(argument)?;
                 lowerer.charge(1, argument.span)?;
-                ir::Argument::Bytes(ir::BytesSource::Param(index))
+                let source = if let ast::ExprKind::Bytes(bytes) = &root.kind {
+                    ir::BytesSource::Literal(bytes.clone())
+                } else {
+                    ir::BytesSource::Param(scalar::byte_parameter(root, context)?)
+                };
+                if windows.is_empty() {
+                    ir::Argument::Bytes(source)
+                } else {
+                    let mut ranges = Vec::with_capacity(windows.len());
+                    for window in windows {
+                        lowerer.charge(1, window.span)?;
+                        let offset = window
+                            .offset
+                            .map(|value| scalar::expression(lowerer, value, context, 0))
+                            .transpose()?;
+                        let length = scalar::expression(lowerer, window.length, context, 0)?;
+                        ranges.push(ir::ByteRange { offset, length });
+                    }
+                    ir::Argument::ByteView { source, ranges }
+                }
             }
         });
     }

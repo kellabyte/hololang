@@ -4,7 +4,7 @@ Let a CPU make progress on several independent lookups while it waits for memory
 
 **Research note — November 10, 2026.** This is an exploration plan, not an approved
 schedule syntax or an implemented Holo feature. The [specification](../spec.md)
-defines semantics; the [implementation plan](../implementation-plan.md#m2--improve-one-measured-bottleneck-next-native-campaign)
+defines semantics; the [implementation plan](../implementation-plan.md#m2--first-finite-compiler-improvement-accepted)
 decides whether this becomes an M2 experiment. Start with the shared
 [research guide](README.md) for campaign and evidence conventions.
 

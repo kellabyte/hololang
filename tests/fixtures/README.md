@@ -9,7 +9,7 @@ tests can check compilation, output, and error behavior.
 | `region.holo`, `recovery.holo` | Bounded regions, retained references, reset and recovery |
 | `borrowed_buffer.holo`, `byte_input.holo` | Borrowed input, alias-visible state, byte initializers |
 | `typed_append.holo`, `typed_frame.holo` | Typed rejection, rollback and retry during record construction |
-| `typed_refill_frame.holo`, `typed_stream_reader.holo` | Typed frame handling with native file or stream input |
+| `typed_refill_frame.holo`, `typed_stream_reader.holo` | Typed frame handling with native file or stream input. The incremental reader imports `holo.buffer` from `lib/holo`. |
 | [Error union package](error_unions/README.md) | Locked multi-file resolution, nested error cases, retry payloads |
 | [Gzip header inspector](gzip_header/README.md) | Formatter regression input and an independent native verifier |
 | [Telemetry worker](telemetry_worker/README.md) | Import resolution, locked package and independent native verifier |

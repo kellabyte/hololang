@@ -1,9 +1,11 @@
-// Bounded RESP2 key/value slot representation and binary key comparison.
+// Bounded RESP2 key/value storage and synchronous table operations.
 // The caller preallocates a fixed table of these slots. Their byte fields keep
 // physical extents for the lifetime of the table. Logical lengths and the
 // occupied bit describe the currently published value without allocating.
 
 namespace redis_server.store
+
+using holo.bytes
 
 // One stable slot in the request handler's bounded table.
 public struct Slot {
@@ -36,52 +38,84 @@ public func empty_slot
     }
 }
 
-// Return 1 if the half-open range is contained in the available extent.
-// The check observes only the input descriptor, and avoids adding potentially
-// overflowing operands. An empty range at the end is valid.
-public func range_fits
-    with noalloc, noblock
-    arg input Bytes as readonly reference
-    arg offset u64 as readonly copy
-    arg length u64 as readonly copy
-    returns u64
-{
-    let extent = core.len(input)
-    // Subtract only when the offset is already inside or at the end.
-    if offset > extent {
-        return 0
-    }
-    // A valid offset can still leave too few bytes for the range.
-    if length > core.sub_wrapping(extent, offset) {
-        return 0
-    }
-    return 1
+public error PutError {
+    Full
+    OverLimit
 }
 
-// Compare a stored key prefix with a checked range in the request.
-// Return 1 for exact binary equality or 0 for mismatch or an invalid extent.
-// Neither borrow escapes. At most length pairs of bytes are compared.
-public func key_matches
+// Return Some(index) for an occupied matching key and None for a miss.
+// The lookup reads only the logical key prefixes, including an empty key.
+public func find
     with noalloc, noblock
-    arg stored_key Bytes as readonly reference
-    arg input Bytes as readonly reference
-    arg offset u64 as readonly copy
-    arg length u64 as readonly copy
-    returns u64
+    arg entries Batch<Slot> as readonly reference
+    arg key Bytes as readonly reference
+    returns Option<u64>
 {
-    // The caller has matched the logical lengths. Physical lengths independently
-    // protect both indexed inputs even for an invalid caller.
-    if length > core.len(stored_key) {
-        return 0
+    return find_slot(entries, key, 0)
+}
+
+// Find a matching slot, or the first free slot when inserting. A full table
+// with no match and a lookup miss both return None. Each call scans once.
+func find_slot
+    with noalloc, noblock
+    arg entries Batch<Slot> as readonly reference
+    arg key Bytes as readonly reference
+    arg inserting u64 as readonly copy
+    returns Option<u64>
+{
+    var first_free = 0
+    var found_free = 0
+    var index = 0
+    for readonly entry in entries {
+        if entry.occupied == 0 {
+            if found_free == 0 {
+                first_free = index
+                found_free = 1
+            }
+        } else {
+            if entry.key_length == core.len(key) {
+                if bytes.equal(core.prefix(entry.key, entry.key_length), key) {
+                    return Some(index)
+                }
+            }
+        }
+        index = core.add_wrapping(index, 1)
     }
-    if range_fits(input, offset, length) == 0 {
-        return 0
-    }
-    // Each iteration stays inside both proven ranges and compares raw bytes.
-    for index in core.range(length) {
-        if stored_key[index] != input[core.add_wrapping(offset, index)] {
-            return 0
+    if inserting == 1 {
+        if found_free == 1 {
+            return Some(first_free)
         }
     }
-    return 1
+    return None
+}
+
+// Replace or insert a pair of binary views from the caller's request buffer.
+// That buffer is separate from the table. Validate both destination extents
+// before writing and keep the old value on failure.
+public func put
+    with noalloc, noblock
+    arg entries Batch<Slot> as readwrite reference
+    arg key Bytes as readonly reference
+    arg value Bytes as readonly reference
+    returns Result<u64, PutError>
+{
+    find_slot(entries, key, 1)
+        on Some(index) then {
+            let destination = core.borrow_readwrite(entries, index)
+            if core.len(key) > core.len(destination.key) {
+                return error PutError.OverLimit
+            }
+            if core.len(value) > core.len(destination.value) {
+                return error PutError.OverLimit
+            }
+            if destination.occupied == 0 {
+                destination.key_length = bytes.move(destination.key, key)
+            }
+            destination.value_length = bytes.move(destination.value, value)
+            destination.occupied = 1
+            return ok index
+        }
+        on None then {
+            return error PutError.Full
+        }
 }

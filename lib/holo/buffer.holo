@@ -1,0 +1,61 @@
+// Maintain a logical prefix within caller-owned initialized byte storage.
+// The caller keeps its own cursors and lends views for each synchronous call.
+
+namespace holo.buffer
+
+// Return the remaining space after the live prefix. A prefix outside the
+// supplied storage traps. Capacity is the extent of the caller's view.
+public func space
+    with noalloc, noblock
+    arg storage Bytes as readonly reference
+    arg filled u64 as readonly copy
+    returns u64
+{
+    let capacity = core.len(storage)
+    core.assert(filled <= capacity)
+    return core.sub_wrapping(capacity, filled)
+}
+
+// Append the exact source extent and return the new prefix length. Source and
+// storage may overlap. An invalid prefix or insufficient space traps before
+// payload writes, and an empty source leaves the buffer unchanged.
+public func append
+    with noalloc, noblock
+    arg storage Bytes as readwrite reference
+    arg filled u64 as readonly copy
+    arg source Bytes as readonly reference
+    returns u64
+{
+    let room = space(storage, filled)
+    let appended = move_into(core.subrange(storage, filled, room), source)
+    return core.add_wrapping(filled, appended)
+}
+
+// Move the unread bytes of the live prefix to the beginning of storage and
+// return their length. Reset the caller's consumed cursor to zero afterward.
+// Invalid cursors trap before payload writes. Bytes beyond the returned length
+// retain their old contents and are outside the new logical prefix.
+public func compact
+    with noalloc, noblock
+    arg storage Bytes as readwrite reference
+    arg consumed u64 as readonly copy
+    arg filled u64 as readonly copy
+    returns u64
+{
+    core.assert(consumed <= filled)
+    core.assert(filled <= core.len(storage))
+    let unread = core.sub_wrapping(filled, consumed)
+    return move_into(core.prefix(storage, unread), core.subrange(storage, consumed, unread))
+}
+
+// Copy the source's original bytes even when the two captured views overlap.
+// The checked move guards the entire destination before changing any byte.
+func move_into
+    with noalloc, noblock
+    arg destination Bytes as readwrite reference
+    arg source Bytes as readonly reference
+    returns u64
+{
+    core.move_bytes(destination, source)
+    return core.len(source)
+}

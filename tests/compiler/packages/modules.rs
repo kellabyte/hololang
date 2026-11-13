@@ -139,6 +139,40 @@ func main returns u64 {
     assert_eq!(success(output), "4660\n255\n65280\n");
 }
 
+/// Bind an option constructor in a legacy leaf without capturing an ordinary
+/// call of the same name inside its payload.
+#[test]
+fn library_option_return_preserves_contextual_constructor() {
+    let entry = r#"using holo.bytes
+
+func main returns u64 {
+    let present = bytes.find(7)
+        on Some(value) then value
+        on None then 0
+    let missing = bytes.find(0)
+        on Some(value) then value
+        on None then 9
+    core.print(present)
+    core.print(missing)
+    return 0
+}
+"#;
+    let library = r#"namespace holo.bytes
+
+public func find arg value u64 as readonly copy returns Option<u64> {
+    if value == 0 { return None }
+    return Some(Some(value))
+}
+
+func Some arg value u64 as readonly copy returns u64 {
+    return core.add_wrapping(value, 1)
+}
+"#;
+    let (_scratch, path, root) = fixture(entry, library);
+    let output = command("run", &path, &root).output().unwrap();
+    assert_eq!(success(output), "8\n9\n");
+}
+
 /// Fail empty or option-like root arguments, including when no directive would
 /// otherwise touch the supplied path.
 #[test]

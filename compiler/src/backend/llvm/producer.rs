@@ -5,11 +5,15 @@
 //! operands and leave the region marker to append. Numeric producers and the
 //! Wide control reserve through the region marker. Failures use ordinary calls.
 
-use crate::ir::{Argument, Build, Expr, Parameter, Producer, Program};
+use crate::ir::{Argument, Build, Expr, Parameter, Producer};
 use crate::layout::{LayoutMode, LayoutPlan};
 
 use super::{
-    context::Lowering, copy, function::Function, input::Input, producer_inline::Inline,
+    context::{Lowering, Module},
+    copy,
+    function::Function,
+    input::Input,
+    producer_inline::Inline,
     producer_lifts, storage,
 };
 
@@ -75,13 +79,10 @@ impl ProducerReturn {
 
 /// Select the experimental layout hint only for a checked scalar-input producer.
 ///
-/// `producer` comes from CheckedProgram. Bytes actuals inside a producer can only
-/// forward its Bytes formals; direct published-field borrows require entry code.
-/// Thus an all-U64 signature cannot read InputLen/InputByte or transitively call
-/// a Bytes-input producer. Apply actuals retain that checked context and its body
-/// has a fresh scalar frame. This is an optimization scope, not purity, uniqueness,
-/// failure-frequency or source-language eligibility. Unused Bytes formals remain
-/// excluded conservatively. Cost is linear in formal count, with no runtime work.
+/// A scalar-input producer has no caller-borrowed bytes. It can observe static
+/// literals and lend them to child producers. The hint is an optimization
+/// preference, with no promise about purity, uniqueness, or failure frequency.
+/// Unused Bytes formals remain excluded conservatively.
 pub(super) fn prefers_success(producer: &Producer) -> bool {
     // Exhaustive kinds keep any future input category outside the known scalar
     // case until the optimization's scope and checked forwarding proof are reviewed.
@@ -141,7 +142,7 @@ enum Reservations {
 
 /// Emit one checked producer as an internal native function.
 ///
-/// `program` supplies validated definitions and `index` identifies the producer.
+/// The module supplies validated definitions and `index` identifies the producer.
 /// The result is owned LLVM text. Scalars use u64 and byte borrows use ptr/u64, while
 /// the hidden destination pointer names the final receiving slot through calls.
 /// Layout changes compiler-owned metadata/limits without adding aggregate copies.
@@ -149,15 +150,16 @@ enum Reservations {
 /// `inline` is the inlining preference for the private definition.
 /// `lifts` lists bounded terminal variants and `lift` selects the current encoding.
 pub(super) fn emit(
-    program: &Program,
-    layout: &LayoutPlan,
+    module: &Module<'_>,
     index: usize,
     target: &str,
     inline: Inline,
     lifts: &producer_lifts::ProducerLifts,
     lift: u8,
 ) -> String {
+    let program = module.program;
     let producer = &program.producers[index];
+    let layout = module.layout;
     let returned = ProducerReturn::for_producer(producer);
     let placement = placement(producer, layout);
     let mut params = Vec::with_capacity(producer.params.len());
@@ -192,7 +194,7 @@ pub(super) fn emit(
     }
     signature.push(')');
     signature.push_str(inline.attribute());
-    let mut lowering = Lowering::new(program, layout, signature, params);
+    let mut lowering = Lowering::new(module, signature, params);
     lowering.construction_hints = prefers_success(producer);
     // A whole-result forward delegates even the leading header or empty unit.
     // Reserving either here would move the child's cursor past its destination.

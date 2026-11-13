@@ -62,6 +62,15 @@ fn quoted_text_preserves_source_spelling() {
     assert_eq!(category(&source, literal), HighlightKind::Text);
 }
 
+#[test]
+fn byte_string_highlighting_includes_the_prefix_and_escapes() {
+    let literal = r#"b"a\xFF""#;
+    assert_eq!(
+        category(&format!("let value = {literal}"), literal),
+        HighlightKind::Text
+    );
+}
+
 /// Iterative nested comments retain whole source extents and report an unfinished suffix visibly.
 #[test]
 fn comments_retain_nesting_unicode_and_original_line_boundaries() {
@@ -126,6 +135,24 @@ fn local_categories_are_useful_without_semantic_checking() {
     assert_eq!(category("entry.func", "func"), HighlightKind::Property);
     assert_eq!(category("if (value)", "if"), HighlightKind::Keyword);
     assert_eq!(category("return (value)", "return"), HighlightKind::Keyword);
+    assert_eq!(category("returns bool", "bool"), HighlightKind::Type);
+}
+
+#[test]
+fn boolean_operators_preserve_contextual_function_hints() {
+    let source = "return not (ready and found) or false";
+    for operator in ["not", "and", "or"] {
+        assert_eq!(category(source, operator), HighlightKind::Operator);
+    }
+    assert_eq!(
+        category("return not(value)", "not"),
+        HighlightKind::Function
+    );
+    assert_eq!(category("return or(value)", "or"), HighlightKind::Function);
+    assert_eq!(
+        category("return core.and(1, 2)", "and"),
+        HighlightKind::Function
+    );
 }
 
 /// Public visibility receives a keyword hint before function and record declarations.

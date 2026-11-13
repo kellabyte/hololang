@@ -195,6 +195,7 @@ fn lexeme_id(kind: LexemeKind) -> u64 {
         LexemeKind::BlockComment => 10,
         LexemeKind::Invalid => 11,
         LexemeKind::Text => 12,
+        LexemeKind::Bytes => 13,
     }
 }
 

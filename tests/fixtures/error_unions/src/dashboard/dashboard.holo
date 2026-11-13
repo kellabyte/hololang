@@ -9,7 +9,8 @@ public func show_customer_count
     arg scenario u64 as readonly copy
     returns u64
 {
-    return load_customer_count(scenario)
+    let outcome = load_customer_count(scenario)
+    return outcome
         on ok(count) then ui.show_count(count)
         on Session.PermissionDenied then ui.sign_in()
         on Sql.Timeout(delay) then ui.try_again(delay)

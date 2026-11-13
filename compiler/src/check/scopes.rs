@@ -10,8 +10,8 @@ use super::definitions::Definitions;
 use super::expressions::{self, Context};
 use super::{CheckError, HostedIo, PrivatePlacement};
 use crate::ir::{
-    Access, AppendPattern, Argument, ConstructArm, FieldKind, Function, FunctionParameterKind, Op,
-    Producer, Refill, ResultValue,
+    Access, AppendPattern, Argument, BytesSource, ConstructArm, FieldKind, Function,
+    FunctionParameterKind, Op, Producer, Refill, ResultBlockArm, ResultPattern, ResultValue,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -29,6 +29,15 @@ pub(super) struct Reference<'p> {
     access: Access,
 }
 
+/// A checked byte field's owning root and complete projection path.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct ByteOrigin<'p> {
+    /// Owning batch or record identity, shared through aliases and same-root rebinds.
+    root: usize,
+    /// Distinct checked fields occupy disjoint storage.
+    path: &'p [String],
+}
+
 /// Kind and ownership facts for an initialized lexical name.
 #[derive(Clone, Copy)]
 pub(super) enum Binding<'p> {
@@ -37,6 +46,10 @@ pub(super) enum Binding<'p> {
         /// Whether `Set` may update this scalar; loop indices are readonly.
         writable: bool,
     },
+    /// Immutable boolean, distinct from unsigned scalar locals.
+    Boolean,
+    /// Immutable result family, independent of the initializer's borrows.
+    SavedResult(&'p str),
     /// An arm-local error with its checked nominal family, never a scalar tag.
     Error {
         /// Family of the subject's failure result.
@@ -58,21 +71,25 @@ pub(super) enum Binding<'p> {
         /// Logical schema used to validate each field projection.
         record: &'p str,
     },
+    /// Call-local authority over an existing published prefix, without tail ownership.
+    BatchView(Reference<'p>),
     /// Checked reference into one live owner root.
     Reference(Reference<'p>),
     /// Immutable success name for a record constructed directly at its final address.
     ScopedReference(Reference<'p>),
     /// Immutable Bytes formal whose observations address the typed formal index.
     Bytes,
+    /// Immutable local view with authority over the captured bytes.
+    BytesView {
+        /// Original field, absent for a view of a caller's byte formal.
+        origin: Option<ByteOrigin<'p>>,
+        /// Permission retained through this view.
+        access: Access,
+    },
     /// The sole opaque TCP stream capability. It is never a scalar or reference.
     TcpStream,
     /// Readonly fresh prefix of one checked refill with a lexical Data scope.
-    Received {
-        /// Owning batch identity, shared through aliases and same-root rebinds.
-        root: usize,
-        /// Byte field path; distinct checked fields occupy disjoint storage.
-        path: &'p [String],
-    },
+    Received(ByteOrigin<'p>),
 }
 
 /// Name environments for nested lexical regions, batches, branches, and loops.
@@ -205,13 +222,43 @@ impl<'p> Environment<'p> {
         }
     }
 
-    /// Copy batch facts while preserving its distinct region/root identities.
-    pub(super) fn batch(&self, name: &str) -> Result<Binding<'p>, CheckError> {
-        // Only a live tail owner supplies published-count and record-schema facts.
+    /// Resolve a batch that owns its region tail for append and reset.
+    fn owned_batch(&self, name: &str) -> Result<Binding<'p>, CheckError> {
         match self.lookup(name)? {
             binding @ Binding::Batch { .. } => Ok(binding),
+            Binding::BatchView(_) => Err(CheckError::new(format!(
+                "borrowed batch {name} does not own its storage tail"
+            ))),
             _ => Err(CheckError::new(format!("{name} is not a batch"))),
         }
+    }
+
+    /// Obtain the published prefix's root and narrow its element access for this use.
+    pub(super) fn batch_view(
+        &self,
+        name: &str,
+        access: Access,
+    ) -> Result<Reference<'p>, CheckError> {
+        let mut view = match self.lookup(name)? {
+            Binding::Batch {
+                root,
+                depth,
+                record,
+                ..
+            } => Reference {
+                root,
+                root_depth: depth,
+                record,
+                access: Access::Readwrite,
+            },
+            Binding::BatchView(view) => view,
+            _ => return Err(CheckError::new(format!("{name} is not a batch"))),
+        };
+        if view.access == Access::Readonly && access == Access::Readwrite {
+            return Err(CheckError::new(format!("batch {name} is readonly")));
+        }
+        view.access = access;
+        Ok(view)
     }
 
     /// Resolve an initialized region and prove its tail is available.
@@ -307,19 +354,98 @@ impl<'p> Environment<'p> {
 
     /// Check a forwarded parameter's typed position without exposing a pointer value.
     pub(super) fn byte_param(&self, index: usize) -> bool {
+        self.byte_param_kind(index).is_some_and(|kind| {
+            matches!(
+                kind,
+                FunctionParameterKind::Bytes | FunctionParameterKind::WritableBytes
+            )
+        })
+    }
+
+    /// Require write authority on the forwarded descriptor itself.
+    pub(super) fn writable_byte_param(&self, index: usize) -> bool {
+        self.byte_param_kind(index) == Some(&FunctionParameterKind::WritableBytes)
+    }
+
+    /// Resolve a typed formal position within the current ordinary frame.
+    fn byte_param_kind(&self, index: usize) -> Option<&FunctionParameterKind> {
         self.function
             .and_then(|function| function.params.get(index))
-            .is_some_and(|parameter| parameter.kind == FunctionParameterKind::Bytes)
+            .map(|parameter| &parameter.kind)
     }
 
     /// Require that `name` is an in-scope fresh byte prefix for a synchronous borrow.
     /// A scalar or ordinary reference cannot stand in for an adapter result.
     pub(super) fn received(&self, name: &str) -> Result<(), CheckError> {
         // A lexical shadow can hide a received prefix from use but cannot widen it.
-        if !matches!(self.lookup(name)?, Binding::Received { .. }) {
+        if !matches!(self.lookup(name)?, Binding::Received(_)) {
             return Err(CheckError::new(format!("{name} is not a received view")));
         }
         Ok(())
+    }
+
+    /// Require a compatible named view and retain its original field identity.
+    pub(super) fn byte_view(
+        &self,
+        name: &str,
+        requested: Access,
+    ) -> Result<Option<ByteOrigin<'p>>, CheckError> {
+        let Binding::BytesView { origin, access } = self.lookup(name)? else {
+            return Err(CheckError::new(format!("{name} is not a local byte view")));
+        };
+        if requested == Access::Readwrite && access == Access::Readonly {
+            return Err(CheckError::new(format!(
+                "local byte view {name} is readonly"
+            )));
+        }
+        Ok(origin)
+    }
+
+    /// Check a byte borrow's authority before narrowing or lending its extent.
+    pub(super) fn byte_view_source(
+        &self,
+        source: &'p BytesSource,
+        access: Access,
+        definitions: &Definitions<'_>,
+    ) -> Result<Option<ByteOrigin<'p>>, CheckError> {
+        match source {
+            BytesSource::Literal(_) => {
+                if access == Access::Readwrite {
+                    return Err(CheckError::new("byte literal is readonly"));
+                }
+                Ok(None)
+            }
+            BytesSource::Param(index) if self.byte_param(*index) => {
+                if access == Access::Readwrite && !self.writable_byte_param(*index) {
+                    return Err(CheckError::new("Bytes parameter is readonly"));
+                }
+                Ok(None)
+            }
+            BytesSource::Field { reference, path } => {
+                let reference = match access {
+                    Access::Readonly => self.reference(reference)?,
+                    Access::Readwrite => self.writable_reference(reference)?,
+                };
+                expressions::require_field(definitions, reference.record, path, FieldKind::Bytes)?;
+                Ok(Some(ByteOrigin {
+                    root: reference.root,
+                    path,
+                }))
+            }
+            BytesSource::Received(name) => {
+                let Binding::Received(origin) = self.lookup(name)? else {
+                    return Err(CheckError::new(format!("{name} is not a received view")));
+                };
+                if access == Access::Readwrite {
+                    return Err(CheckError::new("received view is readonly"));
+                }
+                Ok(Some(origin))
+            }
+            BytesSource::Local(name) => self.byte_view(name, access),
+            BytesSource::Param(_) => Err(CheckError::new(
+                "byte borrow requires a live Bytes parameter",
+            )),
+        }
     }
 
     /// Record a validated graph edge when this frame belongs to a helper.
@@ -367,7 +493,8 @@ pub(super) fn validate_function<'p>(
     for parameter in &function.params {
         let binding = match &parameter.kind {
             FunctionParameterKind::U64 => Binding::Scalar { writable: false },
-            FunctionParameterKind::Bytes => Binding::Bytes,
+            FunctionParameterKind::Bool => Binding::Boolean,
+            FunctionParameterKind::Bytes | FunctionParameterKind::WritableBytes => Binding::Bytes,
             FunctionParameterKind::State(record) => {
                 definitions.require_scalar_record(record)?;
                 Binding::Reference(Reference {
@@ -377,13 +504,24 @@ pub(super) fn validate_function<'p>(
                     access: Access::Readwrite,
                 })
             }
+            FunctionParameterKind::Batch { record, access } => {
+                definitions.record(record)?;
+                Binding::BatchView(Reference {
+                    root: environment.root(),
+                    root_depth: 0,
+                    record,
+                    access: *access,
+                })
+            }
         };
         environment.insert(&parameter.name, binding)?;
     }
     operations(&function.body, definitions, &mut environment)?;
     // Even a dynamically nonempty loop does not establish a structural return.
     if !returns(&function.body) {
-        let result = if function.result.is_some() {
+        let result = if function.returns_bool {
+            "a boolean"
+        } else if function.result.is_some() {
             "a typed result"
         } else {
             "a scalar"
@@ -400,8 +538,11 @@ pub(super) fn validate_function<'p>(
 fn returns(body: &[Op]) -> bool {
     // One definitely returning instruction suffices for all paths still live there.
     body.iter().any(|operation| match operation {
-        Op::Return(_) | Op::ReturnResult(_) => true,
+        Op::Return(_) | Op::ReturnBool(_) | Op::ReturnResult(_) => true,
         Op::Scope(body) => returns(body),
+        Op::HandleResult { arms, .. } | Op::HandleSavedResult { arms, .. } => {
+            arms.iter().all(|arm| returns(&arm.body))
+        }
         Op::If {
             then_body,
             else_body,
@@ -452,15 +593,28 @@ fn operation_check<'p>(
             operation,
             Op::Scope(_)
                 | Op::Let { .. }
+                | Op::LetBool { .. }
+                | Op::BindBytes { .. }
+                | Op::BindResult { .. }
                 | Op::TryLet { .. }
+                | Op::TrySaved { .. }
+                | Op::HandleResult { .. }
+                | Op::HandleSavedResult { .. }
                 | Op::Set { .. }
+                | Op::Borrow { .. }
                 | Op::Alias { .. }
                 | Op::AssignRef { .. }
                 | Op::Write { .. }
+                | Op::WriteByte { .. }
+                | Op::WriteInputByte { .. }
+                | Op::WriteViewByte { .. }
+                | Op::MoveInputBytes { .. }
                 | Op::Repeat { .. }
+                | Op::ForEach { .. }
                 | Op::If { .. }
                 | Op::Assert(_)
                 | Op::Return(_)
+                | Op::ReturnBool(_)
                 | Op::ReturnResult(_)
         )
     {
@@ -544,17 +698,24 @@ fn operation_check<'p>(
             environment.hosted.input = true;
             environment.insert(result, Binding::Scalar { writable: false })?;
         }
-        // Output borrows one initialized projection, with scalar offset/count
+        // Output borrows one initialized field or named view, with offset/count
         // checked in written order. The runtime attempt retains no reference.
         Op::Send {
-            reference,
-            path,
+            source,
             offset,
             count,
             result,
         } => {
-            let source = environment.reference(reference)?;
-            expressions::require_field(definitions, source.record, path, FieldKind::Bytes)?;
+            match source {
+                BytesSource::Field { .. } | BytesSource::Local(_) | BytesSource::Literal(_) => {
+                    environment.byte_view_source(source, Access::Readonly, definitions)?;
+                }
+                BytesSource::Param(_) | BytesSource::Received(_) => {
+                    return Err(CheckError::new(
+                        "send requires an initialized Bytes field, a named byte view, or a byte literal",
+                    ));
+                }
+            }
             expressions::expression(offset, definitions, Context::Execution(environment))?;
             expressions::expression(count, definitions, Context::Execution(environment))?;
             environment.hosted.output = true;
@@ -571,7 +732,7 @@ fn operation_check<'p>(
             if environment.scopes.iter().any(|scope| {
                 scope
                     .values()
-                    .any(|binding| matches!(binding, Binding::Received { .. }))
+                    .any(|binding| matches!(binding, Binding::Received(_)))
             }) {
                 return Err(CheckError::new(
                     "cannot advance the hosted session while a received view is live",
@@ -638,6 +799,40 @@ fn operation_check<'p>(
             expressions::expression(value, definitions, Context::Execution(environment))?;
             environment.insert(name, Binding::Scalar { writable: true })?;
         }
+        Op::LetBool { name, value } => {
+            expressions::boolean(value, definitions, environment)?;
+            environment.insert(name, Binding::Boolean)?;
+        }
+        Op::BindBytes {
+            name,
+            source,
+            access,
+            ranges,
+        } => {
+            let origin = environment.byte_view_source(source, *access, definitions)?;
+            for range in ranges {
+                let context = Context::Execution(environment);
+                if let Some(offset) = &range.offset {
+                    expressions::expression(offset, definitions, context)?;
+                }
+                expressions::expression(&range.length, definitions, context)?;
+            }
+            environment.insert(
+                name,
+                Binding::BytesView {
+                    origin,
+                    access: *access,
+                },
+            )?;
+        }
+        Op::BindResult {
+            name,
+            function,
+            args,
+        } => {
+            let family = expressions::result_initializer(function, args, definitions, environment)?;
+            environment.insert(name, Binding::SavedResult(family))?;
+        }
         // Only the success continuation gains an immutable scalar. Failure
         // exits the owner-free frame with the same family or a checked child lift.
         Op::TryLet {
@@ -657,6 +852,19 @@ fn operation_check<'p>(
                 definitions,
                 environment,
             )?;
+            environment.insert(name, Binding::Scalar { writable: false })?;
+        }
+        Op::TrySaved { name, source } => {
+            let family = environment
+                .function
+                .and_then(|function| function.result.as_deref())
+                .ok_or_else(|| CheckError::new("try requires a scalar typed-result function"))?;
+            let Binding::SavedResult(actual) = environment.lookup(source)? else {
+                return Err(CheckError::new(format!(
+                    "{source} is not a saved result local"
+                )));
+            };
+            expressions::check_try_family(source, Some(actual), family, definitions)?;
             environment.insert(name, Binding::Scalar { writable: false })?;
         }
         // Scalar mutation cannot replace a backing owner, reference, or loop index.
@@ -722,6 +930,29 @@ fn operation_check<'p>(
             // bindings, and only the completed handler adds this immutable scalar.
             environment.insert(result, Binding::Scalar { writable: false })?;
         }
+        Op::HandleResult {
+            function,
+            args,
+            arms,
+        } => {
+            let family = expressions::result_block_subject(
+                function,
+                args,
+                arms.iter().map(|arm| &arm.pattern),
+                definitions,
+                environment,
+            )?;
+            result_blocks(arms, family, definitions, environment)?;
+        }
+        Op::HandleSavedResult { name, arms } => {
+            let family = expressions::saved_result_subject(
+                name,
+                arms.iter().map(|arm| &arm.pattern),
+                definitions,
+                environment,
+            )?;
+            result_blocks(arms, family, definitions, environment)?;
+        }
         // Only the success handler acquires a live tail and exposes the record.
         Op::ConstructHandled {
             region,
@@ -748,25 +979,9 @@ fn operation_check<'p>(
             index,
             access,
         } => {
-            let Binding::Batch {
-                root,
-                depth,
-                record,
-                ..
-            } = environment.batch(batch)?
-            else {
-                unreachable!()
-            };
+            let reference = environment.batch_view(batch, *access)?;
             expressions::expression(index, definitions, Context::Execution(environment))?;
-            environment.insert(
-                name,
-                Binding::Reference(Reference {
-                    root,
-                    root_depth: depth,
-                    record,
-                    access: *access,
-                }),
-            )?;
+            environment.insert(name, Binding::Reference(reference))?;
         }
         // Aliasing may reduce permission but never manufacture write authority.
         Op::Alias {
@@ -838,16 +1053,48 @@ fn operation_check<'p>(
             expressions::expression(index, definitions, Context::Execution(environment))?;
             expressions::expression(value, definitions, Context::Execution(environment))?;
         }
+        Op::WriteInputByte {
+            param,
+            index,
+            value,
+        } => {
+            if !environment.writable_byte_param(*param) {
+                return Err(CheckError::new(
+                    "byte store requires a writable Bytes parameter",
+                ));
+            }
+            expressions::expression(index, definitions, Context::Execution(environment))?;
+            expressions::expression(value, definitions, Context::Execution(environment))?;
+        }
+        Op::WriteViewByte { name, index, value } => {
+            environment.byte_view(name, Access::Readwrite)?;
+            expressions::expression(index, definitions, Context::Execution(environment))?;
+            expressions::expression(value, definitions, Context::Execution(environment))?;
+        }
+        Op::MoveInputBytes {
+            destination,
+            source,
+        } => {
+            if !environment.writable_byte_param(*destination) || !environment.byte_param(*source) {
+                return Err(CheckError::new(
+                    "byte move requires a writable destination and a readable source Bytes parameter",
+                ));
+            }
+        }
         // Reset must preserve every still-usable reference's storage lifetime.
         Op::Reset { batch } => {
-            let Binding::Batch { root, .. } = environment.batch(batch)? else {
+            let Binding::Batch { root, .. } = environment.owned_batch(batch)? else {
                 unreachable!()
             };
             // Every currently usable lexical alias blocks reset, including outer scopes.
             for bindings in &environment.scopes {
                 if bindings.values().any(|binding| match binding {
                     Binding::Reference(reference) => reference.root == root,
-                    Binding::Received { root: source, .. } => *source == root,
+                    Binding::Received(source) => source.root == root,
+                    Binding::BytesView {
+                        origin: Some(source),
+                        ..
+                    } => source.root == root,
                     _ => false,
                 }) {
                     return Err(CheckError::new(format!(
@@ -871,25 +1118,9 @@ fn operation_check<'p>(
             access,
             body,
         } => {
-            let Binding::Batch {
-                root,
-                depth,
-                record,
-                ..
-            } = environment.batch(batch)?
-            else {
-                unreachable!()
-            };
+            let view = environment.batch_view(batch, *access)?;
             environment.scopes.push(HashMap::new());
-            environment.insert(
-                reference,
-                Binding::Reference(Reference {
-                    root,
-                    root_depth: depth,
-                    record,
-                    access: *access,
-                }),
-            )?;
+            environment.insert(reference, Binding::Reference(view))?;
             // The cursor is a normal rooted path: append stays valid, reset cannot pass it.
             operations(body, definitions, environment)?;
             environment.scopes.pop();
@@ -935,7 +1166,24 @@ fn operation_check<'p>(
                     "typed-result function cannot return a bare scalar",
                 ));
             }
+            if environment
+                .function
+                .is_some_and(|function| function.returns_bool)
+            {
+                return Err(CheckError::new(
+                    "boolean function cannot return an unsigned scalar",
+                ));
+            }
             expressions::expression(value, definitions, Context::Execution(environment))?;
+        }
+        Op::ReturnBool(value) => {
+            if !environment
+                .function
+                .is_some_and(|function| function.returns_bool)
+            {
+                return Err(CheckError::new("boolean return requires a bool function"));
+            }
+            expressions::boolean(value, definitions, environment)?;
         }
         Op::ReturnResult(value) => {
             let family = environment
@@ -976,6 +1224,18 @@ fn operation_check<'p>(
                     definitions,
                     environment,
                 )?,
+                ResultValue::Saved(name) => {
+                    let Binding::SavedResult(actual) = environment.lookup(name)? else {
+                        return Err(CheckError::new(format!(
+                            "{name} is not a saved result local"
+                        )));
+                    };
+                    if actual != family {
+                        return Err(CheckError::new(format!(
+                            "saved result {name} must have the exact return family {family}"
+                        )));
+                    }
+                }
             }
         }
         // Entry completion carries no expression, reference, or escape value.
@@ -991,6 +1251,33 @@ fn operation_check<'p>(
     Ok(())
 }
 
+/// Validate each statement arm under a fresh scope with only its active payload.
+fn result_blocks<'p>(
+    arms: &'p [ResultBlockArm],
+    family: &'p str,
+    definitions: &Definitions<'p>,
+    environment: &mut Environment<'p>,
+) -> Result<(), CheckError> {
+    for arm in arms {
+        environment.scopes.push(HashMap::new());
+        let local = match &arm.pattern {
+            ResultPattern::Ok(Some(name))
+            | ResultPattern::Error {
+                binding: Some(name),
+                ..
+            } => Some((name, Binding::Scalar { writable: false })),
+            ResultPattern::Fallback(Some(name)) => Some((name, Binding::Error { family })),
+            _ => None,
+        };
+        if let Some((name, binding)) = local {
+            environment.insert(name, binding)?;
+        }
+        operations(&arm.body, definitions, environment)?;
+        environment.scopes.pop();
+    }
+    Ok(())
+}
+
 /// Resolve an append's receiving schema and verify its once-evaluated actuals.
 /// The constructor can read a live input, including this batch's initialized
 /// prefix, but it can write only the unpublished suffix supplied by the caller.
@@ -1001,7 +1288,7 @@ fn append_producer<'p>(
     definitions: &Definitions<'p>,
     environment: &Environment<'p>,
 ) -> Result<&'p Producer, CheckError> {
-    let Binding::Batch { record, .. } = environment.batch(batch)? else {
+    let Binding::Batch { record, .. } = environment.owned_batch(batch)? else {
         unreachable!("batch lookup checks the binding kind")
     };
     let definition = definitions.producer(producer)?;
@@ -1204,10 +1491,9 @@ fn check_destination_arms<'p, A>(
 
 /// Validate one refill and its disjoint Data and nondata branches.
 ///
-/// The destination's owning batch and exact field path survive aliases and
-/// rebindings. Different records within one batch may alias here because this
-/// checker does not retain record-index proofs. The emitted view remains a
-/// readonly argument capability, with no target bookkeeping for its lifetime.
+/// The destination's owning batch and field path survive aliases, rebindings,
+/// and further narrowing. Ranges within the same field are treated as possibly
+/// overlapping because the checker does not prove their bounds are disjoint.
 fn check_refill<'p>(
     refill: &'p Refill,
     definitions: &Definitions<'p>,
@@ -1215,29 +1501,31 @@ fn check_refill<'p>(
 ) -> Result<(), CheckError> {
     // All attempts use the descriptor admitted once by the executable host.
     environment.hosted.input = true;
-    let target = environment.writable_reference(&refill.reference)?;
-    expressions::require_field(definitions, target.record, &refill.path, FieldKind::Bytes)?;
+    if !matches!(
+        refill.destination,
+        BytesSource::Field { .. } | BytesSource::Local(_)
+    ) {
+        return Err(CheckError::new(
+            "refill requires a writable Bytes field or a named writable byte view",
+        ));
+    }
+    let target = environment
+        .byte_view_source(&refill.destination, Access::Readwrite, definitions)?
+        .ok_or_else(|| CheckError::new("refill destination requires a live byte field"))?;
     expressions::expression(&refill.limit, definitions, Context::Execution(environment))?;
     // Inspect all active scopes, even if an inner name hides a view binding.
     // Same-root paths can reach the same record through independent borrows.
     if environment.scopes.iter().any(|scope| {
-        scope.values().any(|binding| {
-            matches!(binding, Binding::Received { root, path }
-                if *root == target.root && *path == refill.path)
-        })
+        scope
+            .values()
+            .any(|binding| matches!(binding, Binding::Received(origin) if *origin == target))
     }) {
         return Err(CheckError::new(
             "cannot refill a byte field while its received view is live",
         ));
     }
     environment.scopes.push(HashMap::new());
-    environment.insert(
-        &refill.data_name,
-        Binding::Received {
-            root: target.root,
-            path: &refill.path,
-        },
-    )?;
+    environment.insert(&refill.data_name, Binding::Received(target))?;
     operations(&refill.data_body, definitions, environment)?;
     environment.scopes.pop();
     // Nondata outcomes contain a readonly status only. Discard Data authority

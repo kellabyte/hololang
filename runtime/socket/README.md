@@ -42,9 +42,7 @@ idle. Each row validates its I/O phase and checks half-close after the clock
 stops. The shorter `--tcp-check` also induces write backpressure in a separate
 fixture. It retains the unsent suffix, enables writer interest on would-block,
 and verifies exact delivery and interest removal after progress.
-[Apple kqueue manual](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/kqueue.2.html) ·
-[TCP qualification](../../evidence/socket-tcp-qualification-20261112/README.md) ·
-[Initial Unix qualification](../../evidence/socket-library-20261112/README.md)
+[Apple kqueue manual](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/kqueue.2.html)
 
 ### Descriptor reuse and writer rearm
 

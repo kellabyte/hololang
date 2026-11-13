@@ -17,7 +17,7 @@ table outcomes, and reply bytes against independent oracles. The
 The macOS arm64 implementation passes offline parsing, bounded store
 conformance, inherited-stream replies, and the loopback `redis-cli -2`
 check. The listener keeps the Holo entry and its table alive across clients.
-[Verification record](../evidence/resp2-server-20261112/README.md)
+[Preview verification](releases/unreleased.md#verification)
 
 ## What 0.1 should demonstrate
 
@@ -51,8 +51,9 @@ with `redis-cli`.
 ### 1. Parse RESP2 in Holo
 
 **Implemented.** The same parser is compiled into the offline verifier and
-the server. It publishes a copied request descriptor and returns a scalar
-status through the current writable-state ABI.
+the server. It publishes a copied request descriptor only on success and
+returns a typed outcome. The session loop handles the named cases directly.
+The replay verifier reads the same outcomes through a numeric adapter.
 
 Start with offline request replay using the existing input path and the
 [fragmented frame reader](../tests/fixtures/typed_stream_reader.holo) as a checked
@@ -62,9 +63,10 @@ multiple requests in one read, embedded NUL and CRLF, empty payloads, oversized
 lengths, arithmetic overflow, malformed commands, and truncated input. Use an
 independent oracle for command identity, consumed extent, and payload bytes.
 
-Add byte comparison, checked decimal parsing, and bounded reply formatting as
-the application needs them. Extract the reusable operations into `holo.bytes`
-when the supported borrowing and destination rules admit the interface.
+The server uses `holo.bytes` for search, comparison, and moves over checked borrowed
+ranges, `holo.buffer` for pending input, and `holo.decimal` for checked decimal
+parsing and formatting. RESP framing and protocol size limits stay in the
+application.
 
 ### 2. Give the store its own bounded storage
 
@@ -109,12 +111,29 @@ public socket API.
 
 ## Public preview gate
 
-From a clean release tree on the documented macOS arm64 profile, build with the
-published toolchain instructions, start the server, and reproduce the client
-demo, including an overwrite and a rejected request. Run the protocol and store
-oracles, native connection checks, and applicable workspace checks in CI. Choose
-the release license, review source dependencies, and check evidence links in the
-public export. Qualify other targets separately.
+Run the preview check from a Git checkout or extracted candidate on macOS arm64. Install Rust 1.88 or
+later, Python 3.10 or later, a matched LLVM toolchain, and `redis-cli`. For the
+same LLVM and Redis release series as CI, use Homebrew.
+
+```sh
+brew install llvm@22 redis@8.2
+export HOLO_LLVM_PREFIX="$(brew --prefix llvm@22)"
+export PATH="$(brew --prefix redis@8.2)/bin:$PATH"
+make check
+```
+
+The check copies a checkout's tracked and unignored new files into a temporary
+source tree or builds directly from an extracted candidate. It uses a fresh
+Cargo target directory and checks the exact Hello World
+output, runs the Redis parser oracle, and exercises stream and IPv4 loopback
+replies, including an overwrite, a rejected request, and a reconnect. The
+loopback check requires permission to listen on an ephemeral port. When Cargo
+dependencies are already cached, run `python3 -B tools/check.py --offline`.
+
+The [preview workflow](../.github/workflows/preview.yml) runs the same command
+from a clean checkout on macOS arm64 and runs the workspace tests.
+`make archive` creates the source candidate and checksum. Qualify other
+targets separately. [Release notes and archive instructions](releases/unreleased.md)
 
 The [implementation plan](implementation-plan.md) retains compiler milestone
 status and evidence. The [specification](spec.md) governs language decisions for

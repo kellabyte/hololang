@@ -375,6 +375,52 @@ fn packaged_sources_share_private_helpers_and_native_lowering() {
     }
 }
 
+#[test]
+fn public_boolean_parameters_forward_across_package_namespaces() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "telemetry/src/main.holo",
+        r#"using telemetry.protocol
+func main returns u64 {
+    let accepted = protocol.accepts(1 < 2)
+    core.assert(accepted)
+    core.assert(not protocol.accepts(false))
+    return 0
+}
+"#,
+    );
+    fixture.write(
+        "telemetry/src/protocol.holo",
+        r#"namespace telemetry.protocol
+using wire.octets
+public func accepts arg valid bool as readonly copy returns bool {
+    return octets.pass(valid and true)
+}
+"#,
+    );
+    fixture.write(
+        "wire/src/octets.holo",
+        r#"namespace wire.octets
+public func pass arg valid bool as readonly copy returns bool { return valid }
+"#,
+    );
+    fixture.lock();
+    success(
+        fixture
+            .metadata_command("check")
+            .arg("--locked")
+            .output()
+            .unwrap(),
+    );
+    success(
+        fixture
+            .command("run")
+            .args(["--locked", "--release"])
+            .output()
+            .unwrap(),
+    );
+}
+
 /// A lock requires explicit creation, survives root source edits, and changes
 /// when a dependency's raw source or manifest changes. Verify that refresh
 /// restores locked checking and produces byte-identical locks for equal inputs.
@@ -747,26 +793,665 @@ fn shipped_standard_library_passes_strict_naming() {
     assert!(success(output).is_empty());
 }
 
+/// Prepare an application that imports the shipped standard library. The
+/// temporary fixture owns the dependency link and all generated output.
+fn stdlib_fixture(source: &str) -> Fixture {
+    let fixture = Fixture::new();
+    let shipped = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../lib/holo");
+    std::os::unix::fs::symlink(shipped, fixture.path("stdlib")).unwrap();
+    fixture.write(
+        "telemetry/holo.toml",
+        &format!("{MANIFEST}holo = {{ path = \"../stdlib\", version = \"^0.1\" }}\n"),
+    );
+    fixture.write("telemetry/src/main.holo", source);
+    fixture
+}
+
+/// Verify the public decimal APIs on full-width values and bounded views.
+/// The emitted bytes are compared with an independent Rust decimal reference.
+#[test]
+fn decimal_library_handles_u64_boundaries_and_preserves_short_buffers() {
+    use std::fmt::Write as _;
+
+    let values = [
+        0_u64,
+        9,
+        10,
+        999,
+        1_000,
+        10_000_000_000_000_000_000,
+        u64::MAX,
+    ];
+    let mut calls = String::new();
+    let mut expected = String::new();
+    for value in values {
+        // Exercise the native prefix bytes, not only an encoder/decoder round trip.
+        writeln!(
+            calls,
+            "    let parsed_{value} = check_value(slot.data, {value})"
+        )
+        .unwrap();
+        writeln!(calls, "    for index in core.range(decimal.digit_count({value})) {{ core.print(slot.data[index]) }}").unwrap();
+        writeln!(calls, "    core.print(parsed_{value})").unwrap();
+        let digits = value.to_string();
+        for digit in digits.bytes() {
+            writeln!(expected, "{digit}").unwrap();
+        }
+        writeln!(expected, "{value}").unwrap();
+    }
+    // The MAX representation ends with `5`. Change it to `6` to witness a
+    // full-width overflow in both complete and delimiter-terminated scanning.
+    let entry = r#"
+using holo.decimal
+
+struct Slot { data Bytes }
+
+func slot returns Slot {
+    return Slot { data: core.bytes(21, 255) }
+}
+
+// Format into the exact extent, compare its width, then parse it back.
+func check_value
+    arg output Bytes as readwrite reference
+    arg value u64 as readonly copy
+    returns u64
+{
+    var count = 0
+    let required = decimal.digit_count(value)
+    decimal.write_u64(core.prefix(output, required), value)
+        on ok(written) then { count = written }
+        on ShortBuffer(_) then { core.assert(false) }
+    core.assert(count == required)
+    output[count] = 255
+    // Keep a non-ASCII byte immediately after the valid digit view.
+    return decimal.parse_u64(core.prefix(output, count))
+        on ok(parsed) then parsed
+        on error then core.xor(value, 1)
+}
+
+func main returns u64 {
+    let memory = core.region(128) else { return 0 }
+    let slots = core.batch(memory, Slot)
+    let allocated = core.append(slots, slot())
+    core.assert(allocated == 0)
+    let slot = core.borrow_readwrite(slots, 0)
+    // __FULL_WIDTH_CALLS__
+    slot.data[0] = 255
+    slot.data[18] = 255
+    decimal.write_u64(core.prefix(slot.data, 19), 18446744073709551615)
+        on ok then { core.assert(false) }
+        on ShortBuffer(required) then {
+            core.assert(required == 20)
+            core.assert(slot.data[0] == 255)
+            core.assert(slot.data[18] == 255)
+            core.assert(slot.data[19] == 53)
+            core.assert(slot.data[20] == 255)
+        }
+    slot.data[0] = 49
+    slot.data[18] = 49
+    decimal.parse_u64_until(core.prefix(slot.data, 20), 13)
+        on NeedTerminator then {}
+        on ok then { core.assert(false) }
+        on error then { core.assert(false) }
+    slot.data[20] = 13
+    decimal.parse_u64_until(slot.data, 13)
+        on ok(value) then { core.assert(value == 18446744073709551615) }
+        on error then { core.assert(false) }
+    slot.data[19] = 54
+    decimal.parse_u64(core.prefix(slot.data, 20))
+        on Overflow then {}
+        on ok then { core.assert(false) }
+        on error then { core.assert(false) }
+    decimal.parse_u64_until(core.prefix(slot.data, 20), 13)
+        on Overflow then {}
+        on ok then { core.assert(false) }
+        on error then { core.assert(false) }
+    slot.data[0] = 48
+    slot.data[1] = 48
+    decimal.parse_u64(core.prefix(slot.data, 2))
+        on Malformed then {}
+        on ok then { core.assert(false) }
+        on error then { core.assert(false) }
+    decimal.parse_u64(core.prefix(slot.data, 0))
+        on Malformed then {}
+        on ok then { core.assert(false) }
+        on error then { core.assert(false) }
+    return 0
+}
+"#;
+    let fixture = stdlib_fixture(&entry.replace("    // __FULL_WIDTH_CALLS__", &calls));
+    fixture.lock();
+    for options in [None, Some("--release")] {
+        let output = fixture
+            .command("run")
+            .arg("--locked")
+            .args(options)
+            .output()
+            .unwrap();
+        assert_eq!(success(output), expected.as_bytes());
+    }
+}
+
+/// Exercise the shipped equality and move APIs through their locked package.
+/// Forward and backward overlap each require the original source bytes.
+#[test]
+fn byte_library_compares_exact_views_and_moves_overlapping_bytes() {
+    let fixture = stdlib_fixture(
+        r#"
+using holo.bytes
+
+struct Slot { data Bytes }
+
+func seed returns Slot {
+    return Slot { data: core.bytes(5, core.index()) }
+}
+
+func main returns u64 {
+    let memory = core.region(256) else { core.assert(false); return 0 }
+    let slots = core.batch(memory, Slot)
+    let first_status = core.append(slots, seed())
+    let second_status = core.append(slots, seed())
+    core.assert(first_status == 0)
+    core.assert(second_status == 0)
+    let slot = core.borrow_readwrite(slots, 0)
+    let original = core.borrow_readonly(slots, 1)
+
+    let equal = bytes.equal(core.subrange(slot.data, 1, 2), core.subrange(original.data, 1, 2))
+    core.assert(equal)
+    if bytes.equal(core.subrange(slot.data, 1, 2), core.subrange(original.data, 2, 2)) {
+        core.assert(false)
+    }
+    if bytes.equal(core.prefix(slot.data, 1), core.prefix(original.data, 2)) {
+        core.assert(false)
+    }
+    core.assert(bytes.equal(core.subrange(slot.data, 5, 0), core.prefix(original.data, 0)))
+    core.assert(bytes.equal_ignore_ascii_case(b"GeT\xff\0", b"get\xff\0"))
+    core.assert(not bytes.equal_ignore_ascii_case(b"G\xc7T", b"get"))
+    core.assert(not bytes.equal_ignore_ascii_case(b"@", b"\x60"))
+    core.assert(not bytes.equal_ignore_ascii_case(b"a", b"A\0"))
+
+    let moved_right = bytes.move(core.subrange(slot.data, 1, 4), core.prefix(slot.data, 3))
+    core.assert(moved_right == 3)
+    core.assert(bytes.equal(core.subrange(slot.data, 1, 3), core.prefix(original.data, 3)))
+    core.assert(slot.data[0] == 0)
+    core.assert(slot.data[4] == 4)
+
+    let moved_left = bytes.move(core.prefix(slot.data, 4), core.subrange(slot.data, 1, 3))
+    core.assert(moved_left == 3)
+    core.assert(bytes.equal(core.prefix(slot.data, 3), core.prefix(original.data, 3)))
+    core.assert(slot.data[3] == 2)
+    core.assert(slot.data[4] == 4)
+
+    let moved_same = bytes.move(slot.data, slot.data)
+    let moved_empty = bytes.move(slot.data, core.subrange(slot.data, 5, 0))
+    core.assert(moved_same == 5)
+    core.assert(moved_empty == 0)
+    core.assert(slot.data[3] == 2)
+    core.assert(slot.data[4] == 4)
+    return 0
+}
+"#,
+    );
+    fixture.lock();
+    for options in [None, Some("--release")] {
+        assert!(
+            success(
+                fixture
+                    .command("run")
+                    .arg("--locked")
+                    .args(options)
+                    .output()
+                    .unwrap()
+            )
+            .is_empty()
+        );
+    }
+}
+
+/// The first match is relative to the lent view and cannot come from the
+/// backing bytes outside that view.
+#[test]
+fn byte_library_finds_first_octet_in_the_view() {
+    let fixture = stdlib_fixture(
+        r#"
+using holo.bytes
+
+struct Slot { data Bytes }
+
+func seed returns Slot {
+    return Slot { data: core.bytes(6, 0) }
+}
+
+func main returns u64 {
+    let memory = core.region(128) else { core.assert(false); return 0 }
+    let slots = core.batch(memory, Slot)
+    let status = core.append(slots, seed())
+    core.assert(status == 0)
+    let slot = core.borrow_readwrite(slots, 0)
+    slot.data[1] = 13
+    slot.data[3] = 13
+    slot.data[4] = 255
+
+    let input = core.subrange(slot.data, 1, 3)
+    bytes.find(input, 13)
+        on Some(index) then { core.assert(index == 0) }
+        on None then { core.assert(false) }
+    bytes.find(input, 0)
+        on Some(index) then { core.assert(index == 1) }
+        on None then { core.assert(false) }
+    bytes.find(input, 255)
+        on Some(_) then { core.assert(false) }
+        on None then {}
+    bytes.find(slot.data, 255)
+        on Some(index) then { core.assert(index == 4) }
+        on None then { core.assert(false) }
+    bytes.find(input, 269)
+        on Some(_) then { core.assert(false) }
+        on None then {}
+    bytes.find(core.prefix(input, 0), 13)
+        on Some(_) then { core.assert(false) }
+        on None then {}
+    return 0
+}
+"#,
+    );
+    fixture.lock();
+    for options in [None, Some("--release")] {
+        let output = fixture
+            .command("run")
+            .arg("--locked")
+            .args(options)
+            .output()
+            .unwrap();
+        assert!(success(output).is_empty());
+    }
+}
+
+/// Check each endian reader with offset views, including a width-short view
+/// whose backing storage still holds enough bytes to read the full field.
+#[test]
+fn byte_library_reads_unsigned_integers_within_the_view() {
+    use std::fmt::Write as _;
+
+    let source = r#"
+using holo.bytes.read
+
+struct Slot { data Bytes }
+
+func seed returns Slot {
+    return Slot { data: core.bytes(12, core.add_wrapping(128, core.index())) }
+}
+
+func main returns u64 {
+    let memory = core.region(128) else { core.assert(false); return 0 }
+    let slots = core.batch(memory, Slot)
+    let status = core.append(slots, seed())
+    core.assert(status == 0)
+    let slot = core.borrow_readonly(slots, 0)
+    // __READERS__
+    return 0
+}
+"#;
+    let octets = [129, 130, 131, 132, 133, 134, 135, 136];
+    let mut checks = String::new();
+    for width in [2, 4, 8] {
+        let mut little = [0; 8];
+        little[..width].copy_from_slice(&octets[..width]);
+        let mut big = [0; 8];
+        big[8 - width..].copy_from_slice(&octets[..width]);
+        for (order, expected) in [
+            ("le", u64::from_le_bytes(little)),
+            ("be", u64::from_be_bytes(big)),
+        ] {
+            let reader = format!("read.u{}_{order}", width * 8);
+            for length in [width, 9] {
+                writeln!(
+                    checks,
+                    "    {reader}(core.subrange(slot.data, 1, {length}))
+        on ok(value) then {{ core.assert(value == {expected}) }}
+        on Short(_) then {{ core.assert(false) }}"
+                )
+                .unwrap();
+            }
+            for length in [0, width - 1] {
+                writeln!(
+                    checks,
+                    "    {reader}(core.subrange(slot.data, 1, {length}))
+        on ok then {{ core.assert(false) }}
+        on Short(required) then {{ core.assert(required == {width}) }}"
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    let fixture = stdlib_fixture(&source.replace("    // __READERS__", &checks));
+    fixture.lock();
+    for options in [None, Some("--release")] {
+        let output = fixture
+            .command("run")
+            .arg("--locked")
+            .args(options)
+            .output()
+            .unwrap();
+        assert!(success(output).is_empty());
+    }
+}
+
+/// Retry a short field at a nonzero cursor position with a wider view. This
+/// also checks that each successful read advances by its own width.
+#[test]
+fn binary_cursor_advances_only_after_a_complete_field() {
+    let fixture = stdlib_fixture(
+        r#"
+using holo.bytes.read
+
+struct Slot { data Bytes }
+
+func seed returns Slot {
+    return Slot { data: core.bytes(30, core.add_wrapping(128, core.index())) }
+}
+
+func main returns u64 {
+    let memory = core.region(256) else { core.assert(false); return 0 }
+    let slots = core.batch(memory, Slot)
+    let status = core.append(slots, seed())
+    core.assert(status == 0)
+    let slot = core.borrow_readonly(slots, 0)
+
+    let cursor_memory = core.region(128) else { core.assert(false); return 0 }
+    let cursors = core.batch(cursor_memory, read.Cursor)
+    let cursor_ready = core.append(cursors, read.start())
+    core.assert(cursor_ready == 0)
+    let scan = core.borrow_readwrite(cursors, 0)
+    core.assert(scan.position == 0)
+
+    let short = core.prefix(slot.data, 2)
+    read.take_u8(scan, short)
+        on ok(value) then { core.assert(value == 128) }
+        on Short(_) then { core.assert(false) }
+    core.assert(scan.position == 1)
+
+    read.take_u16_le(scan, short)
+        on ok then { core.assert(false) }
+        on Short(required) then { core.assert(required == 2) }
+    core.assert(scan.position == 1)
+
+    let complete = core.prefix(slot.data, 29)
+    read.take_u16_le(scan, complete)
+        on ok(value) then { core.assert(value == 0x8281) }
+        on Short(_) then { core.assert(false) }
+    core.assert(scan.position == 3)
+    read.take_u16_be(scan, complete)
+        on ok(value) then { core.assert(value == 0x8384) }
+        on Short(_) then { core.assert(false) }
+    core.assert(scan.position == 5)
+    read.take_u32_le(scan, complete)
+        on ok(value) then { core.assert(value == 0x88878685) }
+        on Short(_) then { core.assert(false) }
+    core.assert(scan.position == 9)
+    read.take_u32_be(scan, complete)
+        on ok(value) then { core.assert(value == 0x898A8B8C) }
+        on Short(_) then { core.assert(false) }
+    core.assert(scan.position == 13)
+    read.take_u64_le(scan, complete)
+        on ok(value) then { core.assert(value == 0x94939291908F8E8D) }
+        on Short(_) then { core.assert(false) }
+    core.assert(scan.position == 21)
+    read.take_u64_be(scan, complete)
+        on ok(value) then { core.assert(value == 0x95969798999A9B9C) }
+        on Short(_) then { core.assert(false) }
+    core.assert(scan.position == 29)
+
+    read.take_u8(scan, complete)
+        on ok then { core.assert(false) }
+        on Short(required) then { core.assert(required == 1) }
+    core.assert(scan.position == 29)
+    scan.position = 18446744073709551615
+    read.take_u64_be(scan, complete)
+        on ok then { core.assert(false) }
+        on Short(required) then { core.assert(required == 8) }
+    core.assert(scan.position == 18446744073709551615)
+    return 0
+}
+"#,
+    );
+    fixture.lock();
+    for mode in ["wide", "derived", "compact"] {
+        for options in [None, Some("--release")] {
+            let output = fixture
+                .command("run")
+                .args(["--locked", "--layout", mode])
+                .args(options)
+                .output()
+                .unwrap();
+            assert!(success(output).is_empty());
+        }
+    }
+}
+
+/// Exercise writes through named views, including overlapping source bytes,
+/// recovery from short output, and preservation of every byte on failure.
+#[test]
+fn byte_writer_checks_the_entire_operation_before_changing_output() {
+    let fixture = stdlib_fixture(
+        r#"
+using holo.bytes.write
+
+struct Slot { data Bytes }
+
+func seed returns Slot {
+    return Slot { data: core.bytes(40, core.add_wrapping(128, core.index())) }
+}
+
+func main returns u64 {
+    let memory = core.region(256) else { core.assert(false); return 0 }
+    let slots = core.batch(memory, Slot)
+    let status = core.append(slots, seed())
+    core.assert(status == 0)
+    let slot = core.borrow_readwrite(slots, 0)
+
+    let cursor_memory = core.region(128) else { core.assert(false); return 0 }
+    let cursors = core.batch(cursor_memory, write.Cursor)
+    let cursor_ready = core.append(cursors, write.start())
+    core.assert(cursor_ready == 0)
+    let scan = core.borrow_readwrite(cursors, 0)
+    core.assert(scan.position == 0)
+
+    let readwrite output = core.subrange(slot.data, 4, 6)
+    let readwrite narrow = core.prefix(output, 3)
+    let source = core.subrange(slot.data, 1, 5)
+    write.put_u8(scan, output, 255)
+        on ok(count) then { core.assert(count == 1) }
+        on error then { core.assert(false) }
+    core.assert(scan.position == 1)
+
+    write.put_u8(scan, narrow, 256)
+        on InvalidOctet(value) then { core.assert(value == 256) }
+        on ok then { core.assert(false) }
+        on error then { core.assert(false) }
+    core.assert(scan.position == 1)
+    write.put_bytes(scan, narrow, source)
+        on Short(required) then { core.assert(required == 5) }
+        on ok then { core.assert(false) }
+        on error then { core.assert(false) }
+    core.assert(scan.position == 1)
+    core.assert(slot.data[4] == 255)
+    for index in core.range(5) {
+        core.assert(slot.data[core.add_wrapping(5, index)] == core.add_wrapping(133, index))
+    }
+
+    write.put_bytes(scan, output, source)
+        on ok(count) then { core.assert(count == 5) }
+        on error then { core.assert(false) }
+    core.assert(scan.position == 6)
+    let empty = core.prefix(source, 0)
+    write.put_bytes(scan, output, empty)
+        on ok(count) then { core.assert(count == 0) }
+        on error then { core.assert(false) }
+    core.assert(scan.position == 6)
+    write.put_u8(scan, output, 0)
+        on Short(required) then { core.assert(required == 1) }
+        on ok then { core.assert(false) }
+        on error then { core.assert(false) }
+    core.assert(scan.position == 6)
+    core.assert(slot.data[10] == 138)
+
+    scan.position = 0
+    let overlap = core.subrange(slot.data, 5, 5)
+    write.put_bytes(scan, output, overlap)
+        on ok(count) then { core.assert(count == 5) }
+        on error then { core.assert(false) }
+    core.assert(scan.position == 5)
+
+    scan.position = 0
+    let readwrite digits = core.subrange(slot.data, 12, 21)
+    write.put_decimal(scan, digits, 0)
+        on ok(count) then { core.assert(count == 1) }
+        on error then { core.assert(false) }
+    core.assert(scan.position == 1)
+    let readwrite short_digits = core.prefix(digits, 20)
+    write.put_decimal(scan, short_digits, 18446744073709551615)
+        on Short(required) then { core.assert(required == 20) }
+        on ok then { core.assert(false) }
+        on error then { core.assert(false) }
+    core.assert(scan.position == 1)
+    core.assert(digits[0] == 48)
+    for index in core.range(20) {
+        core.assert(digits[core.add_wrapping(index, 1)] == core.add_wrapping(141, index))
+    }
+    write.put_decimal(scan, digits, 18446744073709551615)
+        on ok(count) then { core.assert(count == 20) }
+        on error then { core.assert(false) }
+    core.assert(scan.position == 21)
+
+    scan.position = 18446744073709551615
+    write.put_bytes(scan, output, empty)
+        on Short(required) then { core.assert(required == 0) }
+        on ok then { core.assert(false) }
+        on error then { core.assert(false) }
+    write.put_decimal(scan, digits, 18446744073709551615)
+        on Short(required) then { core.assert(required == 20) }
+        on ok then { core.assert(false) }
+        on error then { core.assert(false) }
+    core.assert(scan.position == 18446744073709551615)
+
+    for index in core.range(core.len(slot.data)) {
+        core.print(slot.data[index])
+    }
+    return 0
+}
+"#,
+    );
+    fixture.lock();
+    let mut expected: Vec<u8> = (128..168).collect();
+    expected[4..10].copy_from_slice(&[129, 130, 131, 255, 133, 133]);
+    expected[12..33].copy_from_slice(b"018446744073709551615");
+    let expected: String = expected.iter().map(|byte| format!("{byte}\n")).collect();
+    for mode in ["wide", "derived", "compact"] {
+        for options in [None, Some("--release")] {
+            let output = fixture
+                .command("run")
+                .args(["--locked", "--layout", mode])
+                .args(options)
+                .output()
+                .unwrap();
+            assert_eq!(success(output), expected.as_bytes());
+        }
+    }
+}
+
+/// A valid pair of views can still be too short for the requested move.
+/// Check the actual executable's trap signal at both optimization levels.
+#[test]
+fn byte_library_move_traps_on_short_destination() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let fixture = stdlib_fixture(
+        r#"
+using holo.bytes
+
+struct Slot { data Bytes }
+func seed returns Slot {
+    return Slot { data: core.bytes(5, core.index()) }
+}
+
+func main returns u64 {
+    let memory = core.region(128) else { return 0 }
+    let slots = core.batch(memory, Slot)
+    let status = core.append(slots, seed())
+    if status != 0 { return 0 }
+    let slot = core.borrow_readwrite(slots, 0)
+    core.print(bytes.move(core.prefix(slot.data, 2), core.subrange(slot.data, 1, 3)))
+    return 0
+}
+"#,
+    );
+    fixture.lock();
+    let expected_signal = match std::env::consts::ARCH {
+        "aarch64" => 5,
+        "x86_64" => 4,
+        architecture => panic!("native trap signal needs an explicit {architecture} expectation"),
+    };
+    for (name, options) in [("o0", None), ("o3", Some("--release"))] {
+        let executable = fixture.path(name);
+        success(
+            fixture
+                .command("build")
+                .args(["--locked", "-o"])
+                .arg(&executable)
+                .args(options)
+                .output()
+                .unwrap(),
+        );
+        let output = Command::new(executable).output().unwrap();
+        assert_eq!(output.status.signal(), Some(expected_signal), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+    }
+}
+
+/// A forwarded readonly view cannot be upgraded to the library's writable
+/// destination even when an earlier caller might hold a writable reference.
+#[test]
+fn byte_library_move_rejects_forwarded_readonly_destination() {
+    let fixture = stdlib_fixture(
+        r#"
+using holo.bytes
+
+struct Slot { data Bytes }
+func seed returns Slot {
+    return Slot { data: core.bytes(5, core.index()) }
+}
+
+func attempt_move
+    arg input Bytes as readonly reference
+    returns u64
+{
+    return bytes.move(core.prefix(input, 1), input)
+}
+
+func main returns u64 {
+    let memory = core.region(128) else { return 0 }
+    let slots = core.batch(memory, Slot)
+    let status = core.append(slots, seed())
+    if status != 0 { return 0 }
+    let slot = core.borrow_readwrite(slots, 0)
+    core.print(attempt_move(slot.data))
+    return 0
+}
+"#,
+    );
+    let output = fixture.metadata_command("check").output().unwrap();
+    assert_terms(
+        &rejection(output),
+        &["main.holo", "readwrite Bytes parameter"],
+    );
+}
+
 /// Validate the shipped socket adapters at the package and native stream boundaries.
 mod socket_results {
-    use super::{Fixture, MANIFEST, hosted_stream, success};
+    use super::{hosted_stream, stdlib_fixture, success};
     use std::fmt::Write;
-    use std::os::unix::fs::symlink;
-    use std::path::PathBuf;
-
-    /// Prepare an application that imports the actual shipped provider.
-    /// The temporary fixture owns the dependency link and all generated output.
-    fn stdlib_fixture(source: &str) -> Fixture {
-        let fixture = Fixture::new();
-        let shipped = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../lib/holo");
-        symlink(shipped, fixture.path("stdlib")).unwrap();
-        fixture.write(
-            "telemetry/holo.toml",
-            &format!("{MANIFEST}holo = {{ path = \"../stdlib\", version = \"^0.1\" }}\n"),
-        );
-        fixture.write("telemetry/src/main.holo", source);
-        fixture
-    }
 
     /// Runtime outcomes map to disjoint observation ranges in the witness.
     /// Raw counts print unchanged. Native codes print with this added base.
@@ -788,7 +1473,7 @@ mod socket_results {
         const FIRST_NATIVE: u64 = NATIVE_BASE + 1;
         const LAST_NATIVE: u64 = NATIVE_BASE + MAX_COUNT;
         const PROBE: &str = r#"
-// Observe the three socket results through a locked package without allocation.
+// Observe socket and session results through a locked package without allocation.
 // Counters and typed error observations occupy separate numeric ranges.
 namespace telemetry.socket_probe
 using holo.net
@@ -844,26 +1529,44 @@ public func observe_wait with noalloc, noblock
         on net.SocketError.Native(code) then core.add_wrapping(4294967296, code)
         on net.SocketError.InvalidStatus then 8589934594
 }
+
+// Distinguish an admitted client from the end of a single-descriptor entry.
+public func observe_session with noalloc, noblock
+    arg status u64 as readonly copy
+    returns u64
+{
+    return net.next_session_result(status)
+        on ok(accepted) then accepted
+        on net.SessionError.End then 1
+        on net.SessionError.Interrupted then 8589934592
+        on net.SessionError.Native(code) then core.add_wrapping(4294967296, code)
+        on net.SessionError.InvalidStatus then 8589934594
+}
 "#;
 
         let cases = [
-            (0, [0, INVALID, 0]),
-            (1, [1, 1, INVALID]),
-            (23, [23, 23, INVALID]),
-            (MAX_COUNT, [MAX_COUNT, MAX_COUNT, INVALID]),
-            (MAX_COUNT + 1, [INVALID; 3]),
-            (NATIVE_TAG - 1, [INVALID; 3]),
-            (NATIVE_TAG, [INVALID; 3]),
-            (NATIVE_TAG | 1, [FIRST_NATIVE; 3]),
-            (NATIVE_TAG | 123, [NATIVE_BASE + 123; 3]),
-            (NATIVE_TAG | MAX_COUNT, [LAST_NATIVE; 3]),
-            (NATIVE_TAG | (MAX_COUNT + 1), [INVALID; 3]),
-            (NATIVE_TAG | (1 << 32) | 1, [INVALID; 3]),
-            (u64::MAX - 2, [INVALID; 3]),
-            (u64::MAX - 1, [WOULD_BLOCK, WOULD_BLOCK, INVALID]),
-            (u64::MAX, [INTERRUPTED; 3]),
+            (0, [0, INVALID, 0, 0]),
+            (1, [1, 1, INVALID, 1]),
+            (23, [23, 23, INVALID, INVALID]),
+            (MAX_COUNT, [MAX_COUNT, MAX_COUNT, INVALID, INVALID]),
+            (MAX_COUNT + 1, [INVALID; 4]),
+            (NATIVE_TAG - 1, [INVALID; 4]),
+            (NATIVE_TAG, [INVALID; 4]),
+            (NATIVE_TAG | 1, [FIRST_NATIVE; 4]),
+            (NATIVE_TAG | 123, [NATIVE_BASE + 123; 4]),
+            (NATIVE_TAG | MAX_COUNT, [LAST_NATIVE; 4]),
+            (NATIVE_TAG | (MAX_COUNT + 1), [INVALID; 4]),
+            (NATIVE_TAG | (1 << 32) | 1, [INVALID; 4]),
+            (u64::MAX - 2, [INVALID; 4]),
+            (u64::MAX - 1, [WOULD_BLOCK, WOULD_BLOCK, INVALID, INVALID]),
+            (u64::MAX, [INTERRUPTED; 4]),
         ];
-        let operations = ["observe_recv", "observe_send", "observe_wait"];
+        let operations = [
+            "observe_recv",
+            "observe_send",
+            "observe_wait",
+            "observe_session",
+        ];
         let mut entry = String::from(
             "// Print the independently classified results in status and operation order.\n\
              using telemetry.socket_probe\n\
@@ -921,11 +1624,11 @@ public func observe_wait with noalloc, noblock
     }
 
     /// Drive the real hosted runtime with a connected stream. Its wait, send,
-    /// and empty receive words cross the package API as typed outcomes.
+    /// empty receive and terminal session words cross the API as typed outcomes.
     #[test]
     fn socket_status_results_accept_native_connected_stream_progress() {
         const ENTRY: &str = r#"
-// Feed native wait, send, and empty receive outcomes to the socket adapters.
+// Feed native wait, send, receive and session outcomes to the socket adapters.
 using holo.net
 
 // Own three initialized reply bytes inline until the synchronous send returns.
@@ -965,6 +1668,12 @@ func main returns u64 {
             on error then 99
         core.print(read)
     }
+    let next = core.next_session()
+    let ended = net.next_session_result(next)
+        on ok then 98
+        on End then 1
+        on error then 99
+    core.print(ended)
     return 0
 }
 "#;
@@ -981,8 +1690,8 @@ func main returns u64 {
         );
         let open = hosted_stream::read_stream(&executable, &[], false);
         let half_closed = hosted_stream::read_stream(&executable, &[], true);
-        assert_eq!(open.stdout, b"0\n3\n4\n");
-        assert_eq!(half_closed.stdout, b"0\n3\n0\n");
+        assert_eq!(open.stdout, b"0\n3\n4\n1\n");
+        assert_eq!(half_closed.stdout, b"0\n3\n0\n1\n");
     }
 }
 
@@ -1399,6 +2108,105 @@ mod fixed_records {
     const HEADER: &str = "namespace wire.frame
 public struct Header { payload_length u64, kind u64 }
 ";
+
+    /// A package function and its caller use the same imported batch element identity.
+    #[test]
+    fn borrowed_batch_parameter_binds_public_schema() {
+        let fixture = Fixture::new();
+        fixture.write("wire/src/frame/header.holo", HEADER);
+        fixture.write("wire/src/frame/make.holo", MAKE);
+        fixture.write(
+            "wire/src/frame/count.holo",
+            r#"
+namespace wire.frame
+public func count arg headers Batch<Header> as readonly reference returns u64 {
+    return core.len(headers)
+}
+"#,
+        );
+        fixture.write(
+            "telemetry/src/main.holo",
+            r#"
+using wire.frame
+func count arg headers Batch<frame.Header> as readonly reference returns u64 {
+    return frame.count(headers)
+}
+func main returns u64 {
+    let memory = core.region(128) else { core.assert(false); return 0 }
+    let headers = core.batch(memory, frame.Header)
+    let status = core.append(headers, frame.make(2, 1))
+    core.assert(status == 0)
+    core.assert(count(headers) == 1)
+    return 0
+}
+"#,
+        );
+        assert!(success(fixture.metadata_command("check").output().unwrap()).is_empty());
+        fixture.write(
+            "wire/src/frame/header.holo",
+            &HEADER.replace("public struct", "struct"),
+        );
+        // Remove the constructor export so the borrowed signature is the only leak.
+        fixture.write(
+            "wire/src/frame/make.holo",
+            &MAKE.replace("public func", "func"),
+        );
+        assert_terms(
+            &rejection(fixture.metadata_command("check").output().unwrap()),
+            &["count.holo", "private struct `Header`"],
+        );
+    }
+
+    /// A fixed state borrow resolves across packages and preserves public
+    /// signature visibility at the provider boundary.
+    #[test]
+    fn borrowed_fixed_state_parameter_binds_public_schema() {
+        let fixture = Fixture::new();
+        fixture.write("wire/src/frame/header.holo", HEADER);
+        fixture.write("wire/src/frame/make.holo", MAKE);
+        fixture.write(
+            "wire/src/frame/advance.holo",
+            r#"
+namespace wire.frame
+public func advance arg header Header as readwrite reference returns u64 {
+    header.payload_length = core.add_wrapping(header.payload_length, 1)
+    return header.payload_length
+}
+"#,
+        );
+        fixture.write(
+            "telemetry/src/main.holo",
+            r#"
+using wire.frame
+func advance arg header frame.Header as readwrite reference returns u64 {
+    return frame.advance(header)
+}
+func main returns u64 {
+    let memory = core.region(128) else { core.assert(false); return 0 }
+    let headers = core.batch(memory, frame.Header)
+    let status = core.append(headers, frame.make(2, 1))
+    core.assert(status == 0)
+    let header = core.borrow_readwrite(headers, 0)
+    core.assert(advance(header) == 3)
+    core.assert(header.payload_length == 3)
+    return 0
+}
+"#,
+        );
+        assert!(success(fixture.command("run").output().unwrap()).is_empty());
+        fixture.write(
+            "wire/src/frame/header.holo",
+            &HEADER.replace("public struct", "struct"),
+        );
+        fixture.write(
+            "wire/src/frame/make.holo",
+            &MAKE.replace("public func", "func"),
+        );
+        assert_terms(
+            &rejection(fixture.metadata_command("check").output().unwrap()),
+            &["advance.holo", "private struct `Header`"],
+        );
+    }
 
     /// A rejected kind leaves the receiving append attempt unpublished.
     const MAKE: &str = "namespace wire.frame
@@ -2475,7 +3283,7 @@ func main returns u64 {
 
             let count = core.len(frames)
             let marker = core.used(memory)
-            let outcome = core.append(frames, receive(pending.wire, filled))
+            let outcome = core.append(frames, receive(core.prefix(pending.wire, filled)))
                 on ok then 0
                 on Rejected Truncated(needed) then needed
                 on Full then core.add_wrapping(256, core.used(memory))

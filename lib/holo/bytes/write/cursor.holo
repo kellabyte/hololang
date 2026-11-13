@@ -1,0 +1,106 @@
+// Write complete fields into caller-owned storage and advance a byte offset.
+// Each operation checks its destination before changing bytes or cursor state.
+
+namespace holo.bytes.write
+
+using holo.bytes
+using holo.decimal
+
+public struct Cursor {
+    // Offset relative to the beginning of the destination view.
+    position u64
+}
+
+public error WriteError {
+    // The operation needs this many bytes at the current position.
+    Short(required u64)
+    // An octet must be in the range 0 through 255.
+    InvalidOctet(value u64)
+}
+
+// Start at the beginning of the destination view.
+public func start
+    with noblock
+    returns Cursor
+{
+    return Cursor {
+        position: 0
+    }
+}
+
+// Write one octet and return one. Validate the octet before checking space.
+public func put_u8
+    with noalloc, noblock
+    arg state Cursor as readwrite reference
+    arg destination Bytes as readwrite reference
+    arg octet u64 as readonly copy
+    returns Result<u64, WriteError>
+{
+    if octet > 255 {
+        return error WriteError.InvalidOctet(octet)
+    }
+    let position = state.position
+    let end = try checked_end(core.len(destination), position, 1)
+    destination[position] = octet
+    state.position = end
+    return ok 1
+}
+
+// Copy the original source bytes, including when the two views overlap.
+// Return the number of bytes copied. An empty source writes zero bytes.
+public func put_bytes
+    with noalloc, noblock
+    arg state Cursor as readwrite reference
+    arg destination Bytes as readwrite reference
+    arg source Bytes as readonly reference
+    returns Result<u64, WriteError>
+{
+    let position = state.position
+    let width = core.len(source)
+    let end = try checked_end(core.len(destination), position, width)
+    let count = bytes.move(core.subrange(destination, position, width), source)
+    state.position = end
+    return ok count
+}
+
+// Write canonical ASCII digits for a u64 and return their count.
+// The decimal helper validates its full output extent before any store.
+public func put_decimal
+    with noalloc, noblock
+    arg state Cursor as readwrite reference
+    arg destination Bytes as readwrite reference
+    arg value u64 as readonly copy
+    returns Result<u64, WriteError>
+{
+    let position = state.position
+    let capacity = core.len(destination)
+    if position > capacity {
+        return error WriteError.Short(decimal.digit_count(value))
+    }
+    let available = core.sub_wrapping(capacity, position)
+    decimal.write_u64(core.subrange(destination, position, available), value)
+        on ok(count) then {
+            state.position = core.add_wrapping(position, count)
+            return ok count
+        }
+        on ShortBuffer(required) then {
+            return error WriteError.Short(required)
+        }
+}
+
+// Compute the next position only after proving that the whole field fits.
+func checked_end
+    with noalloc, noblock
+    arg capacity u64 as readonly copy
+    arg position u64 as readonly copy
+    arg width u64 as readonly copy
+    returns Result<u64, WriteError>
+{
+    if position > capacity {
+        return error WriteError.Short(width)
+    }
+    if core.sub_wrapping(capacity, position) < width {
+        return error WriteError.Short(width)
+    }
+    return ok core.add_wrapping(position, width)
+}

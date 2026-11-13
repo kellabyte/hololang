@@ -6,6 +6,7 @@
 //! existing IR operations without silently choosing future language semantics.
 
 use super::{Block, Kind, Lowerer, arity, ast, core_call, functions};
+use crate::frontend::byte_ranges;
 use crate::{
     ir,
     source::{Diagnostic, Span},
@@ -23,13 +24,20 @@ impl Lowerer {
         match &expr.kind {
             // Literals copy exact u64 values; only initialized scalar names may be read.
             ast::ExprKind::Number(value) => Ok(ir::Expr::Const(*value)),
+            ast::ExprKind::Bytes(_) => Err(Diagnostic::new(
+                expr.span,
+                "a byte string literal cannot be used as a u64",
+            )),
             ast::ExprKind::Name(name) => {
                 let binding = self.lookup(name, expr.span)?;
                 // A byte descriptor cannot leave the call in a scalar result or local.
-                if matches!(binding.kind, Kind::InputBytes { .. } | Kind::ReceivedBytes) {
+                if matches!(
+                    binding.kind,
+                    Kind::InputBytes { .. } | Kind::ReceivedBytes | Kind::BytesView(_)
+                ) {
                     return Err(Diagnostic::new(
                         expr.span,
-                        "a readonly byte borrow cannot become a scalar or escape its call",
+                        "a byte borrow cannot become a scalar or escape its scope",
                     ));
                 }
                 // A fallback binding retains its nominal case identity and has no scalar conversion.
@@ -38,6 +46,20 @@ impl Lowerer {
                         expr.span,
                         "a typed error cannot be used as a u64",
                     ));
+                }
+                if matches!(binding.kind, Kind::Bool | Kind::HandledBool) {
+                    return Err(Diagnostic::new(
+                        expr.span,
+                        "a bool binding cannot be used as a u64",
+                    ));
+                }
+                if let Kind::SavedResult(family) = &binding.kind {
+                    let message = if family == super::functions::OPTION_FAMILY {
+                        "handle the saved `Option<u64>` with `on Some` and `on None`"
+                    } else {
+                        "handle the saved `Result` with `on` arms before using its payload"
+                    };
+                    return Err(Diagnostic::new(expr.span, message));
                 }
                 if !matches!(binding.kind, Kind::Scalar { .. }) {
                     return Err(Diagnostic::new(
@@ -60,15 +82,30 @@ impl Lowerer {
             }
             // Byte reads retain the backend bounds check and evaluate the index once.
             ast::ExprKind::Index { base, index } => {
-                // A byte formal uses its captured logical extent instead of a field header.
-                if let ast::ExprKind::Name(name) = &base.kind
-                    && let Kind::InputBytes { param } = self.lookup(name, base.span)?.kind
-                {
-                    let index = self.scalar(index, output)?;
-                    return Ok(ir::Expr::InputByte {
-                        param,
-                        index: Box::new(index),
+                if let ast::ExprKind::Bytes(bytes) = &base.kind {
+                    return Ok(ir::Expr::LiteralByte {
+                        bytes: bytes.clone(),
+                        index: Box::new(self.scalar(index, output)?),
                     });
+                }
+                // A byte formal uses its captured logical extent instead of a field header.
+                if let ast::ExprKind::Name(name) = &base.kind {
+                    let binding = self.lookup(name, base.span)?;
+                    match binding.kind {
+                        Kind::InputBytes { param, .. } => {
+                            return Ok(ir::Expr::InputByte {
+                                param,
+                                index: Box::new(self.scalar(index, output)?),
+                            });
+                        }
+                        Kind::BytesView(_) => {
+                            return Ok(ir::Expr::ViewByte {
+                                name: binding.ir_name,
+                                index: Box::new(self.scalar(index, output)?),
+                            });
+                        }
+                        _ => {}
+                    }
                 }
                 let (reference, path, kind) = self.projection(base)?;
                 if kind != ir::FieldKind::Bytes {
@@ -129,13 +166,16 @@ impl Lowerer {
                 functions::instantiate(&template.value, &arguments, expr.span, &mut self.budget)
             }
             // Parsing an infix operator does not silently settle overflow/truth conventions.
+            ast::ExprKind::Binary { .. } if functions::boolean_syntax(expr) => Err(
+                Diagnostic::new(expr.span, "a bool expression cannot be used as a u64"),
+            ),
             ast::ExprKind::Binary { .. } => Err(Diagnostic::new(
                 expr.span,
                 "infix scalar arithmetic is unsupported while numeric defaults remain open; use explicit core.add_wrapping, core.sub_wrapping, core.mul_wrapping, core.and, or core.xor",
             )),
-            ast::ExprKind::Bool(_) => Err(Diagnostic::new(
+            ast::ExprKind::Not { .. } | ast::ExprKind::Bool(_) => Err(Diagnostic::new(
                 expr.span,
-                "boolean values are supported only as conditions in this subset",
+                "boolean values cannot be used as a u64",
             )),
             // A bound family root is only a path component in an error case.
             ast::ExprKind::ErrorFamilyRoot { .. } => Err(Diagnostic::new(
@@ -180,18 +220,27 @@ impl Lowerer {
         Ok(values)
     }
 
-    /// Resolve typed destination-producer actuals in written order.
-    /// Scalars receive once-only captures. Byte arguments name complete initialized
-    /// projections or an active received prefix. No target payload is copied.
-    /// Immutable descriptor loads may be scheduled at Append: accepted argument
-    /// effects cannot rebind caller references or change roots and byte extents,
-    /// and resolving a checked published projection cannot fail dynamically. Thus
-    /// delaying those metadata loads across scalar captures is observationally
-    /// equivalent for append, including when an ordinary argument updates fixed
-    /// scalar state or traps. Scoped construction uses deferred actual mode:
-    /// native lowering captures the destination first, then evaluates these
-    /// expressions in the call. The checker still authorizes every root/path.
+    /// Lower ordered constructor actuals without copying borrowed payloads.
+    /// Window checks can trap, so a call with windows keeps all actuals together.
+    /// Whole-field append retains eager scalar captures because its descriptor
+    /// loads are immutable and cannot trap. Scoped construction already defers.
     pub(super) fn producer_arguments(
+        &mut self,
+        args: &[ast::Expr],
+        parameters: &[ir::Parameter],
+        output: &mut Block,
+    ) -> Result<Vec<ir::Argument>, Diagnostic> {
+        let saved = self.deferred_actual;
+        self.deferred_actual |= args.iter().zip(parameters).any(|(actual, parameter)| {
+            *parameter == ir::Parameter::Bytes && byte_ranges::is_window(actual)
+        });
+        let arguments = self.producer_actuals(args, parameters, output);
+        self.deferred_actual = saved;
+        arguments
+    }
+
+    /// Lower each actual according to its destination formal and capture mode.
+    fn producer_actuals(
         &mut self,
         args: &[ast::Expr],
         parameters: &[ir::Parameter],
@@ -213,19 +262,15 @@ impl Lowerer {
                 }
                 ir::Parameter::Bytes => {
                     self.charge(argument.span)?;
-                    // The continuation already owns the exact native extent.
-                    // Other byte actuals still require a complete published field.
-                    if let Some(name) = self.received_argument(argument)? {
-                        ir::Argument::Received(name)
-                    } else {
-                        let (reference, path, kind) = self.projection(argument)?;
-                        if kind != ir::FieldKind::Bytes {
-                            return Err(Diagnostic::new(
-                                argument.span,
-                                "a readonly Bytes argument requires a complete published byte-field projection or a live received view",
-                            ));
+                    match self.byte_argument(argument, false, output)? {
+                        ir::FunctionArgument::Received(name) => ir::Argument::Received(name),
+                        ir::FunctionArgument::Bytes { source, ranges } if ranges.is_empty() => {
+                            ir::Argument::Bytes(source)
                         }
-                        ir::Argument::Bytes(ir::BytesSource::Field { reference, path })
+                        ir::FunctionArgument::Bytes { source, ranges } => {
+                            ir::Argument::ByteView { source, ranges }
+                        }
+                        _ => unreachable!("byte lowering returns a byte argument"),
                     }
                 }
             };
@@ -279,12 +324,20 @@ impl Lowerer {
             // Lengths are metadata observations, never scans or implicit serialization.
             "len" => {
                 arity(args, 1, span)?;
+                if let ast::ExprKind::Bytes(bytes) = &args[0].kind {
+                    return Ok(ir::Expr::Const(bytes.len() as u64));
+                }
                 if let ast::ExprKind::Name(name) = &args[0].kind {
                     let binding = self.lookup(name, args[0].span)?;
                     // These named values have a count or extent without a field projection.
                     match binding.kind {
-                        Kind::Batch { .. } => return Ok(ir::Expr::BatchLen(binding.ir_name)),
-                        Kind::InputBytes { param } => return Ok(ir::Expr::InputLen(param)),
+                        Kind::Batch { .. } | Kind::BatchView { .. } => {
+                            return Ok(ir::Expr::BatchLen(binding.ir_name));
+                        }
+                        Kind::InputBytes { param, .. } => return Ok(ir::Expr::InputLen(param)),
+                        Kind::BytesView(_) | Kind::ReceivedBytes => {
+                            return Ok(ir::Expr::ViewLen(binding.ir_name));
+                        }
                         _ => {}
                     }
                 }
@@ -331,60 +384,156 @@ impl Lowerer {
         }
     }
 
-    /// Lower a boolean/comparison condition, capturing its left side before any
-    /// right-side prefix. Returns unsigned core comparison semantics explicitly.
+    /// Recognize the supported boolean-valued initializers and calls.
+    pub(super) fn is_bool(&self, expr: &ast::Expr) -> bool {
+        match &expr.kind {
+            ast::ExprKind::Name(name) => self
+                .lookup(name, expr.span)
+                .is_ok_and(|binding| matches!(binding.kind, Kind::Bool | Kind::HandledBool)),
+            ast::ExprKind::Call { .. } => functions::named_call(expr)
+                .is_some_and(|(name, _)| self.definitions.bools.contains(name)),
+            _ => functions::boolean_syntax(expr),
+        }
+    }
+
+    /// Lower a typed boolean without admitting numeric values as truth tests.
+    pub(super) fn boolean(
+        &mut self,
+        expr: &ast::Expr,
+        output: &mut Block,
+    ) -> Result<ir::BoolExpr, Diagnostic> {
+        self.charge(expr.span)?;
+        match &expr.kind {
+            ast::ExprKind::Bool(value) => return Ok(ir::BoolExpr::Const(*value)),
+            ast::ExprKind::Name(name) => {
+                let binding = self.lookup(name, expr.span)?;
+                match binding.kind {
+                    Kind::Bool => return Ok(ir::BoolExpr::Local(binding.ir_name)),
+                    Kind::HandledBool => {
+                        return Ok(ir::BoolExpr::Compare(handled_truth(ir::Expr::Local(
+                            binding.ir_name,
+                        ))));
+                    }
+                    _ => {}
+                }
+            }
+            ast::ExprKind::Not { value, .. } => {
+                let value = self.deferred_boolean(value)?;
+                return Ok(ir::BoolExpr::Not(Box::new(value)));
+            }
+            ast::ExprKind::Binary {
+                op, left, right, ..
+            } => {
+                if matches!(op, ast::BinaryOp::LogicalAnd | ast::BinaryOp::LogicalOr) {
+                    let left = Box::new(self.deferred_boolean(left)?);
+                    let right = Box::new(self.deferred_boolean(right)?);
+                    return Ok(if *op == ast::BinaryOp::LogicalAnd {
+                        ir::BoolExpr::And(left, right)
+                    } else {
+                        ir::BoolExpr::Or(left, right)
+                    });
+                }
+                if let Some(op) = functions::comparison(*op) {
+                    return self
+                        .scalar_comparison(op, left, right, output)
+                        .map(ir::BoolExpr::Compare);
+                }
+            }
+            ast::ExprKind::Call { .. } => {
+                if let Some((name, args)) = functions::named_call(expr)
+                    && self.definitions.bools.contains(name)
+                {
+                    return Ok(ir::BoolExpr::Call {
+                        function: name.to_owned(),
+                        args: self.ordinary_arguments(name, args, expr.span)?,
+                    });
+                }
+            }
+            ast::ExprKind::Handle { subject, arms } => {
+                let value = self.handle_result(subject, arms, true)?;
+                return Ok(ir::BoolExpr::Compare(handled_truth(value)));
+            }
+            _ => {}
+        }
+        Err(Diagnostic::new(expr.span, "expected a bool expression"))
+    }
+
+    /// Keep comparison operands and call actuals inside conditional evaluation.
+    fn deferred_boolean(&mut self, expr: &ast::Expr) -> Result<ir::BoolExpr, Diagnostic> {
+        let previous = std::mem::replace(&mut self.deferred_actual, true);
+        let mut output = Block::default();
+        let value = self.boolean(expr, &mut output);
+        self.deferred_actual = previous;
+        debug_assert!(output.ops.is_empty());
+        value
+    }
+
+    /// Lower a boolean condition or an unsigned comparison.
     pub(super) fn condition(
         &mut self,
         expr: &ast::Expr,
         output: &mut Block,
     ) -> Result<ir::Condition, Diagnostic> {
         match &expr.kind {
-            // Bool conditions are local control syntax, not an implicit u64 conversion.
+            // Literal and handled conditions retain their existing lowering.
             ast::ExprKind::Bool(value) => Ok(ir::Condition {
                 op: ir::Compare::Eq,
                 left: ir::Expr::Const(u64::from(*value)),
                 right: ir::Expr::Const(1),
             }),
-            // A handled boolean has a scalar representation but is exposed only as a condition.
+            // Earlier result handlers leave a canonical zero-or-one decision.
             ast::ExprKind::Name(name) => {
                 let binding = self.lookup(name, expr.span)?;
-                if !matches!(binding.kind, Kind::Boolean) {
+                if matches!(binding.kind, Kind::Bool) {
+                    self.charge(expr.span)?;
+                    return Ok(ir::Condition::truth(ir::BoolExpr::Local(binding.ir_name)));
+                }
+                if !matches!(binding.kind, Kind::HandledBool) {
                     return Err(Diagnostic::new(
                         expr.span,
                         "expected a comparison or boolean condition",
                     ));
                 }
-                Ok(ir::Condition {
-                    op: ir::Compare::Eq,
-                    left: ir::Expr::Local(binding.ir_name),
-                    right: ir::Expr::Const(1),
-                })
+                Ok(handled_truth(ir::Expr::Local(binding.ir_name)))
             }
-            ast::ExprKind::Binary { op, left, right } => {
-                let op = match op {
-                    ast::BinaryOp::Eq => ir::Compare::Eq,
-                    ast::BinaryOp::Ne => ir::Compare::Ne,
-                    ast::BinaryOp::Lt => ir::Compare::Lt,
-                    ast::BinaryOp::Le => ir::Compare::Le,
-                    ast::BinaryOp::Gt => ir::Compare::Gt,
-                    ast::BinaryOp::Ge => ir::Compare::Ge,
-                    _ => {
-                        return Err(Diagnostic::new(
-                            expr.span,
-                            "expected a comparison or boolean condition",
-                        ));
-                    }
-                };
-                let left_value = self.scalar(left, output)?;
-                let left = self.capture(left_value, left.span, output);
-                let right = self.scalar(right, output)?;
-                Ok(ir::Condition { op, left, right })
+            ast::ExprKind::Binary {
+                op, left, right, ..
+            } => {
+                if let Some(op) = functions::comparison(*op) {
+                    self.scalar_comparison(op, left, right, output)
+                } else if self.is_bool(expr) {
+                    self.boolean(expr, output).map(ir::Condition::truth)
+                } else {
+                    Err(Diagnostic::new(
+                        expr.span,
+                        "expected a comparison or boolean condition",
+                    ))
+                }
             }
+            _ if self.is_bool(expr) => self.boolean(expr, output).map(ir::Condition::truth),
             _ => Err(Diagnostic::new(
                 expr.span,
                 "expected a comparison or boolean condition",
             )),
         }
+    }
+
+    /// Capture the left scalar before the right operand's prelude can run.
+    fn scalar_comparison(
+        &mut self,
+        op: ir::Compare,
+        left: &ast::Expr,
+        right: &ast::Expr,
+        output: &mut Block,
+    ) -> Result<ir::Condition, Diagnostic> {
+        let left_value = self.scalar(left, output)?;
+        let left = if self.deferred_actual {
+            left_value
+        } else {
+            self.capture(left_value, left.span, output)
+        };
+        let right = self.scalar(right, output)?;
+        Ok(ir::Condition { op, left, right })
     }
 
     /// Resolve a named reference and nested field path to its final logical kind.
@@ -433,5 +582,14 @@ impl Lowerer {
                 })?;
         }
         Ok((binding.ir_name, path, kind))
+    }
+}
+
+/// Earlier result decisions lower to canonical zero or one.
+fn handled_truth(value: ir::Expr) -> ir::Condition {
+    ir::Condition {
+        op: ir::Compare::Eq,
+        left: value,
+        right: ir::Expr::Const(1),
     }
 }

@@ -15,6 +15,78 @@ use holo::ir::{
     Record, ResultArm, ResultPattern, ResultValue,
 };
 
+/// Nested range descriptors retain their base and extent through model calls.
+#[test]
+fn ordinary_byte_window_model_keeps_forwarded_offset() {
+    let source = r#"
+struct Row { bytes Bytes }
+
+func row with noblock returns Row {
+    return Row { bytes: core.bytes(5, core.index()) }
+}
+
+func first arg bytes Bytes as readonly reference returns u64 {
+    return bytes[0]
+}
+
+func forward arg bytes Bytes as readonly reference returns u64 {
+    return first(core.subrange(bytes, 1, 1))
+}
+
+func main returns u64 {
+    let region = core.region(128) else { return 0 }
+    let rows = core.batch(region, Row)
+    let appended = core.append(rows, row())
+    core.assert(appended == 0)
+    let published = core.borrow_readonly(rows, 0)
+    core.print(forward(core.subrange(core.prefix(published.bytes, 4), 1, 3)))
+    return 0
+}
+"#;
+    let program = holo::frontend::parse_experimental(source).unwrap();
+    assert_eq!(model::run(program.program()).unwrap(), [2]);
+    let invalid = source.replace("1, 3", "1, 4");
+    let program = holo::frontend::parse_experimental(&invalid).unwrap();
+    let error = model::run(program.program()).unwrap_err();
+    assert!(error.message.contains("byte argument bounds trap"));
+}
+
+/// The model observes the original source bytes even when the ranges overlap.
+#[test]
+fn ordinary_byte_move_model_keeps_original_overlapping_source() {
+    let source = r#"
+struct Row { bytes Bytes }
+
+func row with noblock returns Row {
+    return Row { bytes: core.bytes(5, core.index()) }
+}
+
+func move_range
+    arg destination Bytes as readwrite reference
+    arg source Bytes as readonly reference
+    returns u64
+{
+    core.move_bytes(destination, source)
+    return core.len(source)
+}
+
+func main returns u64 {
+    let region = core.region(128) else { return 0 }
+    let rows = core.batch(region, Row)
+    let appended = core.append(rows, row())
+    core.assert(appended == 0)
+    let published = core.borrow_readwrite(rows, 0)
+    core.print(move_range(core.subrange(published.bytes, 1, 3), core.prefix(published.bytes, 3)))
+    for index in core.range(5) {
+        core.print(published.bytes[index])
+    }
+    return 0
+}
+"#;
+    let program = holo::frontend::parse_experimental(source).unwrap();
+    assert_eq!(model::run(program.program()).unwrap(), [3, 0, 0, 1, 2, 4]);
+}
+
 /// Capacity, size overflow, and nested rejection preserve the original record.
 ///
 /// The 52-byte envelope is independently 8 + 8 + (8 + 8 + 8 + 4) + 8 bytes.
@@ -108,6 +180,7 @@ fn typed_results_preserve_the_success_value_and_choose_one_error_arm() {
                 ],
             }),
             Op::Function(Function {
+                returns_bool: false,
                 name: "decode".into(),
                 params: vec![FunctionParameter {
                     name: "input".into(),
@@ -189,6 +262,7 @@ fn ordinary_call_model_preserves_alias_visible_capture_order() {
         path: vec!["value".into()],
     };
     let increment = Op::Function(Function {
+        returns_bool: false,
         name: "increment".into(),
         params: vec![state.clone()],
         result: None,
@@ -210,6 +284,7 @@ fn ordinary_call_model_preserves_alias_visible_capture_order() {
         ],
     });
     let sum = Op::Function(Function {
+        returns_bool: false,
         name: "sum".into(),
         result: None,
         params: vec![

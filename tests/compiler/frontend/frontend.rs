@@ -60,6 +60,359 @@ fn rejected(source: &str) -> Diagnostic {
     diagnostic
 }
 
+/// Optional arms are exhaustive and the presence payload is scoped to its arm.
+#[test]
+fn optional_returns_reject_invalid_construction_and_handling() {
+    let optional = "func find returns Option<u64> { return Some(0) }";
+    for (body, message) in [
+        (
+            "find()\n        on Some(_) then {}",
+            "missing `on None` arm",
+        ),
+        (
+            "find()\n        on Some(_) then {}\n        on Some(_) then {}",
+            "duplicate `on Some` arm",
+        ),
+        (
+            "find()\n        on Some then {}\n        on None then {}",
+            "`on Some` requires a payload binding",
+        ),
+        (
+            "find()\n        on Some(_) then {}\n        on None(_) then {}",
+            "`None` has no payload to bind",
+        ),
+        (
+            "find()\n        on ok(_) then {}\n        on None then {}",
+            "use `on Some(value)` and `on None`",
+        ),
+        (
+            "find()\n        on Some(value) then {}\n        on None then { core.print(value) }",
+            "out-of-scope binding",
+        ),
+    ] {
+        let source = format!("{optional}\nfunc main returns u64 {{\n    {body}\n    return 0\n}}");
+        let error = rejected(&source);
+        assert!(error.message.contains(message), "{body}: {error:?}");
+    }
+    for (body, message) in [
+        ("return Some()", "expected 1 arguments"),
+        ("return ok 1", "return `Some(value)`"),
+        (
+            "let value = try find()\n    return Some(value)",
+            "`try` requires a Result operand",
+        ),
+    ] {
+        let source = format!(
+            "{optional}\nfunc probe returns Option<u64> {{\n    {body}\n}}\nfunc main returns u64 {{ return 0 }}"
+        );
+        let error = rejected(&source);
+        assert!(error.message.contains(message), "{body}: {error:?}");
+    }
+    let mixed = format!(
+        "{optional}\nerror Missing {{ None }}\nfunc probe returns Result<u64, Missing> {{ return find() }}\nfunc main returns u64 {{ return 0 }}"
+    );
+    assert!(
+        rejected(&mixed)
+            .message
+            .contains("`Option<u64>` and `Result` are distinct")
+    );
+}
+
+/// An optional binding cannot be reassigned, read as a scalar, or used outside its scope.
+#[test]
+fn saved_optional_scalars_require_an_immutable_lexical_binding() {
+    for (body, message) in [
+        ("var saved = find()", "with an immutable `let`"),
+        (
+            "let saved = find()\n    saved = 0",
+            "binding cannot be reassigned",
+        ),
+        (
+            "let saved = find()\n    core.print(saved)",
+            "handle the saved `Option<u64>`",
+        ),
+        (
+            "{ let saved = find() }\n    saved\n        on Some(_) then {}\n        on None then {}",
+            "out-of-scope binding",
+        ),
+        (
+            "let saved = 0\n    saved\n        on Some(_) then {}\n        on None then {}",
+            "a named `on` subject must be a saved `Result` or `Option<u64>`",
+        ),
+        (
+            "let saved = find()\n    saved\n        on Some(_) then {}",
+            "missing `on None` arm",
+        ),
+    ] {
+        let source = format!(
+            "func find returns Option<u64> {{ return Some(0) }}\nfunc main returns u64 {{\n    {body}\n    return 0\n}}"
+        );
+        let error = rejected(&source);
+        assert!(error.message.contains(message), "{body}: {error:?}");
+    }
+}
+
+/// Named windows can be read and lent to either kind of synchronous callee.
+#[test]
+fn named_byte_views_can_be_observed_and_forwarded() {
+    let entry = populated(
+        r#"let row = core.borrow_readonly(items, 0)
+let prefix = core.prefix(row.data, 3)
+let tail = core.subrange(prefix, 1, 2)
+core.assert(core.len(tail) == 2)
+core.assert(tail[0] == 1)
+core.assert(last(tail) == 2)
+let copied = core.append(items, copy_view(tail))
+core.assert(copied == 0)"#,
+    );
+    let helpers = r#"
+func last arg input Bytes as readonly reference returns u64 {
+    let tail = core.subrange(input, 1, 1)
+    return tail[0]
+}
+func copy_view arg input Bytes as readonly reference returns Row {
+    return Row { id: core.len(input), data: core.bytes(core.len(input), input[core.index()]) }
+}
+"#;
+    accepted(&format!("{helpers}\n{entry}"));
+}
+
+#[test]
+fn byte_strings_supply_readonly_views_and_constructor_inputs() {
+    let source = r#"
+struct Row { data Bytes }
+func copy arg input Bytes as readonly reference returns Row {
+    return Row { data: core.bytes(core.len(input), input[core.index()]) }
+}
+func fixed returns Row {
+    return copy(core.subrange(b"prefix", 3, 3))
+}
+func first arg input Bytes as readonly reference returns u64 { return input[0] }
+func literal_result returns Option<u64> { return Some(b"xyz"[1]) }
+func literal_len returns u64 {
+    let name = b"a\x00\xFF"
+    let window = core.subrange(name, 1, 2)
+    return core.len(window)
+}
+func forward_len returns u64 { return literal_len() }
+func main returns u64 {
+    let memory = core.region(128) else { return 0 }
+    let items = core.batch(memory, Row)
+    let status = core.append(items, fixed())
+    core.assert(status == 0)
+    let copied = core.append(items, copy(core.prefix(b"source", 1)))
+    core.assert(copied == 0)
+    let named = b"\0\xFF"
+    core.assert(core.len(b"") == 0)
+    core.assert(core.len(named) == forward_len())
+    core.assert(named[1] == 255)
+    core.assert(first(core.subrange(b"abc", 1, 2)) == b"bc"[0])
+    core.assert(not b"abc"[0] == 122)
+    let result = literal_result()
+        on Some(value) then value
+        on None then 0
+    core.assert(result == 121)
+    return 0
+}
+"#;
+    accepted(source);
+}
+
+#[test]
+fn byte_strings_cannot_supply_writable_storage_or_scalars() {
+    for (body, expected) in [
+        (r#"b"one"[0] = 1"#, "readonly byte string literal"),
+        (
+            r#"let data = b"one"; data[0] = 1"#,
+            "readonly local byte view",
+        ),
+        (r#"let readwrite data = b"one""#, "literals are readonly"),
+        (
+            r#"let readwrite data = core.prefix(b"one", 1)"#,
+            "literals are readonly",
+        ),
+        (r#"var data = b"one""#, "byte views cannot be rebound"),
+        (r#"core.print(write(b"one"))"#, "literals are readonly"),
+        (r#"core.print(b"one")"#, "cannot be used as a u64"),
+    ] {
+        let source = format!(
+            "func write arg dest Bytes as readwrite reference returns u64 {{ return core.len(dest) }}\nfunc main returns u64 {{ {body}; return 0 }}"
+        );
+        assert!(rejected(&source).message.contains(expected), "{body}");
+    }
+}
+
+/// The local binding belongs to its block and can only lend readonly access.
+#[test]
+fn named_byte_views_reject_rebinding_writes_and_escape() {
+    for (body, message) in [
+        (
+            "var view = core.prefix(row.data, 1)",
+            "byte views cannot be rebound",
+        ),
+        (
+            "let view = core.prefix(row.data, 1)\nview[0] = 9",
+            "cannot write through a readonly local byte view",
+        ),
+        (
+            "let view = core.prefix(row.data, 1)\ncore.print(edit(view))",
+            "local byte view is readonly",
+        ),
+        (
+            "let view = core.prefix(row.data, 1)\nlet saved = view",
+            "cannot become a scalar or escape",
+        ),
+        (
+            "{ let view = core.prefix(row.data, 1) }\ncore.print(core.len(view))",
+            "out-of-scope binding",
+        ),
+    ] {
+        let entry = populated(&format!(
+            "let row = core.borrow_readwrite(items, 0)\n{body}"
+        ));
+        let source = format!(
+            "func edit arg input Bytes as readwrite reference returns u64 {{ return core.len(input) }}\n{entry}"
+        );
+        let error = rejected(&source);
+        assert!(error.message.contains(message), "{body}: {}", error.message);
+    }
+}
+
+/// Writable views cannot acquire more access than their source or change binding.
+#[test]
+fn named_writable_byte_views_reject_permission_escalation() {
+    for (body, message) in [
+        (
+            "let row = core.borrow_readonly(items, 0)\nlet readwrite view = core.prefix(row.data, 1)",
+            "expected a readwrite reference",
+        ),
+        (
+            "let row = core.borrow_readwrite(items, 0)\nlet readonly = core.prefix(row.data, 2)\nlet readwrite view = core.prefix(readonly, 1)",
+            "local byte view is readonly",
+        ),
+        (
+            "let row = core.borrow_readwrite(items, 0)\nlet readwrite view = core.prefix(row.data, 1)\nview = 0",
+            "binding cannot be reassigned",
+        ),
+        ("let readwrite value = 0", "`let readwrite` requires"),
+        (
+            "let row = core.borrow_readwrite(items, 0)\nvar readwrite view = core.prefix(row.data, 1)",
+            "`let readwrite` requires",
+        ),
+    ] {
+        let error = rejected(&populated(body));
+        assert!(error.message.contains(message), "{body}: {}", error.message);
+    }
+    let readonly_parameter = r#"
+func edit arg input Bytes as readonly reference returns u64 {
+    let readwrite view = core.prefix(input, 1)
+    return core.len(view)
+}
+"#;
+    let source = format!("{readonly_parameter}\n{}", populated(""));
+    assert!(
+        rejected(&source)
+            .message
+            .contains("expected a readwrite Bytes parameter")
+    );
+}
+
+/// A bounded batch view can lend an element with its own access or a weaker mode.
+/// The original owner can continue to operate once the synchronous call returns.
+#[test]
+fn borrowed_batch_frontend_checks_forwarding_iteration_and_mutation() {
+    let helpers = r#"
+func sum
+    with noalloc, noblock
+    arg rows Batch<Row> as readonly reference
+    returns u64
+{
+    var total = 0
+    for readonly item in rows {
+        total = core.add_wrapping(total, item.id)
+    }
+    return total
+}
+func update
+    with noalloc, noblock
+    arg rows Batch<Row> as readwrite reference
+    returns u64
+{
+    let item = core.borrow_readwrite(rows, 0)
+    item.id = 9
+    return sum(rows)
+}
+"#;
+    let main = populated("core.assert(update(items) == 9)\ncore.assert(core.len(items) == 1)");
+    accepted(&format!("{helpers}\n{main}"));
+}
+
+/// Readonly paths cannot be upgraded, and even writable views have no owner authority.
+#[test]
+fn borrowed_batch_frontend_rejects_access_upgrades_and_publication() {
+    for (access, statement, message) in [
+        (
+            "readonly",
+            "let item = core.borrow_readwrite(rows, 0)",
+            "readonly batch view",
+        ),
+        (
+            "readonly",
+            "for readwrite item in rows {}",
+            "readonly batch view",
+        ),
+        ("readonly", "update(rows)", "readonly batch view"),
+        (
+            "readwrite",
+            "let status = core.append(rows, row(1, 2))",
+            "borrowed batch view",
+        ),
+        (
+            "readwrite",
+            "core.reset(rows)",
+            "unavailable in ordinary borrowed functions",
+        ),
+    ] {
+        let helper = format!(
+            "func update arg rows Batch<Row> as readwrite reference returns u64 {{ return core.len(rows) }}\nfunc test arg rows Batch<Row> as {access} reference returns u64 {{\n{statement}\nreturn 0\n}}"
+        );
+        let source = format!("{helper}\n{}", populated("core.print(test(items))"));
+        assert!(rejected(&source).message.contains(message), "{statement}");
+    }
+
+    let source = format!(
+        "struct Other {{ id u64; data Bytes }}\nfunc count arg rows Batch<Other> as readonly reference returns u64 {{ return core.len(rows) }}\n{}",
+        populated("core.print(count(items))")
+    );
+    let diagnostic = rejected(&source);
+    assert!(diagnostic.message.contains("expected a batch of `Other`"));
+}
+
+/// Statement arms use the expression form's coverage rules and lexical payloads.
+#[test]
+fn typed_result_blocks_reject_missing_arms_and_escaping_bindings() {
+    let declarations = "error HeaderError { Short(required u64); BadMagic }\nfunc header returns Result<u64, HeaderError> { return error HeaderError.Short(4) }\n";
+    for (body, message) in [
+        (
+            "header()\n        on ok then {}\n        on Short(_) then {}",
+            "HeaderError.BadMagic",
+        ),
+        (
+            "header()\n        on ok(value) then {}\n        on error then { core.print(value) }",
+            "value",
+        ),
+        (
+            "header()\n        on ok then {}\n        on Short(required) then {}\n        on error then {}\n    core.print(required)",
+            "required",
+        ),
+    ] {
+        let source =
+            format!("{declarations}func main returns u64 {{\n    {body}\n    return 0\n}}");
+        let diagnostic = rejected(&source);
+        assert!(diagnostic.message.contains(message), "{diagnostic:?}");
+    }
+}
+
 /// Two nominal families share one spelling. The finite cases also exercise
 /// coverage, exact forwarding, and the absence of implicit scalar conversion.
 #[test]
@@ -69,8 +422,16 @@ error Other { BadMagic }
 func header returns Result<u64, HeaderError> { return error HeaderError.BadMagic }
 "#;
     let cases = [
-        ("let code = header()", "handle the fallible call"),
-        ("header()", "handle the fallible call"),
+        (
+            "let code = header()\n    core.print(code)",
+            "handle the saved `Result`",
+        ),
+        ("var code = header()", "with an immutable `let`"),
+        ("header()", "save the call with `let`"),
+        (
+            "let code = header()\n    code\n        on ok then {}\n        on Other.BadMagic then {}\n        on error then {}",
+            "expected error family `HeaderError`",
+        ),
         (
             "let code = header()\n        on ok(value) then value\n        on BadMagic then 1",
             "HeaderError.Short",
@@ -108,6 +469,34 @@ func header returns Result<u64, HeaderError> { return error HeaderError.BadMagic
         "{declarations}func forward returns Result<u64, Other> {{ return header() }}\nfunc main returns u64 {{ return 0 }}\n"
     );
     assert!(rejected(&source).message.contains("cannot forward Result"));
+    for (output, body, message) in [
+        (
+            "Result<u64, Outer>",
+            "let saved = header()\n    return saved",
+            "cannot forward Result from error family `HeaderError` as `Outer`",
+        ),
+        (
+            "Option<u64>",
+            "let saved = header()\n    return saved",
+            "must have the exact return type",
+        ),
+        (
+            "Result<u64, HeaderError>",
+            "{ let saved = header() }\n    return saved",
+            "unknown or out-of-scope binding",
+        ),
+        (
+            "Result<u64, HeaderError>",
+            "let scalar = 1\n    return scalar",
+            "a named result return requires a saved",
+        ),
+    ] {
+        let source = format!(
+            "{declarations}error Outer {{ from HeaderError as Header }}\nfunc forward returns {output} {{\n    {body}\n}}\nfunc main returns u64 {{ return 0 }}\n"
+        );
+        let diagnostic = rejected(&source);
+        assert!(diagnostic.message.contains(message), "{diagnostic:?}");
+    }
 }
 
 /// Declared union members and handled paths are closed and nominal. Reject
@@ -729,7 +1118,7 @@ fn typed_byte_producer_requires_owned_initialized_output() {
     );
     // Passing an enclosing record cannot silently become a byte descriptor.
     let mismatched = source.replace("receive(1, short.data)", "receive(1, short)");
-    assert!(rejected(&mismatched).message.contains("projection"));
+    assert!(rejected(&mismatched).message.contains("Bytes field"));
 }
 
 /// Payload presence and type belong to the declared case, and a binding never
@@ -783,6 +1172,7 @@ fn try_requires_an_immutable_binding_and_an_admitted_family() {
 error Other { Short }
 func header returns Result<u64, FrameError> { return ok 18446744073709551615 }
 func scalar returns u64 { return 1 }
+func optional returns Option<u64> { return Some(7) }
 "#;
     let source = |header: &str, binding: &str, result: &str| {
         format!("{declarations}{header} {{\n    {binding}\n    {result}\n}}\n")
@@ -827,6 +1217,42 @@ func scalar returns u64 { return 1 }
             "let value = try header()\n    value = 0",
             "return ok value",
             "cannot be reassigned",
+        ),
+        (
+            helper,
+            "let saved = optional()\n    let value = try saved",
+            "return ok value",
+            "requires a Result operand",
+        ),
+        (
+            "func probe returns Option<u64>",
+            "let saved = header()\n    let value = try saved",
+            "return Some(value)",
+            "requires a Result operand",
+        ),
+        (
+            "func probe returns Result<u64, Other>",
+            "let saved = header()\n    let value = try saved",
+            "return ok value",
+            "cannot forward Result from error family `FrameError` as `Other`",
+        ),
+        (
+            helper,
+            "let saved = scalar()\n    let value = try saved",
+            "return ok value",
+            "requires a saved `Result`",
+        ),
+        (
+            helper,
+            "{ let saved = header() }\n    let value = try saved",
+            "return ok value",
+            "out-of-scope binding",
+        ),
+        (
+            "func main returns u64",
+            "let saved = header()\n    let value = try saved",
+            "return 0",
+            "requires a scalar typed-result function",
         ),
     ] {
         let mut input = source(header, binding, result);
@@ -1202,6 +1628,202 @@ fn ordinary_borrowed_buffer_example_checks() {
 }
 
 #[test]
+fn boolean_returns_work_in_conditions_and_immutable_bindings() {
+    let source = r#"
+func matches_one with noalloc, noblock arg value u64 as readonly copy returns bool {
+    return value == 1
+}
+func forwards arg value u64 as readonly copy returns bool {
+    let matches = matches_one(value)
+    return matches
+}
+func literal returns bool { return true }
+func failed returns Option<u64> { return None }
+func decision returns bool {
+    let answered = failed()
+        on Some(_) then true
+        on None then false
+    let saved = answered
+    return saved
+}
+func handled returns bool {
+    return failed()
+        on Some(_) then false
+        on None then true
+}
+func outer with noalloc, noblock returns u64 { return core.add_wrapping(inner(), 2) }
+func inner returns u64 { return code() }
+func code returns u64 {
+    if not forwards(2) and forwards(1) or false { return 7 } else { return 0 }
+}
+func main returns u64 {
+    let matches = forwards(1)
+    let compared = outer() == 9 and not decision()
+    let copied = matches
+    core.assert(copied)
+    core.assert(compared)
+    core.assert(literal())
+    core.assert(false or true and not false)
+    core.assert(handled())
+    if decision() { core.assert(false) }
+    if forwards(2) { core.assert(false) }
+    forwards(3)
+    return 0
+}
+"#;
+    accepted(source);
+}
+
+#[test]
+fn boolean_returns_reject_integer_conversion_and_rebinding() {
+    let predicate = "func predicate returns bool { return true }";
+    for (source, message) in [
+        ("func invalid returns bool { return 1 }", "expected a bool"),
+        (
+            "func invalid returns bool { return false and 1 }",
+            "expected a bool",
+        ),
+        (
+            "func invalid returns bool { return 1 or true }",
+            "expected a bool",
+        ),
+        (
+            "func invalid returns bool { return not 1 }",
+            "expected a bool",
+        ),
+        (
+            "func invalid returns u64 { return predicate() }",
+            "used as a u64",
+        ),
+        (
+            "func invalid returns bool { if true { return false } }",
+            "every normal path",
+        ),
+        (
+            "func invalid returns bool { return invalid() }",
+            "recursive",
+        ),
+        (
+            "func invalid returns bool { return predicate(1) }",
+            "expected 0 arguments",
+        ),
+        (
+            "error Failure { Missing }\nfunc invalid returns Result<bool, Failure> { return ok true }",
+            "unsupported or unknown return type",
+        ),
+    ] {
+        let source = format!("{predicate}\n{source}\nfunc main returns u64 {{ return 0 }}");
+        assert!(rejected(&source).message.contains(message), "{source}");
+    }
+    for (body, message) in [
+        ("core.print(true or false)", "used as a u64"),
+        ("core.print(predicate())", "used as a u64"),
+        (
+            "let result = predicate(); core.print(result)",
+            "used as a u64",
+        ),
+        (
+            "let result = 1; if result {}",
+            "expected a comparison or boolean condition",
+        ),
+        ("var result = predicate()", "bind a bool with `let`"),
+    ] {
+        let source = format!("{predicate}\nfunc main returns u64 {{ {body}; return 0 }}");
+        assert!(rejected(&source).message.contains(message), "{source}");
+    }
+}
+
+#[test]
+fn boolean_parameters_work_in_ordinary_helpers_and_forwarding_calls() {
+    accepted(
+        r#"
+error Choice { Missing }
+func forwarded returns u64 { return core.add_wrapping(select(1 < 2), 1) }
+func with_local returns u64 {
+    let selected = core.add_wrapping(select(false), 1)
+    return selected
+}
+func with_branch returns u64 {
+    if select(true) == 7 { return 1 }
+    return 0
+}
+func select with noalloc, noblock arg flag bool as readonly copy returns u64 {
+    if flag { return 7 }
+    return 3
+}
+func negate arg flag bool as readonly copy returns bool { return not flag }
+func optional arg flag bool as readonly copy returns Option<u64> {
+    if flag { return Some(7) }
+    return None
+}
+func tagged arg flag bool as readonly copy returns Result<u64, Choice> {
+    if flag { return ok 7 }
+    return error Choice.Missing
+}
+func main returns u64 {
+    let checked = optional(negate(false))
+        on Some(_) then true
+        on None then false
+    let value = tagged(checked)
+        on ok(value) then value
+        on Missing then 0
+    core.assert(value == 7)
+    core.assert(forwarded() == 8)
+    core.assert(with_local() == 4)
+    core.assert(with_branch() == 1)
+    core.assert(negate(false or 2 < 1))
+    return 0
+}
+"#,
+    );
+}
+
+#[test]
+fn boolean_parameters_require_readonly_copy_and_keep_their_type() {
+    for (definition, entry, expected) in [
+        (
+            "func invalid arg flag bool as readwrite copy returns bool { return flag }",
+            "",
+            "bool parameters require `as readonly copy`",
+        ),
+        (
+            "func invalid arg flag bool as readonly reference returns bool { return flag }",
+            "",
+            "bool parameters require `as readonly copy`",
+        ),
+        (
+            "struct Row { value u64 }\nfunc invalid arg flag bool as readonly copy returns Row { return Row { value: 1 } }",
+            "",
+            "bool parameters are supported only by ordinary functions",
+        ),
+        (
+            "func invalid arg flag bool as readonly copy returns u64 { return flag }",
+            "",
+            "bool binding cannot be used as a u64",
+        ),
+        (
+            "func invalid arg flag bool as readonly copy returns bool { flag = true; return flag }",
+            "",
+            "binding cannot be reassigned",
+        ),
+        (
+            "func negate arg flag bool as readonly copy returns bool { return not flag }",
+            "core.assert(negate(1))",
+            "expected a bool expression",
+        ),
+        (
+            "func select arg flag bool as readonly copy returns u64 { if flag { return 7 } return 3 }\nstruct Row { value u64 }\nfunc invalid returns Row { return Row { value: select(true) } }",
+            "",
+            "cannot be called from a pure helper or destination constructor",
+        ),
+    ] {
+        let source = format!("{definition}\nfunc main returns u64 {{ {entry}\nreturn 0 }}");
+        let error = rejected(&source);
+        assert!(error.message.contains(expected), "{source}: {error:?}");
+    }
+}
+
+#[test]
 /// Unsupported effects and borrowed escapes reject even in unused definitions.
 fn ordinary_borrowed_functions_reject_invalid_modes_and_effects() {
     let definitions = [
@@ -1344,6 +1966,9 @@ fn hosted_views_forward_and_end_at_the_branch_boundary() {
 #[test]
 fn hosted_views_lend_to_producers_only_in_the_data_branch() {
     let copy = "let copied = core.append(items, copy_chunk(chunk))";
+    let narrowed = "let copied = core.append(items, copy_chunk(core.prefix(chunk, 1)))";
+    let named =
+        "let window = core.prefix(chunk, 1); let copied = core.append(items, copy_chunk(window))";
     let assemble = |data: &str, other: &str, after: &str| {
         let entry = populated(&format!(
             "let row = core.borrow_readwrite(items, 0)\nlet alias = core.alias_readwrite(row)\nrefill row.data, 2 as chunk {{ {data} }} else status {{ {other} }}\n{after}"
@@ -1353,17 +1978,20 @@ fn hosted_views_lend_to_producers_only_in_the_data_branch() {
         )
     };
     accepted(&assemble(copy, "", ""));
+    accepted(&assemble(narrowed, "", ""));
+    accepted(&assemble(named, "", ""));
 
     // Keep the surrounding producer and source owner fixed while varying the
     // attempted escape, widening, or invalidation of the refill capability.
     for (data, other, after, expected) in [
         ("", copy, "", "out-of-scope binding"),
         ("", "", copy, "out-of-scope binding"),
+        ("", "", narrowed, "out-of-scope binding"),
         (
-            "let copied = core.append(items, copy_chunk(core.prefix(chunk, 1)))",
+            named,
             "",
-            "",
-            "live binding name",
+            "core.print(core.len(window))",
+            "out-of-scope binding",
         ),
         (
             "let copied = core.append(items, copy_chunk(chunk)); refill alias.data, 1 as again {} else code {}",
@@ -1392,6 +2020,32 @@ fn hosted_views_allow_refill_of_a_disjoint_field() {
     .replace("data Bytes\n", "data Bytes\n    spare Bytes\n")
     .replace("core.bytes(length, core.index()) }", "core.bytes(length, core.index()), spare: core.bytes(4, 0) }");
     accepted(&source);
+}
+
+/// Named refill destinations use their captured field and declared permission.
+#[test]
+fn hosted_refill_requires_a_writable_named_view() {
+    let source = |body: &str| {
+        populated(&format!(
+            "let row = core.borrow_readwrite(items, 0)\nlet alias = core.alias_readwrite(row)\n{body}"
+        ))
+    };
+    let writable = "let readwrite tail = core.subrange(alias.data, 1, 2)";
+    let refill = "refill tail, 1 as chunk {} else status {}";
+    accepted(&source(&format!("{writable}\n{refill}")));
+
+    let readonly = source(&format!(
+        "let tail = core.subrange(alias.data, 1, 2)\n{refill}"
+    ));
+    let error = rejected(&readonly);
+    assert!(error.message.contains("byte view is readonly"));
+    assert_eq!(&readonly[error.span.start..error.span.end], "tail");
+
+    let nested = source(&format!(
+        "{writable}\nrefill row.data, 1 as first {{ {refill} }} else first_status {{}}"
+    ));
+    let error = rejected(&nested);
+    assert!(error.message.contains("while its received view is live"));
 }
 
 /// Readonly slot access and entry-only host effects remain checked.

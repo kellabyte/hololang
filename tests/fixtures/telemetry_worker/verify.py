@@ -23,10 +23,13 @@ LAYOUTS = ("wide", "derived", "compact")
 PACKAGE = Path("tests/fixtures/telemetry_worker")
 MANIFEST = PACKAGE / "holo.toml"
 SOURCE = PACKAGE / "src"
+# Match package binding order so the standalone control retains declaration IDs.
 FILES = (
-    Path("lib/holo/bytes.holo"), SOURCE / "wire.holo",
-    SOURCE / "frame/decode.holo", SOURCE / "frame/validate.holo",
     SOURCE / "main.holo",
+    SOURCE / "frame/decode.holo", SOURCE / "frame/validate.holo",
+    SOURCE / "wire.holo",
+    Path("lib/holo/bytes.holo"),
+    Path("lib/holo/bytes/read/cursor.holo"), Path("lib/holo/bytes/read/integer.holo"),
 )
 TIMEOUT = 10
 
@@ -144,11 +147,13 @@ def flatten():
             # Standalone source uses its own scope and the same function bodies.
             if line.startswith(("namespace ", "using ")):
                 continue
-            if line.startswith("public func "):
+            if line.startswith(("public func ", "public error ", "public struct ")):
                 line = line.removeprefix("public ")
+            line = line.replace("read.Cursor", "Cursor")
             # Redirect only the known cross-namespace call spellings.
             for qualified in (
                 "bytes.join_low_octets_le", "wire.little_endian_u16",
+                "read.start", "read.take_u8", "read.take_u16_le",
                 "frame.payload_length", "frame.payload_limit", "frame.expected_magic",
             ):
                 line = line.replace(qualified + "(", qualified.split(".")[1] + "(")

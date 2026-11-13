@@ -10,6 +10,63 @@ use crate::{
 };
 
 impl Lowerer {
+    /// Resolve the writable range that a hosted read can fill in place.
+    pub(super) fn refill_destination(
+        &self,
+        operand: &ast::Expr,
+    ) -> Result<ir::BytesSource, Diagnostic> {
+        if matches!(operand.kind, ast::ExprKind::Bytes(_)) {
+            return Err(Diagnostic::new(
+                operand.span,
+                "byte string literals are readonly",
+            ));
+        } else if let ast::ExprKind::Name(name) = &operand.kind {
+            let binding = self.lookup(name, operand.span)?;
+            match binding.kind {
+                Kind::BytesView(ir::Access::Readwrite) => {
+                    return Ok(ir::BytesSource::Local(binding.ir_name));
+                }
+                Kind::BytesView(ir::Access::Readonly) | Kind::ReceivedBytes => {
+                    return Err(Diagnostic::new(
+                        operand.span,
+                        "refill requires a writable destination; this byte view is readonly",
+                    ));
+                }
+                _ => {}
+            }
+        } else if let ast::ExprKind::Member { .. } = operand.kind {
+            let (reference, path, kind) = self.projection(operand)?;
+            if kind == ir::FieldKind::Bytes {
+                return Ok(ir::BytesSource::Field { reference, path });
+            }
+        }
+        Err(Diagnostic::new(
+            operand.span,
+            "expected a readwrite Bytes field or named writable byte view for refill",
+        ))
+    }
+
+    /// Resolve an initialized field, named byte view, or literal for a synchronous send.
+    fn send_source(&self, operand: &ast::Expr) -> Result<ir::BytesSource, Diagnostic> {
+        if let ast::ExprKind::Bytes(bytes) = &operand.kind {
+            return Ok(ir::BytesSource::Literal(bytes.clone()));
+        } else if let ast::ExprKind::Name(name) = &operand.kind {
+            let binding = self.lookup(name, operand.span)?;
+            if matches!(binding.kind, Kind::BytesView(_)) {
+                return Ok(ir::BytesSource::Local(binding.ir_name));
+            }
+        } else if let ast::ExprKind::Member { .. } = operand.kind {
+            let (reference, path, kind) = self.projection(operand)?;
+            if kind == ir::FieldKind::Bytes {
+                return Ok(ir::BytesSource::Field { reference, path });
+            }
+        }
+        Err(Diagnostic::new(
+            operand.span,
+            "core.send requires an initialized Bytes field, a named byte view, or a byte string literal",
+        ))
+    }
+
     /// Resolve a lexical TCP binding by name, returning only its IR identity.
     /// An unknown name or different binding kind has no socket authority.
     pub(super) fn tcp_name(&self, name: &str, span: Span) -> Result<String, Diagnostic> {
@@ -72,14 +129,7 @@ impl Lowerer {
                     arity(args, 3, call_span)?;
                     (None, args)
                 };
-                let (reference, path, kind) = self.projection(&range[0])?;
-                // Native send consumes only an initialized field projection.
-                if kind != ir::FieldKind::Bytes {
-                    return Err(Diagnostic::new(
-                        range[0].span,
-                        "core.send requires an initialized Bytes field",
-                    ));
-                }
+                let source = self.send_source(&range[0])?;
                 let previous = std::mem::replace(&mut self.deferred_actual, true);
                 let operands = (|| {
                     let offset = self.scalar(&range[1], &mut output)?;
@@ -93,8 +143,7 @@ impl Lowerer {
                 Self::tcp_io(
                     stream,
                     ir::Op::Send {
-                        reference,
-                        path,
+                        source,
                         offset,
                         count,
                         result,

@@ -19,7 +19,8 @@ func load_customer_count
     returns Result<u64, DashboardError>
 {
     let account = try session.account_id(scenario)
-    let count = try sql.count_customers(account)
+    let query = sql.count_customers(account)
+    let count = try query
     let saved = try cache.save_count(count)
     return ok saved
 }

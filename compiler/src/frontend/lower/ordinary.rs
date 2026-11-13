@@ -1,10 +1,11 @@
 //! Lower synchronous borrowed functions and their typed actual arguments.
 //!
 //! A call retains its own argument evaluation order. Byte actuals carry source
-//! identity and an optional checked extent. No payload or state record is
+//! identity and any checked windows. No payload or state record is
 //! copied by this adapter. The IR verifier validates effects and live roots.
 
-use super::{Block, Kind, Lowerer, arity, ast, core_call, terminates};
+use super::{Block, Kind, Lowerer, arity, ast, terminates};
+use crate::frontend::byte_ranges;
 use crate::{
     ir,
     source::{Diagnostic, Span},
@@ -28,6 +29,7 @@ impl Lowerer {
         }
         self.scopes.push(HashMap::new());
         self.ordinary_body = true;
+        self.returns_bool = self.definitions.bools.contains(&function.name);
         self.result_family = self.definitions.results.get(&function.name).cloned();
         let result = (|| {
             let kinds = self.definitions.ordinary[&function.name].clone();
@@ -36,11 +38,23 @@ impl Lowerer {
             for (param, (argument, kind)) in function.args.iter().zip(kinds).enumerate() {
                 let binding = match &kind {
                     ir::FunctionParameterKind::U64 => Kind::Scalar { mutable: false },
-                    ir::FunctionParameterKind::Bytes => Kind::InputBytes { param },
+                    ir::FunctionParameterKind::Bool => Kind::Bool,
+                    ir::FunctionParameterKind::Bytes => Kind::InputBytes {
+                        param,
+                        access: ir::Access::Readonly,
+                    },
+                    ir::FunctionParameterKind::WritableBytes => Kind::InputBytes {
+                        param,
+                        access: ir::Access::Readwrite,
+                    },
                     ir::FunctionParameterKind::State(record) => Kind::Reference {
                         record: record.clone(),
                         access: ir::Access::Readwrite,
                         mutable: false,
+                    },
+                    ir::FunctionParameterKind::Batch { record, access } => Kind::BatchView {
+                        record: record.clone(),
+                        access: *access,
                     },
                 };
                 let name = self.bind(&argument.name, binding, argument.span)?;
@@ -52,6 +66,7 @@ impl Lowerer {
                     name: function.name.clone(),
                     params,
                     result: self.result_family.clone(),
+                    returns_bool: self.returns_bool,
                     body: body.ops,
                 },
                 body.spans,
@@ -59,24 +74,37 @@ impl Lowerer {
         })();
         // Even a rejected body must leave no formal binding in another function.
         self.ordinary_body = false;
+        self.returns_bool = false;
         self.result_family = None;
         self.scopes.pop();
         result
     }
 
     /// Build one direct call with ordered actuals and no enclosing operation prelude.
-    /// The native evaluator checks byte prefixes before continuing to later actuals.
+    /// The native evaluator checks byte windows before continuing to later actuals.
     pub(super) fn ordinary_call(
         &mut self,
         name: &str,
         args: &[ast::Expr],
         span: Span,
     ) -> Result<ir::Expr, Diagnostic> {
-        // A fallible result must be handled or forwarded before a scalar can be read.
-        if self.definitions.results.contains_key(name) {
+        if self.definitions.bools.contains(name) {
             return Err(Diagnostic::new(
                 span,
-                "handle the fallible call with `on` or return its exact Result",
+                "a bool return cannot be used as a u64",
+            ));
+        }
+        // A tagged result must be handled before a scalar payload can be read.
+        if let Some(family) = self.definitions.results.get(name) {
+            if family == super::functions::OPTION_FAMILY {
+                return Err(Diagnostic::new(
+                    span,
+                    "save the `Option<u64>` call with `let`, handle it with `on Some` and `on None`, or return it from an optional function",
+                ));
+            }
+            return Err(Diagnostic::new(
+                span,
+                "save the call with `let`, handle it with `on`, or return its exact Result",
             ));
         }
         Ok(ir::Expr::Call {
@@ -85,7 +113,7 @@ impl Lowerer {
         })
     }
 
-    /// Lower once-only actual evaluation for either ordinary result category.
+    /// Lower once-only actual evaluation for an ordinary call.
     /// The returned arguments contain their own evaluation and cannot escape as preludes.
     pub(super) fn ordinary_arguments(
         &mut self,
@@ -100,11 +128,14 @@ impl Lowerer {
             let mut actuals = Vec::with_capacity(args.len());
             let mut output = Block::default();
             // Each child remains within the call node. In particular, a later
-            // scalar helper must not execute before an earlier prefix check.
+            // scalar helper must not execute before an earlier byte range check.
             for (actual, param) in args.iter().zip(params) {
                 let argument = match param {
                     ir::FunctionParameterKind::U64 => {
                         ir::FunctionArgument::Scalar(self.scalar(actual, &mut output)?)
+                    }
+                    ir::FunctionParameterKind::Bool => {
+                        ir::FunctionArgument::Bool(self.boolean(actual, &mut output)?)
                     }
                     ir::FunctionParameterKind::State(record) => {
                         let binding = self.named(actual)?;
@@ -121,24 +152,22 @@ impl Lowerer {
                         }
                         ir::FunctionArgument::State(binding.ir_name)
                     }
-                    ir::FunctionParameterKind::Bytes => {
-                        // A received extent can only be lent as an immediate
-                        // readonly argument. No copied or shortened value escapes.
-                        if let Some(name) = self.received_argument(actual)? {
-                            actuals.push(ir::FunctionArgument::Received(name));
-                            continue;
+                    ir::FunctionParameterKind::Batch { record, access } => {
+                        let (name, actual_record) = self.batch(actual, access)?;
+                        if actual_record != record {
+                            return Err(Diagnostic::new(
+                                actual.span,
+                                format!("expected a batch of `{record}`, found `{actual_record}`"),
+                            ));
                         }
-                        let (source, prefix) = if let Some(("prefix", operands)) = core_call(actual)
-                        {
-                            arity(operands, 2, actual.span)?;
-                            // The IR observes this source before evaluating the requested extent.
-                            let source = self.bytes_source(&operands[0])?;
-                            let length = self.scalar(&operands[1], &mut output)?;
-                            (source, Some(length))
-                        } else {
-                            (self.bytes_source(actual)?, None)
-                        };
-                        ir::FunctionArgument::Bytes { source, prefix }
+                        ir::FunctionArgument::Batch(name)
+                    }
+                    ir::FunctionParameterKind::Bytes | ir::FunctionParameterKind::WritableBytes => {
+                        self.byte_argument(
+                            actual,
+                            param == ir::FunctionParameterKind::WritableBytes,
+                            &mut output,
+                        )?
                     }
                 };
                 actuals.push(argument);
@@ -155,22 +184,102 @@ impl Lowerer {
         result
     }
 
-    /// Resolve the source of a readonly byte argument without observing payload bytes.
+    /// Lower call-scoped byte windows from the original source outward.
+    /// Each window's operands stay in the call, where its bounds precede outer work.
+    pub(super) fn byte_argument(
+        &mut self,
+        actual: &ast::Expr,
+        writable: bool,
+        output: &mut Block,
+    ) -> Result<ir::FunctionArgument, Diagnostic> {
+        let (root, windows) = byte_ranges::split(actual)?;
+        let source = if let Some(name) = self.received_argument(root)? {
+            if writable {
+                return Err(Diagnostic::new(root.span, "received view is readonly"));
+            }
+            if windows.is_empty() {
+                return Ok(ir::FunctionArgument::Received(name));
+            }
+            ir::BytesSource::Received(name)
+        } else {
+            self.bytes_source(root, writable)?
+        };
+        let mut ranges = Vec::with_capacity(windows.len());
+        for window in windows {
+            self.charge(window.span)?;
+            let offset = window
+                .offset
+                .map(|value| self.scalar(value, output))
+                .transpose()?;
+            let length = self.scalar(window.length, output)?;
+            ranges.push(ir::ByteRange { offset, length });
+        }
+        Ok(ir::FunctionArgument::Bytes { source, ranges })
+    }
+
+    /// Resolve the source and access of a byte argument without observing its payload.
     /// A forwarded formal retains its captured extent and caller root in the verifier.
-    fn bytes_source(&self, expr: &ast::Expr) -> Result<ir::BytesSource, Diagnostic> {
-        // A bare byte formal names a descriptor rather than a record projection.
-        if let ast::ExprKind::Name(name) = &expr.kind
-            && let Kind::InputBytes { param } = self.lookup(name, expr.span)?.kind
-        {
-            return Ok(ir::BytesSource::Param(param));
+    fn bytes_source(
+        &self,
+        expr: &ast::Expr,
+        writable: bool,
+    ) -> Result<ir::BytesSource, Diagnostic> {
+        if let ast::ExprKind::Bytes(bytes) = &expr.kind {
+            if writable {
+                return Err(Diagnostic::new(
+                    expr.span,
+                    "byte string literals are readonly",
+                ));
+            }
+            return Ok(ir::BytesSource::Literal(bytes.clone()));
+        }
+        // A byte formal or local window already names a captured descriptor.
+        if let ast::ExprKind::Name(name) = &expr.kind {
+            let binding = self.lookup(name, expr.span)?;
+            match binding.kind {
+                Kind::InputBytes { param, access } => {
+                    if writable && access != ir::Access::Readwrite {
+                        return Err(Diagnostic::new(
+                            expr.span,
+                            "expected a readwrite Bytes parameter",
+                        ));
+                    }
+                    return Ok(ir::BytesSource::Param(param));
+                }
+                Kind::BytesView(access) => {
+                    if writable && access != ir::Access::Readwrite {
+                        return Err(Diagnostic::new(expr.span, "local byte view is readonly"));
+                    }
+                    return Ok(ir::BytesSource::Local(binding.ir_name));
+                }
+                _ => {}
+            }
         }
         let (reference, path, kind) = self.projection(expr)?;
         // Only complete initialized fields may form new byte sources.
         if kind != ir::FieldKind::Bytes {
             return Err(Diagnostic::new(
                 expr.span,
-                "expected a live Bytes field or a readonly byte parameter",
+                "expected a live Bytes field or a byte parameter",
             ));
+        }
+        if writable {
+            let mut root = expr;
+            while let ast::ExprKind::Member { base, .. } = &root.kind {
+                root = base;
+            }
+            if !matches!(
+                self.named(root)?.kind,
+                Kind::Reference {
+                    access: ir::Access::Readwrite,
+                    ..
+                }
+            ) {
+                return Err(Diagnostic::new(
+                    expr.span,
+                    "expected a readwrite reference to the Bytes field",
+                ));
+            }
         }
         Ok(ir::BytesSource::Field { reference, path })
     }

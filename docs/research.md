@@ -32,8 +32,7 @@ acceptance and M2 scope remain defined by the implementation plan.
 
 Each note includes examples, restrictions, staged experiments, correctness gates,
 measurement questions, an assessment, and annotated primary references. The index
-records shared reproduction and compatibility requirements. Keep these plans
-separate from completed results in [evidence](../evidence/README.md).
+records shared reproduction and compatibility requirements.
 
 ## Compatibility with Goose-style storage
 
@@ -143,9 +142,9 @@ attribute. Establish the exact implication and its lifetime/scope first.
 
 The local [readonly-input follow-up](implementation-plan.md#readonly-input-accounting-and-comparison--november-9)
 keeps strong known-length spans alongside record-derived input views. The
-[subsequent investigation](../evidence/short-copy-20261109/README.md) confirms
-constant-length propagation already works through ordinary calls in the finite
-tested cases; deliberate input opacity explains the dynamic-length control.
+subsequent short-copy trial confirmed constant-length propagation through
+ordinary calls in the cases tested. The dynamic-length control deliberately
+hid the length from the compiler.
 An executable length assertion supplies a checked fact without freezing payloads.
 A general short-copy candidate produced both gains and repeated regressions and
 was not adopted. Its optimized widened read also demonstrates why exact original
@@ -162,11 +161,10 @@ speed. Preserve original reservation, trap/error order and permitted source alia
 before substituting bulk copying or skipping failed private initialization. Source
 nesting also differs from retained native frames after ordinary inlining.
 
-The [stable staging-slot trial](../evidence/stable-staging-slots-20261111/README.md)
-reuses initialized field extents across a loop only for stable slots with
-distinct live backing. Dynamic subrange checks and the scalar failure path
-remain. Its combined descriptor proof and inline tiny copy improve the
-empty-frame profile against both the scalar and earlier guarded controls.
+The stable staging-slot trial reused initialized field extents across a loop
+only for stable slots with distinct live backing. It retained dynamic subrange
+checks and the scalar failure path. Its combined descriptor proof and inline
+tiny copy improved the empty-frame profile against both controls.
 
 The [whole-input intrinsic follow-up](implementation-plan.md#whole-input-copy-trial--november-9)
 uses the narrower exact captured-length/index proof, retaining all reservation
@@ -177,12 +175,11 @@ machine path. Its actual target runtime inspection is scoped to one system image
 LLVM memcpy can become a runtime call, so byte semantics alone do not prove an
 external implementation's transitive `noalloc`/`noblock` contract.
 
-The [fresh November 10 scorecard](../evidence/native-scorecard-20261110/README.md)
-rechecks these mechanisms with freshly verified local modified Goose, real C/Rust
-controls and matched O2/generic, SDK 15.5 and macOS 11.0 deployment settings.
-Its [independent replay](../evidence/native-scorecard-20261110/review/independent-analysis/analysis.md)
-validates all 1,680 measured observations and 108 preflights. Holo's 31-byte
-complete-record input path is close to C/Rust record views but materially behind
+The November 10 scorecard rechecked these mechanisms with a locally verified,
+modified Goose, C and Rust controls, and matched O2/generic, SDK 15.5, and
+macOS 11.0 deployment settings. An independent replay validated all 1,680
+measured observations and 108 preflights. Holo's 31-byte complete-record input
+path was close to C and Rust record views and slower than
 their known-length spans; selected ordinary assembly preserves that input-knowledge
 distinction. Lifecycle phase diagnostics nominate construction for investigation.
 Neither observation establishes causality, authorizes stronger alias promises or
@@ -196,9 +193,8 @@ adds 5,210 measured observations and 337 preflights. Fixed success-biased branch
 weights preserve the original checked LLVM after metadata removal and improve
 all nine lifecycle paired medians by 2.04–3.65%. A wide 4,096-byte copy regression
 repeats at about +2.24% and +2.49% paired cost with adverse IQRs, so the candidate
-is rejected and the original compiler inputs are restored. Complete raw outcomes,
-independent replay, all 13 repeated copy pairs and favorable results remain in the
-[trial record](../evidence/construction-branch-20261110/README.md). This supports
+is rejected and the original compiler inputs are restored. The trial included
+independent replay and 13 repeated copy pairs. This supports
 investigating code placement under broader controls; it does not establish that
 fewer branches, a favored success edge, or a diagnostic phase predicts a general
 speedup. No performance policy, alias fact or language rule was adopted by that trial.
@@ -212,18 +208,17 @@ intervals cross zero and ten copy native pairs remain identical. The competing
 exact byte-vector prefix retains the original scalar expression source but changes
 actual native tail/transition code and has less consistent default/compact results;
 it is not adopted. Eight vector review flags remain descriptive, not established
-reproduced regressions. The full record retains 11,512 measured observations and 752
-preflights, including screenings, with the current finite runtime trust boundary
+reproduced regressions. The comparison included 11,512 measured observations and
+752 preflights, including screenings, with the finite runtime trust boundary
 and language semantics intact. This supports narrow eligibility, native-code review
 and broad regression controls; it does not prove that metadata, fewer vector
-instructions or source-identical tails predict hardware cost. The new maintained
-optimization gate retains complete paired distributions and requires review
-rather than automatically selecting a compiler policy.
+instructions or source-identical tails predict hardware cost. The comparison
+used complete paired distributions to guide review of compiler policy.
 
-The [subsequent ingestion fixture](../evidence/ingestion-20261110/README.md)
-combines guarded binary-header decoding, malformed-input rejection, filtering,
-owned destination copying, full consumption and scoped reuse without changing
-the compiler. All 360 measurements and 30 preflights pass independent replay.
+The subsequent ingestion trial combined guarded binary-header decoding,
+malformed-input rejection, filtering, owned destination copying, full consumption,
+and scoped reuse. All 360 measurements and 30 preflights passed independent
+replay.
 Actual optimized Holo code already turns the validated subrange's checked byte
 initializer into `memcpy`; all four controls vectorize the checksum scan. This
 supports inspecting established range facts and native code before adding manual

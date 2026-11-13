@@ -167,8 +167,8 @@ request. Add smaller and intermediate extents before drawing conclusions.
    guessed result. Until integrated, the harness is not Holo-new evidence.
 4. Add one explicit Holo backend experiment only if the native mechanism helps a
    representative workload without compromising retained references or failure
-   behavior. Use `build/benchmarks/` for working output and preserve completed
-   evidence under `evidence/`.
+   behavior. Use `build/benchmarks/` for working output and record the results
+   and their limitations.
 
 For non-temporal stores later, compare write-only output and immediate reuse,
 including required fences in the timed path. For MTE later, compare detection and

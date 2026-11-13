@@ -6,6 +6,12 @@
 //! source-language
 //! defaults remain open. Native storage arithmetic is checked independently.
 
+use std::sync::Arc;
+
+/// Private nominal identity for the scalar optional representation.
+/// Source names cannot spell it.
+pub(crate) const OPTION_U64_FAMILY: &str = "$option.u64";
+
 /// Complete unchecked compiler input, never itself an authorization to lower.
 #[derive(Clone, Debug, Default)]
 pub struct Program {
@@ -77,6 +83,13 @@ pub enum Argument {
     Scalar(Expr),
     /// Capture a readonly source location/extent, without copying its contents.
     Bytes(BytesSource),
+    /// Check ordered windows of a readonly source and pass its final view.
+    ByteView {
+        /// Readonly byte source with an exact initial extent.
+        source: BytesSource,
+        /// Windows evaluated from the innermost to the outermost view.
+        ranges: Vec<ByteRange>,
+    },
     /// Lend the exact readonly prefix in a live refill data continuation.
     Received(String),
 }
@@ -84,8 +97,14 @@ pub enum Argument {
 /// Origin of a synchronous byte borrow; raw addresses and unfinished output are absent.
 #[derive(Clone, Debug)]
 pub enum BytesSource {
+    /// Borrow immutable literal bytes from static storage.
+    Literal(Arc<[u8]>),
     /// Forward a byte formal at this index in the enclosing typed parameter list.
     Param(usize),
+    /// Borrow the already checked prefix of the current refill continuation.
+    Received(String),
+    /// Forward an immutable lexical byte view with its captured extent.
+    Local(String),
     /// Borrow a complete byte field through a live initialized record reference.
     Field {
         /// Lexical record reference retaining its checked batch root.
@@ -102,8 +121,11 @@ pub struct Function {
     pub name: String,
     /// Ordered explicit arguments and their lexical identities.
     pub params: Vec<FunctionParameter>,
-    /// Nominal family of a scalar result, or no family for a plain `u64`.
+    /// Nominal family of a tagged scalar result.
     pub result: Option<String>,
+    /// Whether this helper returns a boolean instead of an unsigned scalar.
+    /// Boolean returns have no result family.
+    pub returns_bool: bool,
     /// Checked operations that return the declared type on every completion path.
     pub body: Vec<Op>,
 }
@@ -179,6 +201,8 @@ pub enum ResultValue {
         /// Actuals evaluated once in written order.
         args: Vec<FunctionArgument>,
     },
+    /// Return the complete outcome already held in an immutable local.
+    Saved(String),
 }
 
 /// One arm of an immediate result handler producing an unsigned value.
@@ -188,6 +212,15 @@ pub struct ResultArm {
     pub pattern: ResultPattern,
     /// Evaluate only after the arm's case has been selected.
     pub value: Expr,
+}
+
+/// One scoped statement arm of an ordinary scalar result handler.
+#[derive(Clone, Debug)]
+pub struct ResultBlockArm {
+    /// Checked case selection and any arm-local binding.
+    pub pattern: ResultPattern,
+    /// Execute only on the matching outcome, in a fresh lexical scope.
+    pub body: Vec<Op>,
 }
 
 /// A payload binder, named error case, or residual error arm.
@@ -222,10 +255,21 @@ pub struct FunctionParameter {
 pub enum FunctionParameterKind {
     /// Copied unsigned value, immutable within the callee.
     U64,
+    /// Copied boolean value, immutable within the callee.
+    Bool,
     /// Readonly byte borrow whose captured extent bounds every load.
     Bytes,
+    /// Readwrite byte borrow whose captured extent bounds every load and store.
+    WritableBytes,
     /// Writable reference to an existing fixed scalar-only record schema.
     State(String),
+    /// Call-scoped view of a batch's published prefix and permitted record access.
+    Batch {
+        /// Exact nominal record schema shared with the actual batch.
+        record: String,
+        /// Access permitted when borrowing a published element.
+        access: Access,
+    },
 }
 
 /// Typed actual captured in source order before entering an ordinary helper.
@@ -233,29 +277,40 @@ pub enum FunctionParameterKind {
 pub enum FunctionArgument {
     /// Evaluate one scalar value, including any nested calls or checked loads.
     Scalar(Expr),
+    /// Evaluate one boolean value, including any nested calls or short-circuit operations.
+    Bool(BoolExpr),
     /// Reborrow the caller's live writable record binding for this call.
     State(String),
-    /// Capture a byte location and its extent, then optionally narrow that extent.
+    /// Capture the published prefix of a live batch or forward a borrowed prefix.
+    Batch(String),
+    /// Capture a byte location and its extent, then apply any nested ranges.
     Bytes {
-        /// Initialized published field or forwarded byte formal.
+        /// Immutable literal or a live initialized byte borrow.
         source: BytesSource,
-        /// Logical prefix evaluated once after capturing the source. Oversize traps.
-        prefix: Option<Expr>,
+        /// Checked windows ordered from the innermost to the outermost view.
+        ranges: Vec<ByteRange>,
     },
     /// Reborrow the readonly prefix produced by the active refill's Data arm.
     Received(String),
 }
 
-/// One experimental host-backed read attempt into a fixed initialized byte field.
+/// One logical window evaluated after capturing its input byte location and extent.
+#[derive(Clone, Debug)]
+pub struct ByteRange {
+    /// Byte offset from the input start. Absent for a prefix starting at zero.
+    pub offset: Option<Expr>,
+    /// Requested length, evaluated after the offset. Invalid ranges trap.
+    pub length: Expr,
+}
+
+/// One experimental host-backed read attempt into a writable byte field or local view.
 ///
 /// A positive result lends the fresh prefix only to `data_body`. The caller
 /// retains the slot and one admitted descriptor across attempts.
 #[derive(Clone, Debug)]
 pub struct Refill {
-    /// Writable reference into the live storage root that owns the slot.
-    pub reference: String,
-    /// Path to the initialized byte field within that reference's record.
-    pub path: Vec<String>,
+    /// Checked writable field or captured local view.
+    pub destination: BytesSource,
     /// Positive request limit evaluated once after capturing the writable slot.
     pub limit: Expr,
     /// New lexical readonly prefix binding in the positive branch.
@@ -371,11 +426,13 @@ pub enum Access {
     Readwrite,
 }
 
-/// Scalar expressions; memory observations require checked live bindings.
+/// Expressions for unsigned scalar evaluation and checked condition operands.
 #[derive(Clone, Debug)]
 pub enum Expr {
     /// Exact unsigned constant.
     Const(u64),
+    /// Boolean operand reserved for the checked truth condition.
+    Bool(Box<BoolExpr>),
     /// Eager scalar-helper application without a runtime closure or function object.
     /// Actuals evaluate once in the enclosing context; body Param indexes a fresh
     /// all-u64 frame and cannot observe enclosing byte inputs or initializer Index.
@@ -401,6 +458,13 @@ pub enum Expr {
         /// Disjoint named arms, with at most one final residual failure arm.
         arms: Vec<ResultArm>,
     },
+    /// Evaluate the selected arm of a saved scalar outcome.
+    HandleSavedResult {
+        /// Live immutable binding of the complete outcome.
+        name: String,
+        /// Exhaustive arms for the binding's nominal outcome type.
+        arms: Vec<ResultArm>,
+    },
     /// Lexical unsigned binding.
     Local(String),
     /// Zero-based U64 constructor or pure Apply formal.
@@ -412,6 +476,22 @@ pub enum Expr {
         /// Index of a Bytes formal, never a numeric pointer parameter.
         param: usize,
         /// Unsigned index evaluated once before checking and loading.
+        index: Box<Expr>,
+    },
+    /// Bounds-checked read from immutable literal bytes, widened to u64.
+    LiteralByte {
+        /// Exact contents, including any embedded zero bytes.
+        bytes: Arc<[u8]>,
+        /// Unsigned index evaluated once before checking and loading.
+        index: Box<Expr>,
+    },
+    /// Captured extent of a lexical byte view.
+    ViewLen(String),
+    /// Read one byte within a lexical view and widen it to u64.
+    ViewByte {
+        /// Immutable view binding.
+        name: String,
+        /// Unsigned index evaluated before the bounds check and load.
         index: Box<Expr>,
     },
     /// Current byte initializer index; unavailable outside its element expression.
@@ -460,6 +540,30 @@ pub enum Expr {
     Nanoseconds,
 }
 
+/// Boolean expressions for ordinary returns, immutable bindings, and conditions.
+#[derive(Clone, Debug)]
+pub enum BoolExpr {
+    /// Exact boolean constant.
+    Const(bool),
+    /// Immutable lexical boolean.
+    Local(String),
+    /// Synchronous call to a checked boolean-returning helper.
+    Call {
+        /// Statically resolved callee identity.
+        function: String,
+        /// Actuals evaluated in written order.
+        args: Vec<FunctionArgument>,
+    },
+    /// Compare two unsigned scalars.
+    Compare(Condition),
+    /// Evaluate the right operand only when the left is true.
+    And(Box<BoolExpr>, Box<BoolExpr>),
+    /// Evaluate the right operand only when the left is false.
+    Or(Box<BoolExpr>, Box<BoolExpr>),
+    /// Negate one boolean operand.
+    Not(Box<BoolExpr>),
+}
+
 /// Explicit unsigned arithmetic; storage address/size arithmetic is not wrapping.
 #[derive(Clone, Copy, Debug)]
 pub enum Binary {
@@ -475,20 +579,33 @@ pub enum Binary {
     And,
 }
 
-/// Unsigned scalar comparison, evaluating the left expression first.
+/// Branch or assertion condition, evaluating the left operand first.
 #[derive(Clone, Debug)]
 pub struct Condition {
     /// Relationship to evaluate.
     pub op: Compare,
-    /// First scalar expression.
+    /// First scalar expression or the boolean operand of a truth test.
     pub left: Expr,
-    /// Second scalar expression.
+    /// Second scalar expression, or a zero placeholder for a truth test.
     pub right: Expr,
+}
+
+impl Condition {
+    /// Test a boolean directly, with no unsigned scalar conversion.
+    pub fn truth(value: BoolExpr) -> Self {
+        Self {
+            op: Compare::Truth,
+            left: Expr::Bool(Box::new(value)),
+            right: Expr::Const(0),
+        }
+    }
 }
 
 /// Comparison relationships for assertions, branches, and construction rejection.
 #[derive(Clone, Copy, Debug)]
 pub enum Compare {
+    /// Test the boolean in the left operand. The right operand must be zero.
+    Truth,
     /// Equal values.
     Eq,
     /// Unequal values.
@@ -538,15 +655,13 @@ pub enum Op {
         /// Readonly scalar name receiving readiness, interruption, or tagged errno.
         result: String,
     },
-    /// Attempt one send from an initialized byte field on the host descriptor.
+    /// Attempt one send from an initialized byte field or named view.
     Send {
-        /// Live reference to the record containing the initialized bytes.
-        reference: String,
-        /// Projection to the readonly send source.
-        path: Vec<String>,
+        /// Readable field, captured local view, or immutable literal.
+        source: BytesSource,
         /// Offset evaluated after capturing the source and before the count.
         offset: Expr,
-        /// Positive count within the remaining field and the native count cap.
+        /// Positive count within the remaining extent and the native count cap.
         count: Expr,
         /// Readonly scalar receiving the exact positive sent count or a status.
         result: String,
@@ -596,6 +711,24 @@ pub enum Op {
         /// Initial unsigned value.
         value: Expr,
     },
+    /// Bind the result of one boolean evaluation.
+    LetBool {
+        /// New immutable boolean name.
+        name: String,
+        /// Initial boolean value.
+        value: BoolExpr,
+    },
+    /// Capture an initialized byte location and bound for the rest of this scope.
+    BindBytes {
+        /// New immutable view binding.
+        name: String,
+        /// Access available through the captured range.
+        access: Access,
+        /// Static literal or live byte source with its original checked extent.
+        source: BytesSource,
+        /// Successive windows in evaluation order from innermost to outermost.
+        ranges: Vec<ByteRange>,
+    },
     /// Call a scalar result function, binding only its success. Failure exits
     /// the enclosing ordinary function in its own family, lifting a declared child.
     TryLet {
@@ -605,6 +738,38 @@ pub enum Op {
         function: String,
         /// Typed actuals evaluated once in their written order.
         args: Vec<FunctionArgument>,
+    },
+    /// Bind the success of a saved scalar result or propagate its failure.
+    TrySaved {
+        /// Immutable success local introduced only after a successful result.
+        name: String,
+        /// Existing lexical result whose tag and payload are reused.
+        source: String,
+    },
+    /// Call a scalar-result function once and save its copied tag and payload.
+    BindResult {
+        /// Immutable outcome binding introduced after the call.
+        name: String,
+        /// Direct callee with a tagged scalar result.
+        function: String,
+        /// Typed actuals evaluated once in their written order.
+        args: Vec<FunctionArgument>,
+    },
+    /// Call an ordinary fallible function once and execute its selected arm.
+    HandleResult {
+        /// Statically resolved ordinary callee identity.
+        function: String,
+        /// Actuals evaluated once before dispatch.
+        args: Vec<FunctionArgument>,
+        /// Complete, disjoint outcome partition in source order.
+        arms: Vec<ResultBlockArm>,
+    },
+    /// Execute the selected arm of a saved scalar outcome.
+    HandleSavedResult {
+        /// Live immutable binding of the complete outcome.
+        name: String,
+        /// Exhaustive arms for the binding's nominal outcome type.
+        arms: Vec<ResultBlockArm>,
     },
     /// Update an existing scalar without altering reference permissions.
     Set {
@@ -695,6 +860,31 @@ pub enum Op {
         /// Value explicitly narrowed to its low eight bits.
         value: Expr,
     },
+    /// Replace a byte inside a writable ordinary parameter's captured view.
+    WriteInputByte {
+        /// Index of the writable byte parameter in its function frame.
+        param: usize,
+        /// Bounds-checked index relative to the start of the view.
+        index: Expr,
+        /// Value explicitly narrowed to its low eight bits.
+        value: Expr,
+    },
+    /// Replace one byte through a captured local view after checking its index.
+    WriteViewByte {
+        /// Writable local view.
+        name: String,
+        /// Index relative to the start of the view.
+        index: Expr,
+        /// Replacement evaluated after the bounds check and narrowed to eight bits.
+        value: Expr,
+    },
+    /// Copy a byte parameter into an existing writable parameter, allowing overlap.
+    MoveInputBytes {
+        /// Writable parameter with room for the entire source.
+        destination: usize,
+        /// Readable parameter whose exact captured extent supplies the byte count.
+        source: usize,
+    },
     /// Reset a batch's marker/count; checker rejects any live reference to it.
     /// This compiler operation does not select a public Holo reset keyword.
     Reset {
@@ -740,6 +930,8 @@ pub enum Op {
     PrintText(String),
     /// Complete the current ordinary helper with one copied unsigned result.
     Return(Expr),
+    /// Complete the current ordinary helper with one copied boolean.
+    ReturnBool(BoolExpr),
     /// Complete the current scalar-result helper with its checked outcome.
     ReturnResult(ResultValue),
     /// Complete the entry process successfully after lexical storage cleanup.
