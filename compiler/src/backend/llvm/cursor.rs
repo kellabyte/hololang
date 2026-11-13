@@ -8,7 +8,10 @@
 
 use crate::ir::Op;
 
-use super::{context::Lowering, storage};
+use super::{
+    context::{Binding, Lowering},
+    storage,
+};
 
 impl Lowering<'_> {
     /// Traverse a checked batch's original published records in physical order.
@@ -20,18 +23,30 @@ impl Lowering<'_> {
     /// checker prevents reset while the per-iteration reference remains usable.
     pub(super) fn for_each(&mut self, batch_name: &str, reference_name: &str, body: &[Op]) {
         let origin = self.batch_origin(batch_name);
-        let (batch, record) = self.batch(batch_name);
         let shape = self.uniform_batch_shape(batch_name);
-        let region_slot = storage::member(&mut self.f, "%holo.batch", &batch, 0);
-        let region = self.f.value(format!("load ptr, ptr {region_slot}"));
-        let base_slot = storage::member(&mut self.f, "%holo.region", &region, 0);
-        let base = self.f.value(format!("load ptr, ptr {base_slot}"));
-        let start_slot = storage::member(&mut self.f, "%holo.batch", &batch, 1);
-        let start = self.f.value(format!("load i64, ptr {start_slot}"));
-        let end_slot = storage::member(&mut self.f, "%holo.batch", &batch, 2);
-        let end = self.f.value(format!("load i64, ptr {end_slot}"));
-        let count_slot = storage::member(&mut self.f, "%holo.batch", &batch, 3);
-        let _count = self.f.value(format!("load i64, ptr {count_slot}"));
+        let (record, base, start, end) = match self.binding(batch_name) {
+            Binding::Batch {
+                slot: batch,
+                record,
+                ..
+            } => {
+                let region_slot = storage::member(&mut self.f, "%holo.batch", &batch, 0);
+                let region = self.f.value(format!("load ptr, ptr {region_slot}"));
+                let base_slot = storage::member(&mut self.f, "%holo.region", &region, 0);
+                let base = self.f.value(format!("load ptr, ptr {base_slot}"));
+                let start_slot = storage::member(&mut self.f, "%holo.batch", &batch, 1);
+                let start = self.f.value(format!("load i64, ptr {start_slot}"));
+                let end_slot = storage::member(&mut self.f, "%holo.batch", &batch, 2);
+                let end = self.f.value(format!("load i64, ptr {end_slot}"));
+                let count_slot = storage::member(&mut self.f, "%holo.batch", &batch, 3);
+                let _count = self.f.value(format!("load i64, ptr {count_slot}"));
+                (record, base, start, end)
+            }
+            Binding::BorrowedBatch { prefix, record } => {
+                (record, prefix.contents, "0".to_owned(), prefix.extent)
+            }
+            _ => unreachable!("checked cursor requires a batch"),
+        };
         let offset_slot = self.f.slot("i64");
         let reference_slot = self.f.slot("ptr");
         self.f.line(format!("store i64 {start}, ptr {offset_slot}"));

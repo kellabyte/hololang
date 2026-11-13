@@ -2,13 +2,12 @@
 //!
 //! Only explicit core arithmetic and closed scalar helpers are admitted. No
 //! unbound published-memory read, allocation, mutation, or unknown call enters a
-//! scalar template. Producer contexts may read explicit readonly byte formals;
-//! scalar-helper declarations remain scalar-only. Contextual byte indexes remain
-//! legal only in payload initializers, with bounds checks retained for input reads.
+//! scalar template. Pure expressions can read static byte literals; producers
+//! can also read explicit readonly byte formals. The contextual `core.index()`
+//! is available in payload initializers. All byte reads retain bounds checks.
 
 use super::{
-    Lowerer, MAX_DEPTH, ScalarTemplate, ast, core_name, instantiate, ordinary_function,
-    parameter_kinds, parameters,
+    Lowerer, MAX_DEPTH, ScalarTemplate, ast, core_name, instantiate, parameter_kinds, parameters,
 };
 use crate::ir;
 use crate::source::{Diagnostic, Span};
@@ -73,12 +72,16 @@ pub(super) fn expression(
             "pure expression exceeds the experimental depth limit of 64",
         ));
     }
-    // Expression alternatives admit only immutable scalar computations, never implicit reads/copies.
+    // Pure scalar expressions can observe readonly input without copying it.
     let lowered = match &value.kind {
         ast::ExprKind::Number(number) => {
             lowerer.charge(1, value.span)?;
             Ok(ir::Expr::Const(*number))
         }
+        ast::ExprKind::Bytes(_) => Err(Diagnostic::new(
+            value.span,
+            "a byte string literal cannot be used as a u64",
+        )),
         ast::ExprKind::Name(name) => {
             let index = context.params.get(name.as_str()).copied().ok_or_else(|| {
                 Diagnostic::new(value.span, format!("unknown pure scalar value `{name}`"))
@@ -94,16 +97,32 @@ pub(super) fn expression(
             Ok(ir::Expr::Param(index))
         }
         ast::ExprKind::Index { base, index } => {
-            let param = byte_parameter(base, context)?;
-            let index = expression(lowerer, index, context, depth + 1)?;
             lowerer.charge(1, value.span)?;
-            Ok(ir::Expr::InputByte {
-                param,
-                index: Box::new(index),
-            })
+            if let ast::ExprKind::Bytes(bytes) = &base.kind {
+                let index = expression(lowerer, index, context, depth + 1)?;
+                Ok(ir::Expr::LiteralByte {
+                    bytes: bytes.clone(),
+                    index: Box::new(index),
+                })
+            } else {
+                let param = byte_parameter(base, context)?;
+                let index = expression(lowerer, index, context, depth + 1)?;
+                Ok(ir::Expr::InputByte {
+                    param,
+                    index: Box::new(index),
+                })
+            }
         }
         ast::ExprKind::Call { callee, args } => {
             call(lowerer, callee, args, value.span, context, depth)
+        }
+        ast::ExprKind::Binary { .. } | ast::ExprKind::Not { .. }
+            if super::boolean_syntax(value) =>
+        {
+            Err(Diagnostic::new(
+                value.span,
+                "a bool expression cannot be used as a u64",
+            ))
         }
         ast::ExprKind::Binary { .. } => Err(Diagnostic::new(
             value.span,
@@ -138,7 +157,9 @@ fn validate_depth(expression: &ir::Expr, span: Span) -> Result<(), Diagnostic> {
                 pending.push((right, depth + 1));
                 pending.push((left, depth + 1));
             }
-            ir::Expr::Byte { index, .. } | ir::Expr::InputByte { index, .. } => {
+            ir::Expr::Byte { index, .. }
+            | ir::Expr::InputByte { index, .. }
+            | ir::Expr::LiteralByte { index, .. } => {
                 pending.push((index, depth + 1));
             }
             ir::Expr::Apply { args, body } => {
@@ -170,9 +191,12 @@ fn call(
         // Length observes a captured readonly extent, never a payload scan or numeric address.
         if name == "len" {
             arity(args.len(), 1, span)?;
-            let param = byte_parameter(&args[0], context)?;
             lowerer.charge(1, span)?;
-            return Ok(ir::Expr::InputLen(param));
+            return Ok(if let ast::ExprKind::Bytes(bytes) = &args[0].kind {
+                ir::Expr::Const(bytes.len() as u64)
+            } else {
+                ir::Expr::InputLen(byte_parameter(&args[0], context)?)
+            });
         }
         if name == "index" {
             arity(args.len(), 0, span)?;
@@ -215,6 +239,12 @@ fn call(
         .get(name.as_str())
         .copied()
         .ok_or_else(|| Diagnostic::new(callee.span, format!("unknown function `{name}`")))?;
+    if function.result == "bool" {
+        return Err(Diagnostic::new(
+            callee.span,
+            "a bool return cannot be used as a u64",
+        ));
+    }
     if function.result != "u64" {
         return Err(Diagnostic::new(
             callee.span,
@@ -223,7 +253,7 @@ fn call(
     }
     // Mutable ordinary calls belong to the statement verifier, outside the pure
     // scalar and private destination-construction graphs.
-    if ordinary_function(function) {
+    if lowerer.ordinary.contains(name.as_str()) {
         return Err(Diagnostic::new(
             callee.span,
             format!(
@@ -238,11 +268,9 @@ fn call(
     for argument in args {
         arguments.push(expression(lowerer, argument, context, depth + 1)?);
     }
-    // Byte-bearing producers may evaluate trapping input reads as scalar actuals.
-    // A scoped eager frame preserves every actual once, even when the template
-    // ignores or repeats its parameter. Prior scalar-only graphs remain pure,
-    // nontrapping arithmetic and retain their existing syntactic substitution.
-    if context.kinds.contains(&ir::Parameter::Bytes) {
+    // A scoped eager frame preserves trapping actuals, including an input or
+    // literal byte read, even when the callee ignores or repeats its parameter.
+    if context.kinds.contains(&ir::Parameter::Bytes) || arguments.iter().any(has_literal_read) {
         lowerer.charge(1, span)?;
         let identities: Vec<_> = (0..arguments.len()).map(ir::Expr::Param).collect();
         let template = &lowerer.scalars[name].value;
@@ -257,7 +285,19 @@ fn call(
     }
 }
 
-/// Resolve a bare readonly byte parameter without permitting arbitrary views or globals.
+/// Pure scalar arguments may contain trapping literal reads after inlining.
+fn has_literal_read(value: &ir::Expr) -> bool {
+    match value {
+        ir::Expr::LiteralByte { .. } => true,
+        ir::Expr::Binary { left, right, .. } => has_literal_read(left) || has_literal_read(right),
+        ir::Expr::Apply { args, body } => {
+            args.iter().any(has_literal_read) || has_literal_read(body)
+        }
+        _ => false,
+    }
+}
+
+/// Resolve a bare readonly byte parameter without admitting globals or stored views.
 /// `value` and `context` are borrowed compiler syntax/facts; the returned full-slot
 /// index retains its source formal kind. Missing/nonbyte names reject at the input span.
 pub(super) fn byte_parameter(
@@ -273,50 +313,69 @@ pub(super) fn byte_parameter(
     }
     Err(Diagnostic::new(
         value.span,
-        "expected a readonly Bytes input parameter; arbitrary slices, published globals, and scalar descriptors are unsupported",
+        "expected a readonly Bytes input parameter; published globals and scalar descriptors are unsupported",
     ))
 }
 
-/// Lower one boolean literal/comparison with pure scalar operands.
-/// Returns an unsigned checked-IR relationship, with no runtime boolean allocation.
+/// Lower a producer guard using pure operands and short-circuit evaluation.
 pub(super) fn condition(
     lowerer: &mut Lowerer<'_>,
     value: &ast::Expr,
     context: &Context<'_>,
 ) -> Result<ir::Condition, Diagnostic> {
-    // Boolean constants and six comparisons are the only source condition forms in this subset.
-    match &value.kind {
-        ast::ExprKind::Bool(flag) => {
-            lowerer.charge(3, value.span)?;
-            Ok(ir::Condition {
+    let result = boolean(lowerer, value, context)?;
+    Ok(match result {
+        // Keep the existing simple guard shapes for destination planning.
+        ir::BoolExpr::Const(flag) => {
+            lowerer.charge(2, value.span)?;
+            ir::Condition {
                 op: ir::Compare::Eq,
-                left: ir::Expr::Const(u64::from(*flag)),
+                left: ir::Expr::Const(u64::from(flag)),
                 right: ir::Expr::Const(1),
-            })
+            }
         }
-        ast::ExprKind::Binary { op, left, right } => {
-            let relation = match op {
-                ast::BinaryOp::Eq => ir::Compare::Eq,
-                ast::BinaryOp::Ne => ir::Compare::Ne,
-                ast::BinaryOp::Lt => ir::Compare::Lt,
-                ast::BinaryOp::Le => ir::Compare::Le,
-                ast::BinaryOp::Gt => ir::Compare::Gt,
-                ast::BinaryOp::Ge => ir::Compare::Ge,
-                _ => {
-                    return Err(Diagnostic::new(
-                        value.span,
-                        "a condition requires a comparison or boolean literal",
-                    ));
-                }
-            };
+        ir::BoolExpr::Compare(condition) => condition,
+        value => ir::Condition::truth(value),
+    })
+}
+
+/// Check each guard operand using the producer's pure expression context.
+fn boolean(
+    lowerer: &mut Lowerer<'_>,
+    value: &ast::Expr,
+    context: &Context<'_>,
+) -> Result<ir::BoolExpr, Diagnostic> {
+    lowerer.charge(1, value.span)?;
+    match &value.kind {
+        ast::ExprKind::Bool(flag) => Ok(ir::BoolExpr::Const(*flag)),
+        ast::ExprKind::Not { value, .. } => Ok(ir::BoolExpr::Not(Box::new(boolean(
+            lowerer, value, context,
+        )?))),
+        ast::ExprKind::Binary {
+            op, left, right, ..
+        } => {
+            if matches!(op, ast::BinaryOp::LogicalAnd | ast::BinaryOp::LogicalOr) {
+                let left = Box::new(boolean(lowerer, left, context)?);
+                let right = Box::new(boolean(lowerer, right, context)?);
+                return Ok(if *op == ast::BinaryOp::LogicalAnd {
+                    ir::BoolExpr::And(left, right)
+                } else {
+                    ir::BoolExpr::Or(left, right)
+                });
+            }
+            let relation = super::comparison(*op).ok_or_else(|| {
+                Diagnostic::new(
+                    value.span,
+                    "a condition requires a comparison or boolean literal",
+                )
+            })?;
             let left = expression(lowerer, left, context, 0)?;
             let right = expression(lowerer, right, context, 0)?;
-            lowerer.charge(1, value.span)?;
-            Ok(ir::Condition {
+            Ok(ir::BoolExpr::Compare(ir::Condition {
                 op: relation,
                 left,
                 right,
-            })
+            }))
         }
         _ => Err(Diagnostic::new(
             value.span,

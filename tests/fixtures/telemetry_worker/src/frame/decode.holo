@@ -1,5 +1,4 @@
-// Field decoding and fixed identifiers for telemetry frames. The wire helper
-// consumes copied scalars, so decoding never retains a read-buffer reference.
+// Decode split length fields and provide the fixed frame signature.
 
 namespace telemetry.frame
 

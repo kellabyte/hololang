@@ -8,6 +8,7 @@ use std::collections::HashSet;
 
 use super::{Block, Kind, Lowerer, arity, ast};
 use crate::frontend::functions;
+use crate::frontend::functions::{OPTION_FAMILY, OPTION_NONE};
 use crate::{
     ir,
     source::{Diagnostic, Span},
@@ -23,6 +24,28 @@ pub(super) struct AppendCall {
     pub args: Vec<ir::Argument>,
     /// Error family for a typed constructor, absent for the numeric adapter.
     pub family: Option<String>,
+}
+
+/// A direct tagged call or a previously evaluated scalar outcome.
+enum HandlerSubject {
+    Call {
+        function: String,
+        args: Vec<ir::FunctionArgument>,
+        family: String,
+    },
+    Local {
+        name: String,
+        family: String,
+    },
+}
+
+impl HandlerSubject {
+    /// Return the checked outcome identity that determines the legal arms.
+    fn family(&self) -> &str {
+        match self {
+            Self::Call { family, .. } | Self::Local { family, .. } => family,
+        }
+    }
 }
 
 impl AppendCall {
@@ -49,7 +72,7 @@ impl Lowerer {
         output: &mut Block,
     ) -> Result<AppendCall, Diagnostic> {
         arity(args, 2, span)?;
-        let (batch, record) = self.batch(&args[0])?;
+        let (batch, record) = self.owned_batch(&args[0])?;
         // The constructor expression denotes a destination call, so it cannot
         // be evaluated independently into a temporary aggregate.
         let ast::ExprKind::Call {
@@ -166,9 +189,9 @@ impl Lowerer {
                             binding,
                         }
                     }
-                    ast::ResultPattern::Fallback(binding) => {
-                        ir::AppendPattern::Fallback(self.fallback_binding(binding.as_deref(), arm)?)
-                    }
+                    ast::ResultPattern::Fallback(binding) => ir::AppendPattern::Fallback(
+                        self.fallback_binding(binding.as_deref(), arm.span)?,
+                    ),
                 };
                 Ok(ir::AppendArm {
                     pattern,
@@ -182,8 +205,8 @@ impl Lowerer {
         Ok((call, lowered))
     }
 
-    /// Bind a successful direct call in the current scope, or propagate its
-    /// same-family or declared child failure. Capture actuals before binding.
+    /// Bind a successful call or saved result, or propagate its same-family or
+    /// declared child failure. Resolve the operand before introducing the local.
     /// Lowering allocates compiler IR only and rejects unsupported contexts.
     pub(super) fn try_binding(
         &mut self,
@@ -195,20 +218,23 @@ impl Lowerer {
         let family = self.result_family.as_deref().ok_or_else(|| {
             Diagnostic::new(span, "`try` requires a scalar typed-result function")
         })?;
-        let (function, args) = self.fallible_call(expression)?;
-        let actual = &self.definitions.results[function];
-        // An explicit child edge provides exactly one nominal route on failure.
-        if self.definitions.errors[family]
-            .try_error_offset(actual)
-            .is_none()
-        {
-            return Err(Diagnostic::new(
-                expression.span,
-                format!(
-                    "cannot forward Result from error family `{actual}` as `{family}` with `try`; declare it as a direct child"
-                ),
-            ));
+        if let ast::ExprKind::Name(source) = &expression.kind {
+            let binding = self.lookup(source, expression.span)?;
+            let Kind::SavedResult(actual) = binding.kind else {
+                return Err(Diagnostic::new(
+                    expression.span,
+                    "`try` requires a saved `Result`",
+                ));
+            };
+            self.require_try_family(&actual, family, expression.span)?;
+            let name = self.bind(name, Kind::Scalar { mutable: false }, span)?;
+            return Ok(ir::Op::TrySaved {
+                name,
+                source: binding.ir_name,
+            });
         }
+        let (function, args) = self.tagged_call(expression)?;
+        self.require_try_family(&self.definitions.results[function], family, expression.span)?;
         let args = self.ordinary_arguments(function, args, expression.span)?;
         let name = self.bind(name, Kind::Scalar { mutable: false }, span)?;
         Ok(ir::Op::TryLet {
@@ -218,8 +244,31 @@ impl Lowerer {
         })
     }
 
-    /// Resolve a typed return against `family`, evaluating only its active
-    /// scalar or forwarding call. Any scalar evaluation prelude stays in `output`.
+    /// Require a Result family that is exact or declared as a direct child.
+    fn require_try_family(&self, actual: &str, family: &str, span: Span) -> Result<(), Diagnostic> {
+        if family == OPTION_FAMILY || actual == OPTION_FAMILY {
+            return Err(Diagnostic::new(
+                span,
+                "`try` requires a Result operand inside a Result function. Handle `Option<u64>` with `on Some` and `on None`",
+            ));
+        }
+        // An explicit child edge provides exactly one nominal route on failure.
+        if self.definitions.errors[family]
+            .try_error_offset(actual)
+            .is_none()
+        {
+            return Err(Diagnostic::new(
+                span,
+                format!(
+                    "cannot forward Result from error family `{actual}` as `{family}` with `try`; declare it as a direct child"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resolve a typed return against `family`. Scalar evaluation preludes
+    /// stay in `output`, and a saved result needs only its lexical name.
     pub(super) fn result_return(
         &mut self,
         expression: &ast::Expr,
@@ -227,6 +276,22 @@ impl Lowerer {
         output: &mut Block,
     ) -> Result<ir::ResultValue, Diagnostic> {
         self.charge(expression.span)?;
+        if let ast::ExprKind::Name(name) = &expression.kind
+            && (family != OPTION_FAMILY || name != OPTION_NONE)
+        {
+            let binding = self.lookup(name, expression.span)?;
+            let Kind::SavedResult(actual) = &binding.kind else {
+                return Err(Diagnostic::new(
+                    expression.span,
+                    "a named result return requires a saved `Result` or `Option<u64>`",
+                ));
+            };
+            self.require_forwarded_type(actual, family, "saved result", expression.span)?;
+            return Ok(ir::ResultValue::Saved(binding.ir_name));
+        }
+        if family == OPTION_FAMILY {
+            return self.option_return(expression, output);
+        }
         match &expression.kind {
             // The first success value is a full-width u64, including zero.
             ast::ExprKind::Ok(value) => Ok(ir::ResultValue::Ok(self.scalar(value, output)?)),
@@ -265,7 +330,38 @@ impl Lowerer {
             }
             _ => Err(Diagnostic::new(
                 expression.span,
-                "return `ok value`, `error Family.Case`, or an exact Result call",
+                "return `ok value`, `error Family.Case`, or a call or saved result with the exact Result type",
+            )),
+        }
+    }
+
+    /// Lower an optional return to the tagged scalar representation.
+    fn option_return(
+        &mut self,
+        expression: &ast::Expr,
+        output: &mut Block,
+    ) -> Result<ir::ResultValue, Diagnostic> {
+        match &expression.kind {
+            ast::ExprKind::Name(name) if name == OPTION_NONE => Ok(ir::ResultValue::Error {
+                family: OPTION_FAMILY.to_owned(),
+                case: OPTION_NONE.to_owned(),
+                payload: None,
+            }),
+            ast::ExprKind::Call { callee, args } if matches!(&callee.kind, ast::ExprKind::Name(name) if name == "Some") =>
+            {
+                arity(args, 1, expression.span)?;
+                Ok(ir::ResultValue::Ok(self.scalar(&args[0], output)?))
+            }
+            ast::ExprKind::Call { .. } => {
+                let (name, args) = self.forwarded_call(expression, OPTION_FAMILY)?;
+                Ok(ir::ResultValue::Call {
+                    function: name.to_owned(),
+                    args: self.ordinary_arguments(name, args, expression.span)?,
+                })
+            }
+            _ => Err(Diagnostic::new(
+                expression.span,
+                "return `Some(value)`, `None`, or a call or saved value of type `Option<u64>`",
             )),
         }
     }
@@ -277,19 +373,38 @@ impl Lowerer {
         expression: &'a ast::Expr,
         family: &str,
     ) -> Result<(&'a str, &'a [ast::Expr]), Diagnostic> {
-        let (name, args) = self.fallible_call(expression)?;
+        let (name, args) = self.tagged_call(expression)?;
         let actual = &self.definitions.results[name];
-        // A whole-result return preserves the exact type and its original tag.
-        if actual != family {
-            return Err(Diagnostic::new(
-                expression.span,
-                format!("cannot forward Result from error family `{actual}` as `{family}`"),
-            ));
-        }
+        self.require_forwarded_type(actual, family, "forwarded call", expression.span)?;
         Ok((name, args))
     }
 
-    /// Resolve one immediate result subject and its disjoint arms. All scalar
+    /// Require exact nominal identity for a return that preserves the original tag.
+    fn require_forwarded_type(
+        &self,
+        actual: &str,
+        family: &str,
+        subject: &str,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        if actual != family {
+            if actual == OPTION_FAMILY || family == OPTION_FAMILY {
+                return Err(Diagnostic::new(
+                    span,
+                    format!(
+                        "the {subject} must have the exact return type because `Option<u64>` and `Result` are distinct"
+                    ),
+                ));
+            }
+            return Err(Diagnostic::new(
+                span,
+                format!("cannot forward Result from error family `{actual}` as `{family}`"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resolve a result subject and its disjoint arms. All scalar
     /// work inside each arm remains an expression until that arm executes.
     /// `boolean` selects the initial bool-literal decision form for a `let`.
     pub(super) fn handle_result(
@@ -298,56 +413,144 @@ impl Lowerer {
         arms: &[ast::ResultArm],
         boolean: bool,
     ) -> Result<ir::Expr, Diagnostic> {
-        let (name, actuals) = self.fallible_call(subject)?;
-        let family = self.definitions.results[name].clone();
-        let args = self.ordinary_arguments(name, actuals, subject.span)?;
+        let selected = self.handler_subject(subject)?;
+        let arms = self.result_arms(
+            subject.span,
+            selected.family(),
+            arms.iter().map(|arm| (&arm.pattern, arm.span, arm)),
+            |lowerer, pattern, arm| {
+                let saved = std::mem::replace(&mut lowerer.deferred_actual, true);
+                let value = lowerer.arm_value(arm, boolean);
+                lowerer.deferred_actual = saved;
+                Ok(ir::ResultArm {
+                    pattern,
+                    value: value?,
+                })
+            },
+        )?;
+        Ok(match selected {
+            HandlerSubject::Call { function, args, .. } => ir::Expr::Handle {
+                function,
+                args,
+                arms,
+            },
+            HandlerSubject::Local { name, .. } => ir::Expr::HandleSavedResult { name, arms },
+        })
+    }
+
+    /// Lower one tagged subject and its exhaustive statement blocks.
+    /// Each block sees only the active payload and uses normal lexical control flow.
+    pub(super) fn handle_result_blocks(
+        &mut self,
+        subject: &ast::Expr,
+        arms: &[ast::ResultBlockArm],
+        span: Span,
+        output: &mut Block,
+    ) -> Result<(), Diagnostic> {
+        let selected = self.handler_subject(subject)?;
+        let mut children = Vec::with_capacity(arms.len());
+        let arms = self.result_arms(
+            subject.span,
+            selected.family(),
+            arms.iter().map(|arm| (&arm.pattern, arm.span, arm)),
+            |lowerer, pattern, arm| {
+                let body = lowerer.block(&arm.body)?;
+                children.push(body.spans);
+                Ok(ir::ResultBlockArm {
+                    pattern,
+                    body: body.ops,
+                })
+            },
+        )?;
+        let operation = match selected {
+            HandlerSubject::Call { function, args, .. } => ir::Op::HandleResult {
+                function,
+                args,
+                arms,
+            },
+            HandlerSubject::Local { name, .. } => ir::Op::HandleSavedResult { name, arms },
+        };
+        output.push(operation, span, children);
+        Ok(())
+    }
+
+    /// Bind the handler to a saved outcome or capture a call's actuals.
+    fn handler_subject(&mut self, subject: &ast::Expr) -> Result<HandlerSubject, Diagnostic> {
+        if let ast::ExprKind::Name(name) = &subject.kind {
+            let binding = self.lookup(name, subject.span)?;
+            if let Kind::SavedResult(family) = binding.kind {
+                return Ok(HandlerSubject::Local {
+                    name: binding.ir_name,
+                    family,
+                });
+            }
+            return Err(Diagnostic::new(
+                subject.span,
+                "a named `on` subject must be a saved `Result` or `Option<u64>`",
+            ));
+        }
+        let (name, actuals) = self.tagged_call(subject)?;
+        Ok(HandlerSubject::Call {
+            function: name.to_owned(),
+            family: self.definitions.results[name].clone(),
+            args: self.ordinary_arguments(name, actuals, subject.span)?,
+        })
+    }
+
+    /// Lower and check an ordinary handler's pattern partition and arm scopes.
+    /// The body adapter handles the expression or statement form within each arm.
+    fn result_arms<'a, A, B>(
+        &mut self,
+        subject: Span,
+        family: &str,
+        arms: impl ExactSizeIterator<Item = (&'a ast::ResultPattern, Span, A)>,
+        mut lower: impl FnMut(&mut Self, ir::ResultPattern, A) -> Result<B, Diagnostic>,
+    ) -> Result<Vec<B>, Diagnostic> {
+        if family == OPTION_FAMILY {
+            return self.option_arms(subject, arms, lower);
+        }
         let mut success = false;
         let mut fallback = false;
         let mut cases = HashSet::new();
         let mut lowered = Vec::with_capacity(arms.len());
-        // Separate lexical scopes keep inactive payload bindings inaccessible.
-        for arm in arms {
-            self.charge(arm.span)?;
+        for (pattern, span, arm) in arms {
+            self.charge(span)?;
             if fallback {
                 return Err(Diagnostic::new(
-                    arm.span,
+                    span,
                     "the `on error` fallback must be the last arm",
                 ));
             }
             self.scopes.push(Default::default());
-            let saved = std::mem::replace(&mut self.deferred_actual, true);
             let item = (|| {
-                let pattern = match &arm.pattern {
+                let pattern = match pattern {
                     ast::ResultPattern::Ok(binding) => {
                         if std::mem::replace(&mut success, true) {
-                            return Err(Diagnostic::new(arm.span, "duplicate `on ok` arm"));
+                            return Err(Diagnostic::new(span, "duplicate `on ok` arm"));
                         }
-                        // Bare `ok` selects success without introducing a scalar,
-                        // just like the explicit wildcard `ok(_)`.
                         let binding = binding
                             .as_deref()
                             .map(|name| {
-                                self.result_binding(name, Kind::Scalar { mutable: false }, arm.span)
+                                self.result_binding(name, Kind::Scalar { mutable: false }, span)
                             })
                             .transpose()?
                             .flatten();
                         ir::ResultPattern::Ok(binding)
                     }
                     ast::ResultPattern::Error { case, binding } => {
-                        let (family, case, has_payload) = self.error_case(case, &family, false)?;
+                        let (family, case, has_payload) = self.error_case(case, family, false)?;
                         if !cases.insert(case.clone()) {
                             return Err(Diagnostic::new(
-                                arm.span,
+                                span,
                                 format!("duplicate error case `{case}`"),
                             ));
                         }
-                        // Binding or `_` makes handling an active payload explicit.
                         let binding = self.payload_binding(
                             &family,
                             &case,
                             has_payload,
                             binding.as_deref(),
-                            arm.span,
+                            span,
                         )?;
                         ir::ResultPattern::Error {
                             family,
@@ -357,33 +560,30 @@ impl Lowerer {
                     }
                     ast::ResultPattern::Fallback(binding) => {
                         fallback = true;
-                        let binding = self.fallback_binding(binding.as_deref(), arm)?;
-                        ir::ResultPattern::Fallback(binding)
+                        ir::ResultPattern::Fallback(
+                            self.fallback_binding(binding.as_deref(), span)?,
+                        )
                     }
                     ast::ResultPattern::Rejected { .. } => {
                         return Err(Diagnostic::new(
-                            arm.span,
+                            span,
                             "`on Rejected Case` requires a typed append",
                         ));
                     }
                 };
-                Ok(ir::ResultArm {
-                    pattern,
-                    value: self.arm_value(arm, boolean)?,
-                })
+                lower(self, pattern, arm)
             })();
-            self.deferred_actual = saved;
             self.scopes.pop();
             lowered.push(item?);
         }
         if !success {
             return Err(Diagnostic::new(
-                subject.span,
+                subject,
                 "result handling requires an `on ok` arm",
             ));
         }
-        if !fallback && cases.len() != self.definitions.errors[&family].cases.len() {
-            let missing = self.definitions.errors[&family]
+        if !fallback && cases.len() != self.definitions.errors[family].cases.len() {
+            let missing = self.definitions.errors[family]
                 .cases
                 .iter()
                 .map(|case| &case.name)
@@ -391,15 +591,86 @@ impl Lowerer {
                 .min()
                 .expect("coverage checked");
             return Err(Diagnostic::new(
-                subject.span,
+                subject,
                 format!("missing error case `{family}.{missing}`"),
             ));
         }
-        Ok(ir::Expr::Handle {
-            function: name.to_owned(),
-            args,
-            arms: lowered,
-        })
+        Ok(lowered)
+    }
+
+    /// Check exhaustive optional patterns and bind the payload in its own arm.
+    fn option_arms<'a, A, B>(
+        &mut self,
+        subject: Span,
+        arms: impl ExactSizeIterator<Item = (&'a ast::ResultPattern, Span, A)>,
+        mut lower: impl FnMut(&mut Self, ir::ResultPattern, A) -> Result<B, Diagnostic>,
+    ) -> Result<Vec<B>, Diagnostic> {
+        let mut some = false;
+        let mut none = false;
+        let mut lowered = Vec::with_capacity(arms.len());
+        for (pattern, span, arm) in arms {
+            self.charge(span)?;
+            let ast::ResultPattern::Error { case, binding } = pattern else {
+                return Err(Diagnostic::new(
+                    span,
+                    "use `on Some(value)` and `on None` for `Option<u64>`",
+                ));
+            };
+            let ast::ExprKind::Name(name) = &case.kind else {
+                return Err(Diagnostic::new(
+                    case.span,
+                    "use the bare `Some` or `None` case for `Option<u64>`",
+                ));
+            };
+            self.scopes.push(Default::default());
+            let item = (|| {
+                let pattern = match name.as_str() {
+                    "Some" => {
+                        if std::mem::replace(&mut some, true) {
+                            return Err(Diagnostic::new(span, "duplicate `on Some` arm"));
+                        }
+                        let binding = binding.as_deref().ok_or_else(|| {
+                            Diagnostic::new(span, "`on Some` requires a payload binding or `(_)`")
+                        })?;
+                        ir::ResultPattern::Ok(self.result_binding(
+                            binding,
+                            Kind::Scalar { mutable: false },
+                            span,
+                        )?)
+                    }
+                    OPTION_NONE => {
+                        if std::mem::replace(&mut none, true) {
+                            return Err(Diagnostic::new(span, "duplicate `on None` arm"));
+                        }
+                        if binding.is_some() {
+                            return Err(Diagnostic::new(span, "`None` has no payload to bind"));
+                        }
+                        ir::ResultPattern::Error {
+                            family: OPTION_FAMILY.to_owned(),
+                            case: OPTION_NONE.to_owned(),
+                            binding: None,
+                        }
+                    }
+                    _ => {
+                        return Err(Diagnostic::new(
+                            span,
+                            "use `on Some(value)` and `on None` for `Option<u64>`",
+                        ));
+                    }
+                };
+                lower(self, pattern, arm)
+            })();
+            self.scopes.pop();
+            lowered.push(item?);
+        }
+        if !some || !none {
+            let missing = if some { "None" } else { "Some" };
+            return Err(Diagnostic::new(
+                subject,
+                format!("missing `on {missing}` arm for `Option<u64>`"),
+            ));
+        }
+        Ok(lowered)
     }
 
     /// Bind a scalar payload when the selected case declares one. Explicit
@@ -432,10 +703,10 @@ impl Lowerer {
     fn fallback_binding(
         &mut self,
         binding: Option<&str>,
-        arm: &ast::ResultArm,
+        span: Span,
     ) -> Result<Option<String>, Diagnostic> {
         binding
-            .map(|name| self.result_binding(name, Kind::Error, arm.span))
+            .map(|name| self.result_binding(name, Kind::Error, span))
             .transpose()
             .map(Option::flatten)
     }
@@ -474,22 +745,34 @@ impl Lowerer {
         self.bind(name, kind, span).map(Some)
     }
 
-    /// Recognize a direct fallible call whose namespace target was already
+    /// Recognize a direct tagged call whose namespace target was already
     /// bound. The borrowed actuals are lowered later in their written order.
-    fn fallible_call<'a>(
+    fn tagged_call<'a>(
         &self,
         expression: &'a ast::Expr,
     ) -> Result<(&'a str, &'a [ast::Expr]), Diagnostic> {
+        self.tagged_target(expression)
+            .map(|(name, args, _)| (name, args))
+            .ok_or_else(|| {
+                Diagnostic::new(
+                    expression.span,
+                    "expected a direct call returning a typed Result or `Option<u64>`",
+                )
+            })
+    }
+
+    /// Read a statically resolved tagged call signature without lowering its arguments.
+    pub(super) fn tagged_target<'a>(
+        &self,
+        expression: &'a ast::Expr,
+    ) -> Option<(&'a str, &'a [ast::Expr], &str)> {
         if let ast::ExprKind::Call { callee, args } = &expression.kind
             && let ast::ExprKind::Name(name) = &callee.kind
-            && self.definitions.results.contains_key(name)
+            && let Some(family) = self.definitions.results.get(name)
         {
-            return Ok((name, args));
+            return Some((name, args, family));
         }
-        Err(Diagnostic::new(
-            expression.span,
-            "expected a direct call returning a typed Result",
-        ))
+        None
     }
 
     /// Resolve a case and its payload shape in its expected family. Body returns

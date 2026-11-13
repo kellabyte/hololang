@@ -35,9 +35,8 @@ loops, and identical emission on an unsupported target.
   at O0, O3, and under ASan. Negatives decline the proof when a re-created slot can
   shrink under a carried cursor, the receiver boundary resets independently, an
   assertion capture is reassigned, a publication check is missing, or an update violates
-  the extent. The unchanged reader gate also checks valid wire digests and
-  malformed-input trap behavior.
-  [Native qualification](../../../evidence/staging-cursor-proof-20261111/README.md)
+  the extent. The [telemetry worker fixture](../../fixtures/telemetry_worker/README.md)
+  covers valid wire digests and malformed-input traps.
 
 - **Outlined bulk calls.** The outlined bulk staging tests compare every byte of a
   two-byte copy and an adjacent 257-byte copy against the model at O0, O3, and under

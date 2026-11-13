@@ -16,6 +16,14 @@ public error SocketError {
     InvalidStatus
 }
 
+// A session transition can end a single-descriptor entry or fail to accept.
+public error SessionError {
+    End
+    Interrupted
+    Native(code u64)
+    InvalidStatus
+}
+
 // Decode a status after the caller has checked its success domain.
 // The two high sentinels take precedence over the tagged errno interval.
 func decode_failure
@@ -87,4 +95,32 @@ public func wait_result
         return error SocketError.InvalidStatus
     }
     return decode_failure(status)
+}
+
+// Decode a host-owned session transition. Success admits a client, and End
+// means the single-descriptor mode has no subsequent session to admit.
+public func next_session_result
+    with noalloc, noblock
+    arg status u64 as readonly copy
+    returns Result<u64, SessionError>
+{
+    if status == 0 {
+        return ok 0
+    }
+    if status == 1 {
+        return error SessionError.End
+    }
+    decode_failure(status)
+        on Interrupted then {
+            return error SessionError.Interrupted
+        }
+        on Native(code) then {
+            return error SessionError.Native(code)
+        }
+        on ok then {
+            return error SessionError.InvalidStatus
+        }
+        on error then {
+            return error SessionError.InvalidStatus
+        }
 }

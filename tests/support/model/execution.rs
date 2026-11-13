@@ -7,7 +7,7 @@
 use super::ModelError;
 use super::construction::{BuildFailure, Rejection};
 use super::ordinary::Outcome;
-use super::state::{Batch, Binding, Reference, Region, State, Stored};
+use super::state::{Batch, Binding, ByteInput, ByteOrigin, Reference, Region, State, Stored};
 use super::value::{Record, Value};
 use holo::ir::{Access, AppendArm, AppendPattern, Argument, ConstructArm, Expr, Op, ResultValue};
 use std::collections::BTreeMap;
@@ -51,6 +51,59 @@ fn match_outcome<'a, T>(
 }
 
 impl State<'_> {
+    /// Update the captured view after validating its permissions and destination index.
+    fn write_view_byte(
+        &mut self,
+        input: &ByteInput,
+        index: &Expr,
+        value: &Expr,
+    ) -> Result<(), ModelError> {
+        let ByteOrigin::Field {
+            batch,
+            index: record,
+            path,
+        } = &input.origin
+        else {
+            return Err(ModelError::new("byte write destination is a literal"));
+        };
+        if input.access != Access::Readwrite {
+            return Err(ModelError::new("byte write destination is readonly"));
+        }
+        let index = self.expression(index, &[], None)?;
+        if index >= self.input_bytes(input)?.len() as u64 {
+            return Err(ModelError::new("byte write bounds trap"));
+        }
+        let value = self.expression(value, &[], None)? as u8;
+        let record = &mut self.batches[*batch].records[*record].record;
+        write_byte(record, path, input.offset + index, value)
+    }
+
+    /// Bind a success or return the original failure under the caller's family.
+    fn propagate_result(&mut self, name: &str, outcome: Outcome) -> Result<(), ModelError> {
+        let target = self
+            .ordinary_result_family
+            .ok_or_else(|| ModelError::new("model try outside typed ordinary function"))?;
+        match outcome {
+            Outcome::Success(value) => self.declare(name, Binding::Scalar(value)),
+            Outcome::Failure {
+                family,
+                case,
+                payload,
+            } => {
+                let (family, case) = self.lift_error(family, case, target)?;
+                self.returned = Some(Outcome::Failure {
+                    family,
+                    case,
+                    payload,
+                });
+                Ok(())
+            }
+            Outcome::Scalar(_) | Outcome::Boolean(_) => {
+                Err(ModelError::new("model try needs a typed result"))
+            }
+        }
+    }
+
     /// Execute structured operations in order, retaining deterministic outputs.
     pub fn execute_ops(&mut self, operations: &[Op]) -> Result<(), ModelError> {
         // Sequential evaluation preserves alias-visible writes and failure
@@ -335,33 +388,55 @@ impl State<'_> {
                 let value = self.expression(value, &[], None)?;
                 self.declare(name, Binding::Scalar(value))
             }
+            Op::LetBool { name, value } => {
+                let value = self.boolean(value)?;
+                self.declare(name, Binding::Boolean(value))
+            }
+            Op::BindBytes {
+                name,
+                source,
+                ranges,
+                access,
+            } => {
+                let mut input = self.capture_byte_source(source, &[])?;
+                if *access == Access::Readwrite && input.access != Access::Readwrite {
+                    return Err(ModelError::new("readonly byte view upgrade"));
+                }
+                self.narrow_byte_input(&mut input, ranges, &[])?;
+                input.access = *access;
+                self.declare(name, Binding::ByteView(input))
+            }
             Op::TryLet {
                 name,
                 function,
                 args,
             } => {
-                // A try operation requires a typed destination in the enclosing
-                // frame. Invoke first so operand and callee effects stay ordered.
-                let target = self
-                    .ordinary_result_family
-                    .ok_or_else(|| ModelError::new("model try outside typed ordinary function"))?;
-                match self.invoke(function, args)? {
-                    Outcome::Success(value) => self.declare(name, Binding::Scalar(value)),
-                    Outcome::Failure {
-                        family,
-                        case,
-                        payload,
-                    } => {
-                        let (family, case) = self.lift_error(family, case, target)?;
-                        self.returned = Some(Outcome::Failure {
-                            family,
-                            case,
-                            payload,
-                        });
-                        Ok(())
-                    }
-                    Outcome::Scalar(_) => Err(ModelError::new("model try needs a typed result")),
+                let outcome = self.invoke(function, args)?;
+                self.propagate_result(name, outcome)
+            }
+            Op::TrySaved { name, source } => {
+                let outcome = self.saved_result(source)?;
+                self.propagate_result(name, outcome)
+            }
+            Op::BindResult {
+                name,
+                function,
+                args,
+            } => {
+                let outcome = self.invoke(function, args)?;
+                if matches!(outcome, Outcome::Scalar(_) | Outcome::Boolean(_)) {
+                    return Err(ModelError::new("model result binding needs a typed result"));
                 }
+                self.declare(name, Binding::SavedResult(outcome))
+            }
+            Op::HandleResult {
+                function,
+                args,
+                arms,
+            } => self.handle_result_blocks(function, args, arms),
+            Op::HandleSavedResult { name, arms } => {
+                let outcome = self.saved_result(name)?;
+                self.execute_result_arm(&outcome, arms)
             }
             Op::Set { name, value } => {
                 self.scalar(name)?;
@@ -410,21 +485,21 @@ impl State<'_> {
                 index,
                 access,
             } => {
-                let batch = self.batch_id(batch)?;
+                let view = self.batch_view(batch, *access)?;
                 let index = self.expression(index, &[], None)?;
                 let index = usize::try_from(index)
                     .map_err(|_| ModelError::new("record index conversion trap"))?;
                 // A reference can name only a fully published element, never an
                 // unfinished suffix or the record just beyond the batch length.
-                if index >= self.batches[batch].records.len() {
+                if index >= view.count {
                     return Err(ModelError::new("record borrow bounds trap"));
                 }
                 self.declare(
                     name,
                     Binding::Reference(Reference {
-                        batch,
+                        batch: view.batch,
                         index,
-                        access: *access,
+                        access: view.access,
                     }),
                 )
             }
@@ -486,12 +561,57 @@ impl State<'_> {
                 let record = &mut self.batches[handle.batch].records[handle.index].record;
                 write_byte(record, path, index, value)
             }
+            Op::WriteInputByte {
+                param,
+                index,
+                value,
+            } => {
+                let input = self.byte_input(&[], *param)?.clone();
+                self.write_view_byte(&input, index, value)
+            }
+            Op::WriteViewByte { name, index, value } => {
+                let input = self.byte_view(name)?;
+                self.write_view_byte(&input, index, value)
+            }
+            Op::MoveInputBytes {
+                destination,
+                source,
+            } => {
+                let destination = self.byte_input(&[], *destination)?.clone();
+                let source = self.byte_input(&[], *source)?;
+                let ByteOrigin::Field { batch, index, path } = &destination.origin else {
+                    return Err(ModelError::new("byte move destination is a literal"));
+                };
+                if destination.access != Access::Readwrite {
+                    return Err(ModelError::new("byte move destination is readonly"));
+                }
+                if source.len > self.input_bytes(&destination)?.len() as u64 {
+                    return Err(ModelError::new("byte move bounds trap"));
+                }
+                // Snapshot only in the independent oracle so overlapping moves
+                // have their specified meaning without modeling native pointers.
+                let bytes = self.input_bytes(source)?.to_vec();
+                let record = &mut self.batches[*batch].records[*index].record;
+                let Value::Bytes(payload) = project_mut(record, path)? else {
+                    return Err(ModelError::new("non-byte move projection"));
+                };
+                let start = destination.offset as usize;
+                payload[start..start + bytes.len()].copy_from_slice(&bytes);
+                Ok(())
+            }
             Op::Reset { batch } => {
                 let batch = self.batch_id(batch)?;
                 // The model may scan its scopes for diagnostics; the native
                 // compiler must establish this statically without runtime scans.
-                if self.scopes.iter().flat_map(|scope| scope.values())
-                    .any(|binding| matches!(binding, Binding::Reference(reference) if reference.batch == batch)) {
+                if self.scopes.iter().flat_map(|scope| scope.values()).any(
+                    |binding| match binding {
+                        Binding::Reference(reference) => reference.batch == batch,
+                        Binding::ByteView(input) => {
+                            matches!(input.origin, ByteOrigin::Field { batch: owner, .. } if owner == batch)
+                        }
+                        _ => false,
+                    },
+                ) {
                     return Err(ModelError::new("reset while a reference remains usable"));
                 }
                 let region = self.batches[batch].region;
@@ -524,11 +644,10 @@ impl State<'_> {
                 access,
                 body,
             } => {
-                let batch = self.batch_id(batch)?;
-                let count = self.batches[batch].records.len();
+                let view = self.batch_view(batch, *access)?;
                 // Capture the initial published prefix. Appended records are not
                 // visited, and rebinding the body cursor cannot change progression.
-                for index in 0..count {
+                for index in 0..view.count {
                     // A completed process cannot visit another published record.
                     if self.exited || self.returned.is_some() {
                         break;
@@ -538,9 +657,9 @@ impl State<'_> {
                     self.declare(
                         reference,
                         Binding::Reference(Reference {
-                            batch,
+                            batch: view.batch,
                             index,
-                            access: *access,
+                            access: view.access,
                         }),
                     )?;
                     let result = self.execute_ops(body);
@@ -588,6 +707,13 @@ impl State<'_> {
                 self.returned = Some(Outcome::Scalar(self.expression(value, &[], None)?));
                 Ok(())
             }
+            Op::ReturnBool(value) => {
+                if self.ordinary_stack.is_empty() {
+                    return Err(ModelError::new("boolean return outside ordinary function"));
+                }
+                self.returned = Some(Outcome::Boolean(self.boolean(value)?));
+                Ok(())
+            }
             Op::ReturnResult(value) => {
                 // Typed completion is also local to the current ordinary frame.
                 if self.ordinary_stack.is_empty() {
@@ -612,6 +738,7 @@ impl State<'_> {
                             .transpose()?,
                     },
                     ResultValue::Call { function, args } => self.invoke(function, args)?,
+                    ResultValue::Saved(name) => self.saved_result(name)?,
                 });
                 Ok(())
             }

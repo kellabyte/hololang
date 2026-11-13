@@ -25,6 +25,10 @@ propagate a declared child error with its copied `u64` payload. The opening
 example uses the proposed outcome enum. Runnable append examples handle
 the same outcomes with scalars or booleans.
 
+For an ordinary lookup that can miss, `Option<u64>` represents presence with
+`Some(value)` and absence with `None`. Redis uses both cases when choosing a
+GET reply. [Optional scalar returns](spec.md#optional-scalar-returns)
+
 ## Compose a result from several services
 
 A dashboard loads the active account, queries a customer count, and saves it.
@@ -49,7 +53,8 @@ func load_customer_count
     returns Result<u64, DashboardError>
 {
     let account = try session.account_id(scenario)
-    let count = try sql.count_customers(account)
+    let query = sql.count_customers(account)
+    let count = try query
     let saved = try cache.save_count(count)
     return ok saved
 }
@@ -57,7 +62,7 @@ func load_customer_count
 
 If the query returns `SqlError.Timeout(500)`, the second `try` returns
 `DashboardError.Sql.Timeout(500)` and the cache call is skipped. The caller
-can name the child case and bind its delay. Here, `on error` handles any
+can save the outcome and handle it later. Here, `on error` handles any
 remaining failure, including a lost database connection.
 
 ```holo
@@ -69,7 +74,8 @@ public func show_customer_count
     arg scenario u64 as readonly copy
     returns u64
 {
-    return load_customer_count(scenario)
+    let outcome = load_customer_count(scenario)
+    return outcome
         on ok(count) then ui.show_count(count)
         on Session.PermissionDenied then ui.sign_in()
         on Sql.Timeout(delay) then ui.try_again(delay)
@@ -86,6 +92,17 @@ The runnable demo prints `42`, `1`, `500`, `3`, and `4` on separate
 lines. The scenario argument drives the deterministic services through success,
 sign-in, retry, cache recovery, and fallback. [Dashboard package](../tests/fixtures/error_unions/README.md)
 
+A saved `Result<u64, E>` is immutable. The call runs at the `let`
+declaration, and the local preserves its original success value or named
+error and payload. A caller can do other work before handling the result or
+handle it more than once. `let count = try query` binds the saved success
+or propagates its failure using the same family rules as `try call(...)`.
+Both expression and statement handlers use the
+same exhaustiveness and payload scope rules as immediate handlers.
+When the enclosing helper returns the same `Result<u64, E>` type,
+`return outcome` forwards the saved value and preserves its original
+case and payload.
+
 ### Error union rules
 
 - A family can mix local cases with `from ChildFamily as Alias` entries. Each
@@ -98,8 +115,8 @@ sign-in, retry, cache recovery, and fallback. [Dashboard package](../tests/fixtu
   full path when an explicit package type prefix shares the same spelling.
 - `try` lifts a failure into the caller's family when the callee uses that
   same family or a declared direct child. Each intermediate layer can propagate
-  its own declared child, preserving the complete path. A bare `return call(...)`
-  still requires the exact result type.
+  its own declared child, preserving the complete path. Both `return call(...)`
+  and `return outcome` require the exact result type.
 - `return error DashboardError.Sql.Timeout(500)` constructs the selected leaf
   explicitly. Each concrete case has at most one named `u64` payload.
   There can be at most 255 leaves in an expanded family in this implementation.
@@ -271,9 +288,12 @@ stay in the `else` continuation, where no received input is bound.
 The [hosted frame example](../tests/fixtures/typed_refill_frame.holo) reads a complete
 frame, then a four-byte prefix that needs six bytes, then EOF. It verifies
 rollback and the earlier frame's owned payload after the slot is reused.
-The [incremental reader](../tests/fixtures/typed_stream_reader.holo) assembles a frame
-across reads in a bounded initialized slot. It uses `Truncated(required)` to
-choose the next read limit, retries the append, and publishes the frame once
+The [incremental reader](../tests/fixtures/typed_stream_reader.holo) uses
+[`holo.buffer`](../lib/holo/buffer.holo) to assemble a frame across reads in a
+bounded initialized slot. It passes `core.prefix(pending.wire, filled)` to
+the producer, so the nested decoder can use `core.len(input)` as its only
+input bound. It uses `Truncated(required)` to choose the next read limit,
+retries the append, and publishes the frame once
 its entire extent is present. EOF with an incomplete frame reports the last
 required extent. The native acceptance test covers files and fragmented
 nonblocking sockets across all layouts at O0, O3, and under ASan.
@@ -401,8 +421,7 @@ general aggregate moves, and arbitrary payload patterns require their own rules.
 
 ## Handle the result with `on`
 
-- The result expression and its `on … then` lines form one expression. In the
-  first surface, a `return` operand or `let` initializer can take an `on` list.
+- An `on` list on a `return` operand or `let` initializer forms an expression.
   Its arms begin on following lines at the same indentation, deeper than the
   subject line. Dedenting ends the list. Function and executable body braces
   follow the [existing rule](spec.md#2-decisions-carried-forward).
@@ -421,6 +440,41 @@ general aggregate moves, and arbitrary payload patterns require their own rules.
   the remaining cases with an error fallback. The checker rejects missing,
   duplicate, and wrong-family patterns and points to the relevant arm or case.
   The same rules apply to ordinary calls and to a checked append.
+
+### Run a block for an ordinary result
+
+Use a direct call as a statement and give every arm a block when each outcome
+needs its own actions. The call runs once, and only the selected block runs.
+Payload bindings are immutable and local to that arm. The block can update
+outer variables, run scoped operations, or return from the enclosing function.
+If the arm falls through, execution continues after the handler. A block
+handler requires the same outcome coverage as an expression handler.
+
+```holo
+parse_request(request, core.prefix(wire.data, filled), cursor)
+    on ok(consumed) then {
+        cursor = core.add_wrapping(cursor, consumed)
+        read_needed = 0
+    }
+    on NeedMore(required) then {
+        core.assert(required > filled)
+    }
+    on Malformed then {
+        read_needed = 0
+        reply_error = 2
+    }
+    on OverLimit then {
+        read_needed = 0
+        reply_error = 3
+    }
+    on Overflow then {
+        read_needed = 0
+        reply_error = 4
+    }
+```
+
+The [RESP2 session loop](../examples/redis_server/src/main.holo) uses this form
+to distinguish a partial request from a malformed one at the point of recovery.
 
 ### Check success with an error fallback
 
@@ -566,7 +620,7 @@ original order, and routes each known return to its matching arm. Only the
 chosen arm runs. The emitter merges payloads when multiple return sites
 reach the same arm. The bounded shape excludes memory access, local mutation,
 and calls inside the inlined chain. `try` and general handled calls keep the
-ordinary result ABI. [Native results](../evidence/error-edges-20261111/README.md#ordinary-scalar-return-edges)
+ordinary result ABI. [Native scalar dispatch tests](../tests/compiler/frontend/frontend_evaluation.rs)
 
 ### Typed append in the checked compiler
 
@@ -642,7 +696,7 @@ changes its named rejection tags at their point of construction. Success,
 `Full`, and `SizeOverflow` use their existing encodings. A continuing call
 or a call without a selected specialization lifts the result on its failure
 edge.
-[Native comparisons and disassembly](../evidence/error-reservation-20261111/README.md) · [Union specialization](../evidence/union-rejection-lift-20261111/README.md)
+[Native reservation and union lift tests](../tests/compiler/frontend/frontend_native.rs)
 
 For byte-bearing typed records in Derived64 and Compact32, the producer
 advances a private cursor through the variable-size suffix and returns its
@@ -651,7 +705,7 @@ marker at the saved checkpoint, even after earlier fields were written.
 A caller resuming after a variable child uses its checked end before
 reserving the next field. A retained record header is written only after
 the last field succeeds.
-[Byte-bearing native replay](../evidence/byte-reservation-comparison-20261111/README.md)
+[Native byte-bearing reservation tests](../tests/compiler/storage/reservation.rs)
 
 Rollback requires fixed marker bookkeeping for the selected owner. The
 compiler can eliminate redundant operations when it preserves the same state.
@@ -714,30 +768,27 @@ returns `BadChild` before the child's field reservation, while valid input
 reaches that reservation and returns `Full`. The same marker, count, and seed
 checks hold after both attempts. [Native and model test](../tests/compiler/frontend/frontend_native.rs)
 
-The [matched benchmark](../benchmarks/scalar-errors/append/README.md) times
-successful construction and nested rejection in separate native batches. It
-uses the same numeric producer shape, prepared inputs, and prewarmed backing.
-The failed interval covers complete attempts through dispatch and digest.
+An earlier matched benchmark timed successful construction and nested
+rejection in separate native batches. It used the same numeric producer
+shape, prepared inputs, and prewarmed backing. The failed interval covered
+complete attempts through dispatch and digest.
 An isolated marker-store cost would require a separate measurement.
 
 The initial M3 Max comparison measured 3.44% more paired elapsed time for
 typed success than numeric append and 3.53% more in the repeat. Its
 generated code showed extra status and payload selection after inlining.
-The later fixed-reservation lowering closes the fixed-record gate against
+The later fixed-reservation lowering closed the fixed-record gate against
 C and Rust in the inline and outlined configurations on that target.
-[Initial comparison](../evidence/typed-append-20261111/README.md) · [Active comparison](../evidence/error-reservation-20261111/README.md)
 
-The staged frame comparison measures the byte-bearing decoder against C,
+The staged frame comparison measured the byte-bearing decoder against C,
 Rust, and Goose with matched fragments and packed owned output. The
-per-byte checked staging loop is visible in Holo's native code. The
-comparison covers the whole reader, including copying and published payload
-consumption. [Staged frame measurements](../evidence/frame-reader-20261111/README.md)
+generated code contained a per-byte checked staging loop. The comparison
+covered the whole reader, including copying and published payload consumption.
 
-Direct phase clocks on the 192-byte reader show separate costs in admission
-and owned-payload consumption. A second diagnostic feeds pre-staged prefixes
+Direct phase clocks on the 192-byte reader showed separate costs in admission
+and owned-payload consumption. A second diagnostic fed pre-staged prefixes
 to the same decode and publication path. The admission gap against C and
-Goose persists there. The owned scan also costs more than both controls.
-[Direct phase measurements](../evidence/frame-reader-phases-20261111/README.md)
+Goose persisted there. The owned scan also cost more than both controls.
 
 ## Implementation stages and acceptance
 
@@ -755,15 +806,13 @@ interface requirements.
 The locked staged reader is the regression gate for the supported slice.
 Its native test checks truncation, capacity rollback, retry, EOF, and
 previously published payloads across actual wide and two-byte refills.
-The default packaged performance replay records split admission and the
+An earlier packaged performance replay measured split admission and the
 complete reader against C, Rust, and Goose. The fixed-record append gate
-passes against C and Rust across the three measured call configurations
+passed against C and Rust across the three measured call configurations
 on macOS arm64. The locked hosted scoped test verifies that the producer
 sees the exact received prefix, restores the tail before the selected
 handler, and can retry at the same address. Native Linux throughput and
-PMU collection remain reader performance work.
-[Packaged regression gate](../evidence/packaged-reader-gate-20261111/README.md) · [Fixed-record gate](../evidence/error-reservation-20261111/README.md)
-[Locked hosted scoped test](../evidence/locked-hosted-scope-20261112/README.md)
+PMU collection remain reader performance work. [Hosted package tests](../tests/compiler/packages/packages.rs)
 
 ```sh
 cargo test --offline -p holo --test packages package_outlined_staging_preserves_hosted_rollback_and_reuse
@@ -772,12 +821,12 @@ cargo test --offline -p holo --test packages package_hosted_scoped_construct_ret
 
 | Stage | Acceptance evidence |
 |---|---|
-| **1. Ordinary typed results. Implemented experimentally.** | Source and checked IR cover package visibility, exact forwarding, case identity, exhaustiveness, and result types. Native tests cover full-width success and error payloads, named cases before fallback, and exactly-once evaluation. [Scalar result tests](../tests/compiler/frontend/frontend_evaluation.rs) · [Scalar comparison](../evidence/scalar-errors-20261111/README.md) |
+| **1. Ordinary typed results. Implemented experimentally.** | Source and checked IR cover package visibility, exact forwarding, case identity, exhaustiveness, and result types. Native tests cover full-width success and error payloads, named cases before fallback, and exactly-once evaluation. [Scalar result tests](../tests/compiler/frontend/frontend_evaluation.rs) |
 | **Named error unions. Implemented experimentally.** | Package and native tests cover named child handlers, short-circuiting, nested lifts with full-width payloads, and rollback across fixed and byte-bearing layouts. The checked IR verifies every child tag range and rejects cycles and ambiguous lifts. [Runnable dashboard](../tests/fixtures/error_unions/README.md) · [Native cases](../tests/compiler/frontend/frontend_native.rs) |
-| **2. Fixed-record typed append. Implemented experimentally.** | Native O0/O3/ASan and independent model cover copied payloads, nested rejection, failure ordering, rollback, retry, and a retained reference. The checked IR rejects incompatible producers, payload shape and scope errors, and incomplete handlers. [Runnable fixture](../tests/fixtures/typed_append.holo) · [Numeric fixed-record control](../evidence/public-records-20261111/README.md) |
+| **2. Fixed-record typed append. Implemented experimentally.** | Native O0/O3/ASan and independent model cover copied payloads, nested rejection, failure ordering, rollback, retry, and a retained reference. The checked IR rejects incompatible producers, payload shape and scope errors, and incomplete handlers. [Runnable fixture](../tests/fixtures/typed_append.holo) |
 | **3. Byte-bearing typed append. Implemented experimentally.** | Model and native tests cover nested truncation and malformed input, empty and complete ranges, `Full`, typed size overflow, and an independent bounds trap. The runnable fixture checks a retained reference and ownership of the copied payload. [Runnable frame](../tests/fixtures/typed_frame.holo) · [Native cases](../tests/compiler/storage/byte_input_native.rs) |
 | **4. Package typed append. Implemented experimentally.** | Locked package tests check nominal types and visibility, byte-identical LLVM against flat source, and native O0, O3, and ASan across layouts. The nested byte-bearing decoder verifies rollback after a parent write, exact-slot retry, and published payload ownership after input mutation. [Package rules and example](packages.md#byte-bearing-typed-append-across-packages) · [Conformance tests](../tests/compiler/packages/packages.rs) |
-| **5. Forwarding and scoped results. Implemented experimentally.** | Exact result forwarding preserves the receiving slot through nested calls. Scoped fixed and byte-bearing construction verifies early exit, exact fit, exhaustion, nested rollback, and lexical borrow restrictions. The locked hosted case runs against files and nonblocking sockets at O0, O3, and under ASan in all three layouts. [Forwarding evidence](../evidence/aggregate-return-forwarding-20261111/README.md) · [Scoped results](../evidence/scoped-result-20261111/README.md) · [Locked hosted evidence](../evidence/locked-hosted-scope-20261112/README.md) |
+| **5. Forwarding and scoped results. Implemented experimentally.** | Exact result forwarding preserves the receiving slot through nested calls. Scoped fixed and byte-bearing construction verifies early exit, exact fit, exhaustion, nested rollback, and lexical borrow restrictions. The locked hosted case runs against files and nonblocking sockets at O0, O3, and under ASan in all three layouts. [Native forwarding and scope tests](../tests/compiler/frontend/frontend_native.rs) · [Hosted package tests](../tests/compiler/packages/packages.rs) |
 
 The hosted package witness adds real file and nonblocking stream reads through
 the same checked decoder. A short read leaves stale bytes in the reused
@@ -791,12 +840,12 @@ ordinary compiler. The qualified macOS arm64 staging leaf changes the
 checked transfer into the pending slot. Typed truncation, capacity rollback,
 exact-slot retry, and previously published payloads pass the same package
 gate at O0, O3, and with AddressSanitizer.
-[Packaged staging gate](../evidence/packaged-reader-gate-20261111/README.md#actual-refill-and-rollback)
+[Staging copy tests](../tests/compiler/backend/staging_copy.rs)
 
 The typed and numeric frame fixtures agree across layouts at O0 and O3.
 They use the same guards, wire inputs, and destination fields. The matched
-byte-bearing campaign measures success and nested rejection separately across
-32-, 64-, 65-, and 192-byte payload profiles. [Frame replay](../evidence/error-edges-20261111/README.md#byte-bearing-append-and-release-validation) · [Byte-bearing measurements](../evidence/byte-bearing-append-20261111/README.md)
+byte-bearing campaign measured success and nested rejection separately across
+32-, 64-, 65-, and 192-byte payload profiles.
 
 Inspect branches, spills, reservation checks, marker stores, bytes copied, and
 allocation and helper calls on both paths. Check record sizes and offsets across
@@ -805,25 +854,24 @@ mixed failures with matched optimized controls before attributing a speed change
 to typed errors. Report combined attempt and retry timing separately from any
 isolated bookkeeping measurement.
 
-The [runtime-input scalar comparison](../evidence/scalar-error-runtime-20261111/README.md)
-covers all-success, rare, and mixed validation. Its archived AArch64 typed loop
-inlines the validator, selects the success payload and error tag, then masks
-and compares that tag again to choose the final code. Numeric Holo combines
-validation with selection of the final digest input. Counting the loop path
-through the back edge yields 25 typed instructions versus 18 numeric when
+The earlier runtime-input scalar comparison covered all-success, rare, and
+mixed validation. Its AArch64 typed loop inlined the validator, selected the
+success payload and error tag, then masked and compared that tag again to
+choose the final code. Numeric Holo combined validation with selection of the
+final digest input. The loop path through the back edge contained 25 typed
+instructions versus 18 numeric when
 the length check passes, and 21 versus 11 for an oversized header. These are
-static path counts for the archived binaries. Both inline the call. The
-adopted direct scalar lowering reduces the paths to 18 and 11 instructions.
-It improves paired elapsed time across success, rare, and mixed profiles in
-the exact-binary repeat. The append publication-edge trial produces identical
-optimized binaries and leaves the existing append lowering active.
-[Dispatch trials](../evidence/error-edges-20261111/README.md)
+static path counts for the trial binaries. Both inlined the call. The
+adopted direct scalar lowering reduced the paths to 18 and 11 instructions.
+It improved paired elapsed time across success, rare, and mixed profiles in
+the exact-binary repeat. The append publication-edge trial produced identical
+optimized binaries and left the existing append lowering active.
 
-The outlined producer diagnostic confirms that the pair crosses the tested
+The outlined producer diagnostic confirmed that the pair crossed the tested
 arm64 boundary in two registers. With parent and child outlined, the typed
-parent normalizes the child pair before returning. The numeric parent can
-tail-call the child. The complete-attempt timings include that difference in
-addition to dispatch and storage bookkeeping. [Outlined calls](../evidence/refill-and-append-20261111/README.md#outlined-producer-calls)
+parent normalized the child pair before returning. The numeric parent could
+tail-call the child. The complete-attempt timings included that difference
+along with dispatch and storage bookkeeping.
 
 Direct forwarding recovered the native tail branch and improved the fully
 outlined rejection profile. The broad trial regressed 64-byte success, and
@@ -833,7 +881,6 @@ three campaigns. The four-language comparison placed inline Holo within
 repeat. The main inline success run and the outlined profiles left the gate
 open at that stage. The subsequent checked SSA reservation lowering passed
 the fixed-record gate in both runs.
-[Earlier evaluation](../evidence/error-release-20261111/README.md) · [Qualified lowering](../evidence/error-reservation-20261111/README.md)
 
 The earlier late LLVM trial preserved inline and parent-only code and
 recovered a tail branch with the child still outlined. Fully outlined
@@ -841,7 +888,6 @@ success and rare failures missed that trial's gate. A private-metadata
 probe removed three parent-only reloads and reduced paired elapsed time
 by 18% on success and 29% on rare failures in the repeat. That probe
 motivated the checked SSA reservation lowering.
-[Late forwarding and metadata evaluation](../evidence/error-late-forward-20261111/README.md)
 
 The [Goose compatibility checklist](spec.md#goose-performance-compatibility-checklist)
 guides that review. This slice keeps the checked bounded data stack, bump

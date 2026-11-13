@@ -86,9 +86,9 @@ func main
 
     let frame_memory = core.region(256) else { core.assert(false); return 0 }
     let frames = core.batch(frame_memory, Received)
-    // Positive input passes directly to the typed append. Nondata has no view.
+    // Narrow the fresh input before passing it to the typed append.
     refill slot.wire, 6 as input {
-        let accepted = core.append(frames, receive(1, input))
+        let accepted = core.append(frames, receive(1, core.prefix(input, 6)))
             on ok    then true
             on error then false
         core.assert(accepted)

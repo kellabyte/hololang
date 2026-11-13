@@ -9,9 +9,9 @@
 //! scalar body, so unused potentially trapping byte reads cannot disappear.
 
 use super::ModelError;
-use super::state::{ByteInput, Input, State};
+use super::state::{Binding, ByteInput, ByteOrigin, Input, State};
 use super::value::{Record, Value};
-use holo::ir::{Binary, Compare, Condition, Expr};
+use holo::ir::{Access, Binary, BoolExpr, Compare, Condition, Expr};
 
 impl State<'_> {
     /// Evaluate a scalar expression in source order using explicit pure inputs.
@@ -44,7 +44,11 @@ impl State<'_> {
         if scalar_only
             && !matches!(
                 expr,
-                Expr::Const(_) | Expr::Param(_) | Expr::Binary { .. } | Expr::Apply { .. }
+                Expr::Const(_)
+                    | Expr::Param(_)
+                    | Expr::Binary { .. }
+                    | Expr::Apply { .. }
+                    | Expr::LiteralByte { .. }
             )
         {
             return Err(ModelError::new(
@@ -55,6 +59,7 @@ impl State<'_> {
         // lowering and of any compiler expression type/effect helper.
         match expr {
             Expr::Const(value) => Ok(*value),
+            Expr::Bool(_) => Err(ModelError::new("boolean used as a model scalar")),
             Expr::Local(name) => self.scalar(name),
             Expr::Param(position) => match params.get(*position) {
                 Some(Input::Scalar(value)) => Ok(*value),
@@ -83,21 +88,28 @@ impl State<'_> {
                 args,
                 arms,
             } => self.handle_result(function, args, arms),
+            Expr::HandleSavedResult { name, arms } => {
+                let outcome = self.saved_result(name)?;
+                self.evaluate_result_arm(&outcome, arms)
+            }
             Expr::InputByte { param, index: at } => {
                 let at = self.expression_context(at, params, index, scalar_only)?;
                 let input = self.byte_input(params, *param)?;
-                // Check the captured extent before reading semantic storage; a
-                // trap is not a recoverable append status or an unchecked load.
-                if at >= input.len {
-                    return Err(ModelError::new("input byte read bounds trap"));
-                }
-                let bytes = self.input_bytes(input)?;
-                let at = usize::try_from(at)
-                    .map_err(|_| ModelError::new("input byte read bounds trap"))?;
-                bytes
-                    .get(at)
+                self.read_input_byte(input, at)
+            }
+            Expr::LiteralByte { bytes, index: at } => {
+                let at = self.expression_context(at, params, index, scalar_only)?;
+                usize::try_from(at)
+                    .ok()
+                    .and_then(|at| bytes.get(at))
                     .map(|byte| u64::from(*byte))
-                    .ok_or_else(|| ModelError::new("input byte read storage unavailable"))
+                    .ok_or_else(|| ModelError::new("byte literal read bounds trap"))
+            }
+            Expr::ViewLen(name) => Ok(self.byte_view(name)?.len),
+            Expr::ViewByte { name, index: at } => {
+                let input = self.byte_view(name)?;
+                let at = self.expression_context(at, params, index, scalar_only)?;
+                self.read_input_byte(&input, at)
             }
             Expr::Index => index.ok_or_else(|| ModelError::new("byte index outside initializer")),
             Expr::Binary { op, left, right } => {
@@ -146,7 +158,7 @@ impl State<'_> {
                     _ => Err(ModelError::new("non-byte length projection")),
                 }
             }
-            Expr::BatchLen(name) => Ok(self.batches[self.batch_id(name)?].records.len() as u64),
+            Expr::BatchLen(name) => Ok(self.batch_view(name, Access::Readonly)?.count as u64),
             Expr::Used(name) => u64::try_from(self.regions[self.region_id(name)?].used)
                 .map_err(|_| ModelError::new("model marker exceeds native integer range")),
             Expr::Address(name) => {
@@ -164,13 +176,68 @@ impl State<'_> {
         }
     }
 
-    /// Compare two expressions after evaluating the left one before the right.
+    /// Evaluate a boolean in the current execution frame.
+    pub fn boolean(&mut self, value: &BoolExpr) -> Result<bool, ModelError> {
+        self.boolean_context(value, &[], None)
+    }
+
+    /// Evaluate boolean operators using the scalar inputs of their enclosing frame.
+    fn boolean_context(
+        &mut self,
+        value: &BoolExpr,
+        params: &[Input],
+        index: Option<u64>,
+    ) -> Result<bool, ModelError> {
+        self.tick()?;
+        match value {
+            BoolExpr::Const(value) => Ok(*value),
+            BoolExpr::Local(name) => {
+                if !self.construction_stack.is_empty() {
+                    return Err(ModelError::new("boolean local used in model construction"));
+                }
+                match self.binding(name)? {
+                    Binding::Boolean(value) => Ok(value),
+                    _ => Err(ModelError::new(format!("{name} is not a boolean"))),
+                }
+            }
+            BoolExpr::Call { function, args } => self.boolean_call(function, args),
+            BoolExpr::Compare(condition) => self.scalar_comparison(condition, params, index),
+            BoolExpr::And(left, right) => Ok(self.boolean_context(left, params, index)?
+                && self.boolean_context(right, params, index)?),
+            BoolExpr::Or(left, right) => Ok(self.boolean_context(left, params, index)?
+                || self.boolean_context(right, params, index)?),
+            BoolExpr::Not(value) => Ok(!self.boolean_context(value, params, index)?),
+        }
+    }
+
+    /// Evaluate a boolean test or an ordered pair of scalar operands.
     pub fn condition(
         &mut self,
         condition: &Condition,
         params: &[Input],
         index: Option<u64>,
     ) -> Result<bool, ModelError> {
+        if matches!(condition.op, Compare::Truth) {
+            if let (Expr::Bool(value), Expr::Const(0)) = (&condition.left, &condition.right) {
+                return self.boolean_context(value, params, index);
+            }
+            return Err(ModelError::new("malformed model boolean condition"));
+        }
+        self.scalar_comparison(condition, params, index)
+    }
+
+    /// Compare two expressions after evaluating the left one before the right.
+    fn scalar_comparison(
+        &mut self,
+        condition: &Condition,
+        params: &[Input],
+        index: Option<u64>,
+    ) -> Result<bool, ModelError> {
+        if matches!(condition.op, Compare::Truth) {
+            return Err(ModelError::new(
+                "model scalar comparison needs a comparison operator",
+            ));
+        }
         let left = self.expression(&condition.left, params, index)?;
         let right = self.expression(&condition.right, params, index)?;
         // Native and model comparisons are unsigned, with no floating-point or
@@ -182,6 +249,7 @@ impl State<'_> {
             Compare::Le => left <= right,
             Compare::Gt => left > right,
             Compare::Ge => left >= right,
+            Compare::Truth => unreachable!("boolean tests are handled before comparisons"),
         })
     }
 
@@ -223,29 +291,48 @@ impl State<'_> {
         }
     }
 
+    /// Read one byte after validating the captured logical bound.
+    fn read_input_byte(&self, input: &ByteInput, at: u64) -> Result<u64, ModelError> {
+        if at >= input.len {
+            return Err(ModelError::new("input byte read bounds trap"));
+        }
+        let bytes = self.input_bytes(input)?;
+        let at = usize::try_from(at).map_err(|_| ModelError::new("input byte read bounds trap"))?;
+        bytes
+            .get(at)
+            .map(|byte| u64::from(*byte))
+            .ok_or_else(|| ModelError::new("input byte read storage unavailable"))
+    }
+
     /// Read current initialized bytes using a captured logical record/path identity.
     /// Checks lifetime, publication, field kind and frozen captured extent; returns
     /// a borrowed host slice with no payload allocation or native address assumption.
-    pub fn input_bytes(&self, input: &ByteInput) -> Result<&[u8], ModelError> {
-        let batch = self
-            .batches
-            .get(input.batch)
-            .filter(|batch| batch.active)
-            .ok_or_else(|| ModelError::new("input byte root is no longer live"))?;
-        let stored = batch
-            .records
-            .get(input.index)
-            .ok_or_else(|| ModelError::new("input byte record is no longer published"))?;
-        // The storage stays initialized. A narrower logical prefix must not be
-        // widened back to the owning field's extent during forwarding.
-        match project(&stored.record, &input.path)?.0 {
-            Value::Bytes(bytes) if bytes.len() as u64 >= input.len => {
-                Ok(&bytes[..input.len as usize])
+    pub fn input_bytes<'a>(&'a self, input: &'a ByteInput) -> Result<&'a [u8], ModelError> {
+        let bytes: &[u8] = match &input.origin {
+            ByteOrigin::Literal(bytes) => bytes,
+            ByteOrigin::Field { batch, index, path } => {
+                let batch = self
+                    .batches
+                    .get(*batch)
+                    .filter(|batch| batch.active)
+                    .ok_or_else(|| ModelError::new("input byte root is no longer live"))?;
+                let stored = batch
+                    .records
+                    .get(*index)
+                    .ok_or_else(|| ModelError::new("input byte record is no longer published"))?;
+                let Value::Bytes(bytes) = project(&stored.record, path)?.0 else {
+                    return Err(ModelError::new("input byte projection changed"));
+                };
+                bytes
             }
-            _ => Err(ModelError::new(
-                "input byte projection or captured extent changed",
-            )),
+        };
+        // Retain the original relative window even through several forwards.
+        if u128::from(input.offset) + u128::from(input.len) <= bytes.len() as u128 {
+            return Ok(&bytes[input.offset as usize..(input.offset + input.len) as usize]);
         }
+        Err(ModelError::new(
+            "input byte projection or captured extent changed",
+        ))
     }
 }
 

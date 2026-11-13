@@ -18,7 +18,7 @@ use super::{
 };
 use crate::frontend::{
     ast, check_library_module,
-    functions::result_parts,
+    functions::{SCALAR_OPTION, batch_record, result_parts},
     lower_module,
     parse::{self, LeafPath, Library},
 };
@@ -545,7 +545,7 @@ fn index_errors(namespace: &mut Namespace, sources: &[SourceFile<'_>]) -> Result
     for file in &namespace.files {
         for declaration in &file.module.errors {
             let name = &declaration.name;
-            if matches!(name.as_str(), "u64" | "Bytes" | "Result")
+            if matches!(name.as_str(), "u64" | "bool" | "Bytes" | "Result")
                 || namespace.local.records.contains_key(name)
             {
                 return Err(Diagnostic::new(
@@ -584,11 +584,14 @@ fn index_records(namespace: &mut Namespace, sources: &[SourceFile<'_>]) -> Resul
     // All contributors share a record scope, including private declarations.
     for file in &namespace.files {
         for record in &file.module.records {
-            // The two builtin types keep their ordinary meanings in every namespace.
-            if matches!(record.name.as_str(), "u64" | "Bytes") {
+            // Builtin type names keep their ordinary meanings in every namespace.
+            if matches!(record.name.as_str(), "u64" | "bool" | "Bytes") {
                 return Err(Diagnostic::new(
                     record.span,
-                    "a struct cannot redefine the builtin `u64` or `Bytes` type",
+                    format!(
+                        "a struct cannot redefine the builtin `{}` type",
+                        record.name
+                    ),
                 ));
             }
             if let Some(first) = declarations.insert(&record.name, record.span) {
@@ -699,7 +702,9 @@ fn index_functions(
                         ),
                     ));
                 }
-                if success != "u64" && !namespace.interface.public_records.contains_key(success) {
+                if !matches!(success, "u64" | "bool" | SCALAR_OPTION)
+                    && !namespace.interface.public_records.contains_key(success)
+                {
                     return Err(Diagnostic::new(
                         function.span,
                         format!(
@@ -707,6 +712,26 @@ fn index_functions(
                             function.name
                         ),
                     ));
+                }
+                for argument in &function.args {
+                    let batch = batch_record(&argument.ty);
+                    let record = batch.unwrap_or(&argument.ty);
+                    if namespace.local.records.contains_key(record)
+                        && !namespace.interface.public_records.contains_key(record)
+                    {
+                        let kind = if batch.is_some() {
+                            "a batch of"
+                        } else {
+                            "state of"
+                        };
+                        return Err(Diagnostic::new(
+                            argument.type_span,
+                            format!(
+                                "public function `{}` cannot borrow {kind} private struct `{record}`",
+                                function.name
+                            ),
+                        ));
+                    }
                 }
             }
             // Bare-name lookup spans contributors, so every declaration must

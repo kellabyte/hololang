@@ -256,10 +256,20 @@ fn proof_requires_every_possible_publication_to_match() {
         "    core.assert(first)",
         "    core.assert(first)\n    if core.len(rows) == 0 {\n        let ignored = core.append(rows, slot(3, 0))\n            on ok then true\n            on error then false\n        core.assert(ignored)\n    }",
     );
+    let mixed_result = SOURCE
+        .replace(
+            "func main returns u64",
+            "error ChoiceError { Refused }\nfunc choice returns Result<u64, ChoiceError> { return ok 0 }\nfunc main returns u64",
+        )
+        .replace(
+            "    core.assert(first)",
+            "    core.assert(first)\n    choice()\n        on ok then {}\n        on Refused then {\n            let ignored = core.append(rows, slot(3, 0))\n                on ok then true\n                on error then false\n            core.assert(ignored)\n        }",
+        );
     let unknown = SOURCE.replace("slot(2, 11)", "slot(core.len(rows), 11)");
     // The ordinary policy is also exact for the unsupported target/layouts.
     for (source, target, layout) in [
         (mixed.as_str(), TARGET, LayoutMode::Derived64),
+        (mixed_result.as_str(), TARGET, LayoutMode::Derived64),
         (unknown.as_str(), TARGET, LayoutMode::Derived64),
         (SOURCE, TARGET, LayoutMode::Wide),
         (SOURCE, TARGET, LayoutMode::Compact32),

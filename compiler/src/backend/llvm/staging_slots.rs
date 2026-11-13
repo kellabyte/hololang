@@ -8,7 +8,7 @@
 
 use std::collections::HashSet;
 
-use crate::ir::Op;
+use crate::ir::{Op, ResultPattern};
 
 use super::{
     context::{Binding, Lowering},
@@ -177,6 +177,9 @@ fn select<'a>(
         match operation {
             Op::Borrow { name, .. }
             | Op::Alias { name, .. }
+            | Op::BindBytes { name, .. }
+            | Op::BindResult { name, .. }
+            | Op::TrySaved { name, .. }
             | Op::ForEach {
                 reference: name, ..
             } => {
@@ -185,6 +188,18 @@ fn select<'a>(
             Op::ConstructHandled { arms, .. } => {
                 // A success binding can shadow a reference from the preheader.
                 introduced.extend(arms.iter().filter_map(|arm| arm.reference.as_deref()));
+            }
+            Op::HandleResult { arms, .. } | Op::HandleSavedResult { arms, .. } => {
+                for arm in arms {
+                    let binding = match &arm.pattern {
+                        ResultPattern::Ok(binding)
+                        | ResultPattern::Error { binding, .. }
+                        | ResultPattern::Fallback(binding) => binding,
+                    };
+                    if let Some(name) = binding {
+                        introduced.insert(name.as_str());
+                    }
+                }
             }
             Op::Repeat { index, body, .. } => {
                 // Collect only eligible loop shapes, leaving other operations untouched.
@@ -252,6 +267,11 @@ fn visit<'a>(body: &'a [Op], visitor: &mut impl FnMut(&'a Op)) {
                     visit(&arm.body, visitor);
                 }
             }
+            Op::HandleResult { arms, .. } | Op::HandleSavedResult { arms, .. } => {
+                for arm in arms {
+                    visit(&arm.body, visitor);
+                }
+            }
             Op::If {
                 then_body,
                 else_body,
@@ -275,7 +295,11 @@ fn visit<'a>(body: &'a [Op], visitor: &mut impl FnMut(&'a Op)) {
             | Op::TcpClose { .. }
             | Op::Send { .. }
             | Op::Let { .. }
+            | Op::LetBool { .. }
+            | Op::BindBytes { .. }
+            | Op::BindResult { .. }
             | Op::TryLet { .. }
+            | Op::TrySaved { .. }
             | Op::Set { .. }
             | Op::Append { .. }
             | Op::AppendHandled { .. }
@@ -284,11 +308,15 @@ fn visit<'a>(body: &'a [Op], visitor: &mut impl FnMut(&'a Op)) {
             | Op::AssignRef { .. }
             | Op::Write { .. }
             | Op::WriteByte { .. }
+            | Op::WriteInputByte { .. }
+            | Op::WriteViewByte { .. }
+            | Op::MoveInputBytes { .. }
             | Op::Reset { .. }
             | Op::Assert(_)
             | Op::Print(_)
             | Op::PrintText(_)
             | Op::Return(_)
+            | Op::ReturnBool(_)
             | Op::ReturnResult(_)
             | Op::ExitZero
             | Op::OpaqueRegion(_) => {}

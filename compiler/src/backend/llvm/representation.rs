@@ -5,21 +5,23 @@
 //! Helpers never scan payload bytes or enumerate records to free them. Indexed
 //! borrowing remains O(index), while cursor traversal performs one typed hop.
 
-use crate::{
-    ir::{FieldKind, Program},
-    layout::LayoutPlan,
-};
+use crate::ir::FieldKind;
 
-use super::{context::Lowering, function::Function, storage};
+use super::{
+    context::{Lowering, Module},
+    function::Function,
+    storage,
+};
 
 /// Emit one positive record-size helper for a checked schema and selected plan.
 /// The result owns compiler text; native reads concern initialized shape metadata
 /// only. Publication and immutable shape establish nonwrapping valid extents.
-pub(super) fn size(program: &Program, layout: &LayoutPlan, index: usize) -> String {
-    let record = &program.records[index];
+pub(super) fn size(module: &Module<'_>, index: usize) -> String {
+    let record = &module.program.records[index];
+    let layout = module.layout;
     let representation = layout.record(&record.name);
     let header = format!("define internal i64 @holo.record_size.{index}(ptr %record)");
-    let mut lowering = Lowering::new(program, layout, header, Vec::new());
+    let mut lowering = Lowering::new(module, header, Vec::new());
     // Wide/retained records keep the direct frozen-size load, preserving their
     // constant-work skip even when earlier fields have several variable components.
     if representation.header_bytes != 0 {
@@ -69,14 +71,36 @@ pub(super) fn indexed(index: usize) -> String {
     ));
     let count_slot = storage::member(&mut f, "%holo.batch", "%batch", 3);
     let count = f.value(format!("load i64, ptr {count_slot}"));
-    let valid = f.value(format!("icmp ult i64 %index, {count}"));
-    f.line(format!("call void @holo.assert(i1 {valid})"));
+    check_index(&mut f, &count);
     let region_slot = storage::member(&mut f, "%holo.batch", "%batch", 0);
     let region = f.value(format!("load ptr, ptr {region_slot}"));
     let base_slot = storage::member(&mut f, "%holo.region", &region, 0);
     let base = f.value(format!("load ptr, ptr {base_slot}"));
     let start_slot = storage::member(&mut f, "%holo.batch", "%batch", 1);
     let start = f.value(format!("load i64, ptr {start_slot}"));
+    indexed_lookup(&mut f, index, &base, &start);
+    f.finish()
+}
+
+/// Emit the same indexed lookup over a borrowed, count-bounded prefix.
+/// The ABI lends its first record address and count without owner metadata.
+pub(super) fn indexed_prefix(index: usize) -> String {
+    let mut f = Function::new(format!(
+        "define internal ptr @holo.prefix_record_at.{index}(ptr %contents, i64 %count, i64 %index)"
+    ));
+    check_index(&mut f, "%count");
+    indexed_lookup(&mut f, index, "%contents", "0");
+    f.finish()
+}
+
+/// Reject the first index outside the supplied published count before reading shape.
+fn check_index(f: &mut Function, count: &str) {
+    let valid = f.value(format!("icmp ult i64 %index, {count}"));
+    f.line(format!("call void @holo.assert(i1 {valid})"));
+}
+
+/// Walk frozen extents starting at the supplied base and offset to a checked index.
+fn indexed_lookup(f: &mut Function, index: usize, base: &str, start: &str) {
     f.line("br label %lookup");
     f.label("lookup");
     f.line("%position = phi i64 [ 0, %entry ], [ %following.position, %advance ]");
@@ -98,5 +122,4 @@ pub(super) fn indexed(index: usize) -> String {
     f.line("br label %lookup");
     f.label("done");
     f.line("ret ptr %address");
-    f.finish()
 }

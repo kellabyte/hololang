@@ -1,23 +1,21 @@
 // Inspect the ten-byte fixed prefix of a gzip member from a hosted input.
-// The slot is reused across short reads. Parser state holds only scalar fields
-// and never retains an input reference. See README.md for the output contract.
+// The native slot is reused across short reads. A four-byte field retains only
+// the timestamp octets. See README.md for the output contract.
 
-using holo.bytes
+using holo.bytes.read
 
 // One initialized slot for the native adapter's bounded writes.
 struct InputSlot {
     // The adapter lends only the fresh prefix of this ten-byte backing.
     wire Bytes
+    // The timestamp's four octets, retained across short reads.
+    timestamp Bytes
 }
 
 // State that survives short reads, including a split modification time.
 struct Header {
     // Number of validated prefix bytes, from zero through ten.
     received u64
-    // Low octet of the timestamp halfword currently being assembled.
-    mtime_low_octet u64
-    // Unsigned timestamp seconds. Zero means the timestamp is unavailable.
-    mtime_seconds u64
     // Gzip flags, including indicators for optional header fields.
     flags u64
     // Raw extra flags for the DEFLATE compression method.
@@ -31,7 +29,8 @@ func start_input
     returns InputSlot
 {
     return InputSlot {
-        wire: core.bytes(10, 0)
+        wire: core.bytes(10, 0),
+        timestamp: core.bytes(4, 0)
     }
 }
 
@@ -41,8 +40,6 @@ func start_header
 {
     return Header {
         received: 0,
-        mtime_low_octet: 0,
-        mtime_seconds: 0,
         flags: 0,
         compression_hint: 0,
         os: 0
@@ -50,12 +47,13 @@ func start_header
 }
 
 // Validate one copied octet at its absolute offset in the fixed prefix.
-// Accept with zero and update only the relevant scalar field. On malformed
+// Accept with zero and update only the corresponding field. On malformed
 // input, return its status without consuming later fields. The caller supplies
 // offsets 0 through 9 in order. This operation acquires and waits for nothing.
 func accept_octet
     with noalloc, noblock
     arg header Header as readwrite reference
+    arg timestamp Bytes as readwrite reference
     arg offset u64 as readonly copy
     arg octet u64 as readonly copy
     returns u64
@@ -88,22 +86,9 @@ func accept_octet
         header.flags = octet
         return 0
     }
-    // Offsets four through seven encode the unsigned timestamp. The low
-    // octet of either halfword may arrive on an earlier read.
+    // Keep these four wire octets in order until the full header arrives.
     if offset < 8 {
-        if core.and(offset, 1) == 0 {
-            header.mtime_low_octet = octet
-            return 0
-        }
-        let halfword = bytes.join_low_octets_le(header.mtime_low_octet, octet)
-        // The lower half arrives before the upper half. The combined value
-        // fits in 32 bits, including timestamps above the signed 32-bit range.
-        if offset == 5 {
-            header.mtime_seconds = halfword
-        } else {
-            let upper = core.mul_wrapping(halfword, 65536)
-            header.mtime_seconds = core.add_wrapping(header.mtime_seconds, upper)
-        }
+        timestamp[core.sub_wrapping(offset, 4)] = octet
         return 0
     }
     // The last two positions are metadata. Keep their original values.
@@ -118,10 +103,11 @@ func accept_octet
 // Process a fresh readonly prefix into caller-owned state. Input length is
 // bounded by the remaining header bytes at the call site. Return zero after
 // advancing received, or return the earliest rejection without publishing
-// success. Provisional scalar fields are used only after the header completes.
+// success. Provisional fields are used only after the header completes.
 func accept_chunk
     with noalloc, noblock
     arg header Header as readwrite reference
+    arg timestamp Bytes as readwrite reference
     arg input Bytes as readonly reference
     returns u64
 {
@@ -130,7 +116,7 @@ func accept_chunk
     // The captured extent bounds each load. Each iteration handles one offset.
     for index in core.range(size) {
         let offset = core.add_wrapping(previous, index)
-        let status = accept_octet(header, offset, input[index])
+        let status = accept_octet(header, timestamp, offset, input[index])
         // Leave all subsequent fields unexamined on malformed input.
         if status != 0 {
             return status
@@ -173,7 +159,7 @@ func main
     loop {
         let remaining = core.sub_wrapping(10, header.received)
         refill slot.wire, remaining as chunk {
-            let status = accept_chunk(header, chunk)
+            let status = accept_chunk(header, slot.timestamp, chunk)
             // Invalid input never publishes provisional metadata.
             if status != 0 {
                 core.print(status)
@@ -181,11 +167,17 @@ func main
             }
             // Stop at ten bytes, even if the peer keeps the stream open.
             if header.received == 10 {
-                core.print(0)
-                core.print(header.mtime_seconds)
-                core.print(header.flags)
-                core.print(header.compression_hint)
-                core.print(header.os)
+                read.u32_le(slot.timestamp)
+                    on ok(mtime_seconds) then {
+                        core.print(0)
+                        core.print(mtime_seconds)
+                        core.print(header.flags)
+                        core.print(header.compression_hint)
+                        core.print(header.os)
+                    }
+                    on Short(_) then {
+                        core.assert(false)
+                    }
                 return 0
             }
         } else status {

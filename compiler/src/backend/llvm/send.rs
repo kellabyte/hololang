@@ -1,10 +1,10 @@
 //! Checked lowering for one synchronous send or explicit writable wait.
 //!
-//! Each attempt borrows the admitted descriptor and a live initialized field.
+//! Each attempt borrows the admitted descriptor and a live byte source.
 //! The emitted guards establish the exact byte subrange and validate the scalar
 //! result before exposure. No payload copy or native owner is introduced.
 
-use crate::ir::Expr;
+use crate::ir::{BytesSource, Expr};
 
 use super::{
     context::{Binding, Lowering},
@@ -17,21 +17,14 @@ pub(super) const DECLARATIONS: &str = "declare i64 @holo_send_experimental(i64, 
      declare i64 @holo_wait_output_experimental(i64, i64)\n\n";
 
 impl Lowering<'_> {
-    /// Emit one direct send from the live field's selected subrange.
+    /// Emit one direct send from a checked byte source's selected subrange.
     ///
     /// Captures metadata before evaluating offset and count in written order.
     /// Invalid ranges or impossible adapter results trap, with no status
     /// binding visible. The adapter borrows the bytes for the duration of send.
-    pub(super) fn send(
-        &mut self,
-        reference: &str,
-        path: &[String],
-        offset: &Expr,
-        count: &Expr,
-        name: &str,
-    ) {
-        let Input::Bytes { contents, len } = self.capture_byte_field(reference, path) else {
-            unreachable!("checked send source is a byte field");
+    pub(super) fn send(&mut self, source: &BytesSource, offset: &Expr, count: &Expr, name: &str) {
+        let Input::Bytes { contents, len } = self.capture_bytes(source) else {
+            unreachable!("checked send source has a byte descriptor");
         };
         let offset = self.expression(offset);
         let count = self.expression(count);
@@ -40,9 +33,9 @@ impl Lowering<'_> {
         let offset_fits = self.f.value(format!("icmp ule i64 {offset}, {len}"));
         let remaining = self.f.value(format!("sub i64 {len}, {offset}"));
         let positive = self.f.value(format!("icmp ne i64 {count}, 0"));
-        let fits_field = self.f.value(format!("icmp ule i64 {count}, {remaining}"));
+        let fits_source = self.f.value(format!("icmp ule i64 {count}, {remaining}"));
         let fits_native = self.f.value(format!("icmp ule i64 {count}, {MAX_NATIVE}"));
-        let valid_range = self.f.value(format!("and i1 {offset_fits}, {fits_field}"));
+        let valid_range = self.f.value(format!("and i1 {offset_fits}, {fits_source}"));
         let valid_count = self.f.value(format!("and i1 {positive}, {fits_native}"));
         let allowed = self.f.value(format!("and i1 {valid_range}, {valid_count}"));
         self.f.line(format!("call void @holo.assert(i1 {allowed})"));

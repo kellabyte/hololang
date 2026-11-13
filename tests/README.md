@@ -36,5 +36,6 @@ with a target name and source path. The workspace root has no package to
 discover the files. The CLI package gives the suites access to the Cargo-built
 `holo` executable.
 
-Failed native checks preserve replay inputs under `build/failures/`. Completed
-historical acceptance records belong to [evidence](../evidence/README.md).
+Failed native checks preserve replay inputs under `build/failures/`.
+Run `make check` to verify Hello World and the Redis demo from a fresh
+source snapshot. [Preview verification](../docs/releases/unreleased.md#verification)

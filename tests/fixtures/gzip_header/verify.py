@@ -21,8 +21,8 @@ from pathlib import Path
 # Four octets, one unsigned little-endian word, and two final octets.
 FIXED = struct.Struct("<BBBBIBB")
 SOURCE = Path("tests/fixtures/gzip_header/main.holo")
-LIBRARY_ROOT = Path("lib/holo")
-LIBRARY = LIBRARY_ROOT / "bytes.holo"
+MANIFEST = SOURCE.with_name("holo.toml")
+READ_NAMESPACE = Path("lib/holo/bytes/read")
 LAYOUTS = ("wide", "derived", "compact")
 TIMEOUT = 10
 
@@ -188,8 +188,8 @@ def run_stream(executable, directory, fragments, *, close_write, trailing=b""):
 
 def stream_fixtures(header):
     """Create short-read, truncation, and held-open rejection witnesses."""
-    # Send one octet at a time so both timestamp halfwords cross read
-    # boundaries. The final sentinel must still be queued after completion.
+    # Send one octet at a time so the timestamp spans four separate reads.
+    # The final sentinel must still be queued after completion.
     fragments = [bytes((octet,)) for octet in header[:-1]] + [header[-1:] + b"X"]
     return {
         "split-header": (fragments, False, b"X"),
@@ -199,22 +199,27 @@ def stream_fixtures(header):
 
 
 def write_flat_control(output):
-    """Write equivalent source with the library helper in the same source file."""
+    """Write equivalent source with the imported namespace in the entry file."""
     flat = output / "flattened.holo"
     source = SOURCE.read_text()
-    using_line = "using holo.bytes\n"
-    call = "bytes.join_low_octets_le("
+    using_line = "using holo.bytes.read\n"
+    call = "read.u32_le("
     # Ensure the control removes a real directive and resolves a real library call.
     if source.count(using_line) != 1 or call not in source:
-        raise ValueError(f"{SOURCE}: expected a `using holo.bytes` directive and call")
-    source = source.replace(using_line, "").replace(call, "join_low_octets_le(")
-    library = LIBRARY.read_text()
-    namespace_line = "namespace holo.bytes\n"
-    # The flattened helper shares the entry scope and needs no namespace header.
-    if library.count(namespace_line) != 1:
-        raise ValueError(f"{LIBRARY}: expected one namespace holo.bytes header")
-    library = library.replace(namespace_line, "").replace("public func ", "func ")
-    flat.write_text(library + "\n" + source)
+        raise ValueError(f"{SOURCE}: expected the endian reader import and call")
+    source = source.replace(using_line, "").replace(call, "u32_le(")
+    namespace_line = "namespace holo.bytes.read\n"
+    contributors = []
+    # Match package discovery order, including declarations unused by gzip.
+    for path in sorted(READ_NAMESPACE.glob("*.holo")):
+        library = path.read_text()
+        if library.count(namespace_line) != 1:
+            raise ValueError(f"{path}: expected one namespace holo.bytes.read header")
+        library = library.replace(namespace_line, "")
+        for declaration in ("func", "error", "struct"):
+            library = library.replace(f"public {declaration} ", f"{declaration} ")
+        contributors.append(library)
+    flat.write_text("\n".join([source, *contributors]))
     return flat
 
 
@@ -228,7 +233,7 @@ def verify(holo, output):
     for layout in LAYOUTS:
         directory = output / layout
         options = ["--layout", layout]
-        module = options + ["--library-root", str(LIBRARY_ROOT), str(SOURCE)]
+        module = options + ["--package", str(MANIFEST), "--locked"]
         module_ir = run_command(directory / "module-ir", [str(holo), "emit-llvm", *module])
         flat_ir = run_command(directory / "flat-ir", [str(holo), "emit-llvm", *options, str(flat)])
         # Exact LLVM identity checks the namespace boundary before optimization.

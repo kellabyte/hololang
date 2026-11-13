@@ -25,8 +25,6 @@ struct Header {
     start: usize,
     /// Opening body brace, which aligns with the function declaration.
     end: usize,
-    /// Exact result-type range, where angle brackets are type punctuation.
-    result: Span,
 }
 
 /// Parsed source locations where inserting a line boundary preserves grammar.
@@ -35,12 +33,14 @@ struct Layout {
     breaks: Vec<usize>,
     /// Source-ordered function header ranges, excluding their body braces.
     headers: Vec<Header>,
+    /// Source-ordered type ranges where angle brackets are type punctuation.
+    header_types: Vec<Span>,
     /// Source-ordered result arm lists, potentially nested through block arms.
     handlers: Vec<Span>,
     /// Indentation-delimited destination field lists, disjoint by grammar.
     destinations: Vec<Span>,
-    /// Success prefix positions whose grouped operands must retain separating space.
-    successes: Vec<usize>,
+    /// Contextual words that separate from a grouped operand.
+    spaced_words: Vec<usize>,
 }
 
 /// Pending layout and the already emitted source; comments are borrowed on write.
@@ -90,9 +90,10 @@ impl Layout {
         let mut layout = Self {
             breaks: Vec::new(),
             headers: Vec::with_capacity(module.functions.len()),
+            header_types: Vec::new(),
             handlers: Vec::new(),
             destinations: Vec::new(),
-            successes: Vec::new(),
+            spaced_words: Vec::new(),
         };
         // Field and declaration boundaries come from syntax. A public record's
         // boundary includes its marker and a field named `return` stays a field.
@@ -147,7 +148,9 @@ impl Layout {
             }
             for argument in &function.args {
                 layout.breaks.push(argument.span.start);
+                layout.header_types.push(argument.type_span);
             }
+            layout.header_types.push(function.result_span);
             // This cursor advances to a syntactically established opening brace,
             // rather than inferring block kind from capitalization or token spelling.
             while tokens[cursor].kind != LexemeKind::Symbol('{') {
@@ -158,7 +161,6 @@ impl Layout {
             layout.headers.push(Header {
                 start: name.span.end,
                 end,
-                result: function.result_span,
             });
             layout.collect_statements(&function.body);
         }
@@ -170,7 +172,7 @@ impl Layout {
         layout
             .destinations
             .sort_unstable_by_key(|range| range.start);
-        layout.successes.sort_unstable();
+        layout.spaced_words.sort_unstable();
         layout
     }
 
@@ -198,7 +200,8 @@ impl Layout {
                     self.collect_expression(expression);
                 }
                 ast::StatementKind::PrintText(_) => {}
-                ast::StatementKind::Construct { subject, arms } => {
+                ast::StatementKind::Construct { subject, arms }
+                | ast::StatementKind::HandleResult { subject, arms } => {
                     self.collect_expression(subject);
                     // The continuation level belongs to the arm headers and
                     // every line of their blocks, including each closing brace.
@@ -286,12 +289,24 @@ impl Layout {
                     self.collect_expression(&field.value);
                 }
             }
-            ast::ExprKind::Binary { left, right, .. } => {
+            ast::ExprKind::Binary {
+                op,
+                operator,
+                left,
+                right,
+            } => {
+                if matches!(op, ast::BinaryOp::LogicalAnd | ast::BinaryOp::LogicalOr) {
+                    self.spaced_words.push(operator.start);
+                }
                 self.collect_expression(left);
                 self.collect_expression(right);
             }
+            ast::ExprKind::Not { operator, value } => {
+                self.spaced_words.push(operator.start);
+                self.collect_expression(value);
+            }
             ast::ExprKind::Ok(value) => {
-                self.successes.push(expression.span.start);
+                self.spaced_words.push(expression.span.start);
                 self.collect_expression(value);
             }
             ast::ExprKind::Error { payload, .. } => {
@@ -315,6 +330,7 @@ impl Layout {
             }
             ast::ExprKind::Number(_)
             | ast::ExprKind::Bool(_)
+            | ast::ExprKind::Bytes(_)
             | ast::ExprKind::Name(_)
             | ast::ExprKind::ErrorFamilyRoot { .. } => {}
         }
@@ -335,10 +351,11 @@ fn emit(source: &str, tokens: &[Lexeme], layout: &Layout) -> String {
     let mut lists = 0usize;
     let mut boundary = 0usize;
     let mut header = 0usize;
+    let mut header_type = 0usize;
     let mut handler = 0usize;
     let mut active_handlers = Vec::new();
     let mut destination = 0usize;
-    let mut success = 0usize;
+    let mut spaced_word = 0usize;
     // Lexemes partition the immutable source. Each token is emitted or consumed
     // as pending whitespace exactly once, including complete multiline comments.
     for &token in tokens {
@@ -364,9 +381,15 @@ fn emit(source: &str, tokens: &[Lexeme], layout: &Layout) -> String {
         }
         let in_header =
             header < layout.headers.len() && token.span.start >= layout.headers[header].start;
-        let in_result_type = in_header
-            && token.span.start >= layout.headers[header].result.start
-            && token.span.start < layout.headers[header].result.end;
+        while let Some(span) = layout.header_types.get(header_type)
+            && token.span.start >= span.end
+        {
+            header_type += 1;
+        }
+        let in_type = layout
+            .header_types
+            .get(header_type)
+            .is_some_and(|span| token.span.start >= span.start && token.span.start < span.end);
         // A block arm may itself contain another arm list. Nested ranges finish
         // innermost first; each is pushed and popped once in the token scan.
         while active_handlers
@@ -414,16 +437,18 @@ fn emit(source: &str, tokens: &[Lexeme], layout: &Layout) -> String {
         {
             output.forced_break = false;
         }
-        // Preserve the whitespace that separates `ok (value)` from an ordinary
-        // call named `ok`. Other open parentheses keep their existing spacing.
-        while success < layout.successes.len() && layout.successes[success] < token.span.start {
-            success += 1;
+        // Preserve the space between a contextual word and a grouped operand.
+        // Calls with those names still use tight parentheses.
+        while spaced_word < layout.spaced_words.len()
+            && layout.spaced_words[spaced_word] < token.span.start
+        {
+            spaced_word += 1;
         }
-        let success_prefix = token.kind == LexemeKind::Symbol('(')
-            && success != 0
-            && output
-                .previous
-                .is_some_and(|previous| previous.span.start == layout.successes[success - 1]);
+        let grouped_operand = token.kind == LexemeKind::Symbol('(')
+            && spaced_word != 0
+            && output.previous.is_some_and(|previous| {
+                previous.span.start == layout.spaced_words[spaced_word - 1]
+            });
         output.write(
             source,
             token,
@@ -432,8 +457,8 @@ fn emit(source: &str, tokens: &[Lexeme], layout: &Layout) -> String {
                 + usize::from(in_header)
                 + active_handlers.len()
                 + usize::from(in_destination),
-            in_result_type,
-            success_prefix,
+            in_type,
+            grouped_operand,
         );
         // Opening braces and explicit statement separators admit a newline;
         // never force one after `}`, which may be followed by a postfix call.
@@ -463,8 +488,8 @@ impl Output {
         source: &str,
         token: Lexeme,
         indent: usize,
-        in_result_type: bool,
-        success_prefix: bool,
+        in_type: bool,
+        grouped_operand: bool,
     ) {
         let newlines = self.source_breaks.max(usize::from(self.forced_break));
         // Leading blank space disappears; pending real/structural line breaks
@@ -483,12 +508,12 @@ impl Output {
             for _ in 0..indent * INDENT_WIDTH {
                 self.text.push(' ');
             }
-        } else if success_prefix
+        } else if grouped_operand
             || needs_space(
                 source,
                 self.previous.expect("same-line previous token"),
                 token,
-                in_result_type,
+                in_type,
             )
         {
             self.text.push(' ');
@@ -501,10 +526,10 @@ impl Output {
 
 /// Decide horizontal separation between adjacent emitted lexemes in `source`.
 /// Returns no owned text; punctuation remains tight and words/operators separate.
-fn needs_space(source: &str, previous: Lexeme, current: Lexeme, in_result_type: bool) -> bool {
+fn needs_space(source: &str, previous: Lexeme, current: Lexeme, in_type: bool) -> bool {
     // Type angle brackets bind to the written type; comparisons elsewhere
     // retain normal operator spacing. A comma still separates type arguments.
-    if in_result_type
+    if in_type
         && (matches!(current.kind, LexemeKind::Symbol('<' | '>'))
             || previous.kind == LexemeKind::Symbol('<'))
     {
@@ -630,18 +655,21 @@ fn same_statements(left: &[ast::Statement], right: &[ast::Statement]) -> bool {
                     ast::StatementKind::Let {
                         name: ln,
                         mutable: lm,
+                        writable_view: lw,
                         value: lv,
                         otherwise: lo,
                     },
                     ast::StatementKind::Let {
                         name: rn,
                         mutable: rm,
+                        writable_view: rw,
                         value: rv,
                         otherwise: ro,
                     },
                 ) => {
                     ln == rn
                         && lm == rm
+                        && lw == rw
                         && same_expression(lv, rv)
                         && match (lo, ro) {
                             (Some(left), Some(right)) => same_statements(left, right),
@@ -672,6 +700,16 @@ fn same_statements(left: &[ast::Statement], right: &[ast::Statement]) -> bool {
                         arms: la,
                     },
                     ast::StatementKind::Construct {
+                        subject: rs,
+                        arms: ra,
+                    },
+                )
+                | (
+                    ast::StatementKind::HandleResult {
+                        subject: ls,
+                        arms: la,
+                    },
+                    ast::StatementKind::HandleResult {
                         subject: rs,
                         arms: ra,
                     },
@@ -779,9 +817,13 @@ fn same_expression(left: &ast::Expr, right: &ast::Expr) -> bool {
     match (&left.kind, &right.kind) {
         (ast::ExprKind::Number(left), ast::ExprKind::Number(right)) => left == right,
         (ast::ExprKind::Bool(left), ast::ExprKind::Bool(right)) => left == right,
+        (ast::ExprKind::Bytes(left), ast::ExprKind::Bytes(right)) => left == right,
         (ast::ExprKind::Name(left), ast::ExprKind::Name(right)) => left == right,
         (ast::ExprKind::Ok(left), ast::ExprKind::Ok(right))
-        | (ast::ExprKind::Try(left), ast::ExprKind::Try(right)) => same_expression(left, right),
+        | (ast::ExprKind::Try(left), ast::ExprKind::Try(right))
+        | (ast::ExprKind::Not { value: left, .. }, ast::ExprKind::Not { value: right, .. }) => {
+            same_expression(left, right)
+        }
         (
             ast::ExprKind::Error {
                 case: left,
@@ -877,11 +919,13 @@ fn same_expression(left: &ast::Expr, right: &ast::Expr) -> bool {
                 op: lo,
                 left: ll,
                 right: lr,
+                ..
             },
             ast::ExprKind::Binary {
                 op: ro,
                 left: rl,
                 right: rr,
+                ..
             },
         ) => lo == ro && same_expression(ll, rl) && same_expression(lr, rr),
         _ => false,

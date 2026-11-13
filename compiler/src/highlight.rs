@@ -136,7 +136,7 @@ impl Iterator for Highlighter<'_> {
             LexemeKind::Whitespace | LexemeKind::Newline => HighlightKind::Plain,
             LexemeKind::LineComment | LexemeKind::BlockComment => HighlightKind::Comment,
             LexemeKind::Number => HighlightKind::Number,
-            LexemeKind::Text => HighlightKind::Text,
+            LexemeKind::Text | LexemeKind::Bytes => HighlightKind::Text,
             LexemeKind::Invalid => HighlightKind::Invalid,
             LexemeKind::EqualEqual
             | LexemeKind::NotEqual
@@ -270,8 +270,43 @@ impl Highlighter<'_> {
             }
             // Hosted control words are contextual; existing calls can use them as names.
             "loop" | "refill" if !call => HighlightKind::Keyword,
+            // A word between operands is an infix operator. Preserve the
+            // spelling as a function or name when it starts an operand.
+            "and" | "or"
+                if self.previous.is_some_and(|(kind, before)| {
+                    !self.source[before.end..span.start].contains('\n')
+                        && match kind {
+                            LexemeKind::Identifier => !matches!(
+                                &self.source[before.start..before.end],
+                                "let" | "var" | "return" | "if" | "for" | "in" | "then"
+                            ),
+                            LexemeKind::Number
+                            | LexemeKind::Bytes
+                            | LexemeKind::Symbol(')' | ']' | '}') => true,
+                            _ => false,
+                        }
+                }) =>
+            {
+                HighlightKind::Operator
+            }
+            "not"
+                if following.is_some_and(|next| {
+                    !self.source[span.end..next.span.start].contains('\n')
+                        && match next.kind {
+                            LexemeKind::Identifier => !matches!(
+                                &self.source[next.span.start..next.span.end],
+                                "and" | "or" | "else"
+                            ),
+                            LexemeKind::Number | LexemeKind::Bytes => true,
+                            LexemeKind::Symbol('(') => span.end < next.span.start,
+                            _ => false,
+                        }
+                }) =>
+            {
+                HighlightKind::Operator
+            }
             "noalloc" | "noblock" => HighlightKind::Contract,
-            "u64" | "Bytes" => HighlightKind::Type,
+            "u64" | "bool" | "Bytes" => HighlightKind::Type,
             "core" => HighlightKind::Builtin,
             _ => {
                 // Known words take precedence over call shape, so `if (...)` stays
@@ -301,7 +336,7 @@ impl Highlighter<'_> {
 /// Recognize built-in or conventionally capitalized type-like spellings.
 /// This is a nonempty ASCII-name hint, not symbol resolution or naming validation.
 fn type_word(word: &str) -> bool {
-    matches!(word, "u64" | "Bytes") || word.as_bytes()[0].is_ascii_uppercase()
+    matches!(word, "u64" | "bool" | "Bytes") || word.as_bytes()[0].is_ascii_uppercase()
 }
 
 /// Identify trivia whose contents never select a declaration/call/field name.

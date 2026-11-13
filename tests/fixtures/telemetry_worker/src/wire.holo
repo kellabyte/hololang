@@ -1,5 +1,4 @@
-// Wire integers for the telemetry protocol. The caller passes copied octets
-// and can assemble a field across native reads without retaining a byte view.
+// Combine the copied octets of a length split across native reads.
 
 namespace telemetry.wire
 

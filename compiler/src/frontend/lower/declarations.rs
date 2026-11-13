@@ -5,7 +5,7 @@
 //! constructors the final batch slot. Recovery exposes no unacquired owner.
 
 use super::{Block, Kind, Lowerer, arity, ast, core_call};
-use crate::{ir, source::Diagnostic};
+use crate::{frontend::byte_ranges, ir, source::Diagnostic};
 
 impl Lowerer {
     /// Lower a declaration and report whether an owner consumed the remaining block.
@@ -18,6 +18,7 @@ impl Lowerer {
         let ast::StatementKind::Let {
             name,
             mutable,
+            writable_view,
             value,
             otherwise,
         } = &statement.kind
@@ -25,6 +26,74 @@ impl Lowerer {
             unreachable!("declaration dispatch requires let/var");
         };
         let mut output = Block::default();
+        if *writable_view && matches!(value.kind, ast::ExprKind::Bytes(_)) {
+            return Err(Diagnostic::new(
+                value.span,
+                "byte string literals are readonly",
+            ));
+        }
+        if *writable_view && (*mutable || !byte_ranges::is_window(value)) {
+            return Err(Diagnostic::new(
+                statement.span,
+                "`let readwrite` requires a `core.prefix` or `core.subrange` initializer",
+            ));
+        }
+        if (matches!(value.kind, ast::ExprKind::Bytes(_)) || byte_ranges::is_window(value))
+            && otherwise.is_none()
+        {
+            if *mutable {
+                return Err(Diagnostic::new(
+                    statement.span,
+                    "byte views cannot be rebound; bind the view with `let`",
+                ));
+            }
+            // Keep source and range evaluation together and in written order.
+            let saved = std::mem::replace(&mut self.deferred_actual, true);
+            let argument = self.byte_argument(value, *writable_view, &mut output);
+            self.deferred_actual = saved;
+            let ir::FunctionArgument::Bytes { source, ranges } = argument? else {
+                unreachable!("a byte window or literal has a captured source");
+            };
+            debug_assert!(output.ops.is_empty());
+            let access = if *writable_view {
+                ir::Access::Readwrite
+            } else {
+                ir::Access::Readonly
+            };
+            let name = self.bind(name, Kind::BytesView(access), statement.span)?;
+            output.push(
+                ir::Op::BindBytes {
+                    name,
+                    access,
+                    source,
+                    ranges,
+                },
+                statement.span,
+                [],
+            );
+            return Ok((output, false));
+        }
+        if let Some((function, actuals, family)) = self.tagged_target(value) {
+            if *mutable || otherwise.is_some() {
+                return Err(Diagnostic::new(
+                    statement.span,
+                    "save a tagged result with an immutable `let`",
+                ));
+            }
+            let family = family.to_owned();
+            let args = self.ordinary_arguments(function, actuals, value.span)?;
+            let name = self.bind(name, Kind::SavedResult(family), statement.span)?;
+            output.push(
+                ir::Op::BindResult {
+                    name,
+                    function: function.to_owned(),
+                    args,
+                },
+                statement.span,
+                [],
+            );
+            return Ok((output, false));
+        }
         // Typed append publishes or rolls back before any selected arm runs.
         // Bind the decision after lowering all arms so none sees its own result.
         if let ast::ExprKind::Handle { subject, arms } = &value.kind
@@ -43,7 +112,7 @@ impl Lowerer {
                 self.append_decision(args, subject.span, arms, boolean, &mut output)?;
             // Both result types have an immutable checked binding.
             let kind = if boolean {
-                Kind::Boolean
+                Kind::HandledBool
             } else {
                 Kind::Scalar { mutable: false }
             };
@@ -57,7 +126,7 @@ impl Lowerer {
             if *mutable || otherwise.is_some() {
                 return Err(Diagnostic::new(
                     statement.span,
-                    "bind a propagated scalar with `let name = try call(...)`",
+                    "bind a propagated scalar with `let` and `try`",
                 ));
             }
             let operation = self.try_binding(name, subject, value.span)?;
@@ -65,16 +134,13 @@ impl Lowerer {
             return Ok((output, false));
         }
         if let Some((operation, args)) = core_call(value) {
-            // Helpers work on existing argument storage. Owners and batch-root
-            // borrows are entry operations and cannot outlive this call frame.
+            // Helpers work on existing argument storage. Owners and hosted
+            // operations are entry-only. Element borrows use a checked batch view.
             if self.ordinary_body
                 && matches!(
                     operation,
                     "region"
                         | "batch"
-                        | "append"
-                        | "borrow_readonly"
-                        | "borrow_readwrite"
                         | "wait_input"
                         | "send"
                         | "wait_output"
@@ -220,9 +286,9 @@ impl Lowerer {
             // Borrow/alias access is explicit; binding rebinding is a separate permission.
             if matches!(operation, "borrow_readonly" | "borrow_readwrite") {
                 arity(args, 2, value.span)?;
-                let (batch, record) = self.batch(&args[0])?;
-                let index = self.scalar(&args[1], &mut output)?;
                 let access = access(operation);
+                let (batch, record) = self.batch(&args[0], access)?;
+                let index = self.scalar(&args[1], &mut output)?;
                 let name = self.bind(
                     name,
                     Kind::Reference {
@@ -320,8 +386,17 @@ impl Lowerer {
                 ));
             }
             let value = self.handle_result(subject, arms, true)?;
-            let name = self.bind(name, Kind::Boolean, statement.span)?;
+            let name = self.bind(name, Kind::HandledBool, statement.span)?;
             output.push(ir::Op::Let { name, value }, statement.span, []);
+            return Ok((output, false));
+        }
+        if self.is_bool(value) {
+            if *mutable {
+                return Err(Diagnostic::new(statement.span, "bind a bool with `let`"));
+            }
+            let value = self.boolean(value, &mut output)?;
+            let name = self.bind(name, Kind::Bool, statement.span)?;
+            output.push(ir::Op::LetBool { name, value }, statement.span, []);
             return Ok((output, false));
         }
         let value = self.scalar(value, &mut output)?;

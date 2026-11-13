@@ -15,11 +15,25 @@ functions. Error declarations share the type namespace with records. The
 resolver rejects ambiguous and cyclic unions, preserves leaf order and payloads,
 and budgets the generated paths. Each case can carry one `u64` field.
 Fallible scalar headers retain their family for the parent frontend,
-which lowers entry and ordinary bodies. Typed destination constructors keep
+which lowers entry and ordinary bodies. `Option<u64>` uses a private family
+identity for its absent tag. Typed destination constructors keep
 their schema and family together in the producer definition. The checked IR
 verifier remains required before LLVM lowering. These modules do not depend on
 legacy code, allocate generated-program heap objects,
 or choose default source arithmetic semantics.
+
+An ordinary `u64`, `bool`, `Option<u64>`, or `Result<u64, E>` header can declare
+`Batch<Record>` as a readonly or readwrite reference and fixed scalar record
+state as a readwrite reference. Package binding resolves the schemas before
+definition checking. The signature carries the nominal schema and access mode
+for argument and element checks in the ordinary call graph.
+
+`returns bool` selects the ordinary path even for helpers with only copied
+arguments. The signature records the boolean return type so entry and ordinary
+bodies can resolve and check direct calls before lowering any callee body.
+A `bool as readonly copy` parameter also selects the ordinary path. A scalar
+helper with a boolean parameter or a boolean branch can be called by helpers
+that would otherwise use scalar templates.
 
 Scalar-helper arguments require `u64 as readonly copy`. Record constructors also
 accept `Bytes as readonly reference`; their `core.len(input)` and `input[index]`
@@ -31,7 +45,8 @@ to their low eight bits. `core.index()` exists only in the element expression.
 Returning an existing local
 aggregate, arbitrary reference inputs, writable byte parameters, mutation, and
 general function bodies remain outside these producer categories. Ordinary borrowed
-functions may mutate their explicitly passed fixed state. They cannot enter a
+functions may mutate their explicitly passed fixed state or writable byte
+views, including when returning a typed scalar result. They cannot enter a
 producer or a pure scalar template. Owned byte output always uses explicit `core.bytes`;
 direct field forwarding does not silently copy existing payloads.
 
@@ -51,18 +66,26 @@ Its callee must return the exact nominal record and, for typed results, the
 exact error family. This forwards the existing destination, typed operands,
 and outcome. It allocates no intermediate record. A child-family lift still
 requires the explicit nested `try` path. Prefix rejection guards belong to
-the fresh-literal form. Package binding resolves same-namespace callee and
-type identities before this check.
+the fresh-literal form. Guard comparisons and boolean literals compose with
+`not`, short-circuit `and`, and short-circuit `or`. Package binding resolves
+same-namespace callee and type identities before this check.
 
 Nested literals become synthetic destination producers with all outer typed
 parameters explicitly forwarded. Byte descriptor slots cannot become numeric
 scalars; input byte-index children participate in depth and substitution budgets.
 This simple adapter may forward unused inputs; it introduces no aggregate temporary.
-Named and synthetic producers retain
+Named calls can narrow a forwarded input with `core.prefix` or `core.subrange`.
+The bounds are pure scalar expressions checked against the caller's captured
+extent before entering the callee. Named and synthetic producers retain
 existing checked suffix rollback. Constructors cannot claim strict `noalloc`
 because current lowering advances dynamic region storage. `noblock` and scalar
 `noalloc` are admitted only after all source calls resolve to the supported closed
 pure graph; this makes no wait-freedom, page-fault, or execution-time guarantee.
+
+Readonly producer arguments can also borrow static byte strings, with the same
+checked windows. A pure scalar expression can observe a byte string's length
+or read one byte by index. Calls with a potentially trapping literal read as an
+actual evaluate it once even when the callee discards its argument.
 
 Scalar-helper invocations inside byte-bearing producers use the checked IR's
 eager scoped scalar application. Actuals are evaluated once in written order,

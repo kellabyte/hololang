@@ -406,6 +406,61 @@ fn operator_precedence_preserves_structure_for_later_rejection() {
 }
 
 #[test]
+fn boolean_precedence_and_contextual_names_preserve_grouping() {
+    let statements = body("return not left == right and ready() or not(false)");
+    let StatementKind::Return(Expr {
+        kind:
+            ExprKind::Binary {
+                op: BinaryOp::LogicalOr,
+                left,
+                right,
+                ..
+            },
+        ..
+    }) = &statements[0].kind
+    else {
+        panic!("expected disjunction");
+    };
+    assert!(matches!(right.kind, ExprKind::Call { .. }));
+    let ExprKind::Binary {
+        op: BinaryOp::LogicalAnd,
+        left,
+        ..
+    } = &left.kind
+    else {
+        panic!("expected conjunction");
+    };
+    let ExprKind::Not { value, .. } = &left.kind else {
+        panic!("expected negation");
+    };
+    assert!(matches!(
+        value.kind,
+        ExprKind::Binary {
+            op: BinaryOp::Eq,
+            ..
+        }
+    ));
+
+    let statements =
+        body("let not = true\nlet result = not and not (false)\nor()\nand()\nnot()\nreturn 0");
+    assert_eq!(statements.len(), 6);
+    let StatementKind::Let { value, .. } = &statements[1].kind else {
+        panic!("expected binding");
+    };
+    let ExprKind::Binary {
+        op: BinaryOp::LogicalAnd,
+        left,
+        right,
+        ..
+    } = &value.kind
+    else {
+        panic!("expected conjunction");
+    };
+    assert!(matches!(&left.kind, ExprKind::Name(name) if name == "not"));
+    assert!(matches!(right.kind, ExprKind::Not { .. }));
+}
+
+#[test]
 /// Equal-precedence operators remain left-associated, preserving written evaluation order.
 fn operator_chains_are_left_associative() {
     let statements = body("return 8 - 3 - 1");
@@ -473,6 +528,13 @@ fn unsupported_modes_and_parameterized_types_are_rejected() {
             .contains("passing")
     );
     assert!(rejection("struct Item { data Batch<u64> }").contains("parameterized types"));
+    assert!(
+        rejection("func f returns Option<Bytes> { return None }").contains("require `Option<u64>`")
+    );
+    assert!(
+        rejection("func f arg value Option<u64> as readonly copy returns u64 { return 0 }")
+            .contains("parameterized types")
+    );
 }
 
 #[test]
@@ -501,8 +563,8 @@ fn hostile_expression_nesting_is_bounded() {
         .collect::<Vec<_>>()
         .join(" + ");
     let projection_chain = format!("value{}", ".field".repeat(300));
-    // Recursive grouping, left-deep infix trees, and postfix trees need separate limits.
-    for expression in [deeply_nested, left_chain, projection_chain] {
+    let negation_chain = format!("{}true", "not ".repeat(256));
+    for expression in [deeply_nested, left_chain, projection_chain, negation_chain] {
         assert!(
             rejection(&format!("func main returns u64 {{ return {expression} }}"))
                 .contains("limit")

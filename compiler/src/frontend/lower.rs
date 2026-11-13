@@ -37,17 +37,25 @@ enum Kind {
         /// Whether assignment is permitted.
         mutable: bool,
     },
-    /// Immutable boolean produced by handling a result, usable as a condition.
-    Boolean,
+    /// Immutable boolean decision retained in the handler's zero-or-one lane.
+    HandledBool,
+    /// Immutable boolean with a distinct checked local type.
+    Bool,
     /// Arm-local failure value. The scalar slice cannot coerce it to an integer.
     Error,
-    /// Call-local readonly bytes carrying the captured formal extent.
+    /// Immutable copied tag and payload retaining its nominal outcome identity.
+    SavedResult(String),
+    /// Call-local byte view carrying the captured formal extent and permission.
     InputBytes {
         /// Index in the complete ordinary parameter list.
         param: usize,
+        /// Permission checked when the caller lends this view.
+        access: ir::Access,
     },
     /// Lexical readonly fresh extent from a checked hosted refill.
     ReceivedBytes,
+    /// Local view captured once from an initialized byte source.
+    BytesView(ir::Access),
     /// Opaque lexical stream owner. Only the checked hosted I/O operations can use it.
     TcpStream,
     /// Finite backing owner; no implicit copies or reassignments are supported.
@@ -56,6 +64,13 @@ enum Kind {
     Batch {
         /// Logical schema name.
         record: String,
+    },
+    /// Call-local access to the published prefix of a batch.
+    BatchView {
+        /// Nominal schema of the published elements.
+        record: String,
+        /// Maximum permission for reborrowing elements or forwarding the view.
+        access: ir::Access,
     },
     /// Rooted reference with independent binding mutability and path permission.
     Reference {
@@ -128,7 +143,9 @@ struct Lowerer {
     depth: usize,
     /// Whether returns and harness-operation diagnostics belong to a helper body.
     ordinary_body: bool,
-    /// Nominal family returned by the current ordinary body, if fallible.
+    /// Whether the current ordinary body returns a boolean.
+    returns_bool: bool,
+    /// Checked result identity of the current ordinary body, if tagged.
     result_family: Option<String>,
     /// Typed actual evaluation is contained in its expression until the call runs.
     deferred_actual: bool,
@@ -201,6 +218,7 @@ fn lower_bodies(
         budget: NODE_BUDGET,
         depth: 0,
         ordinary_body: false,
+        returns_bool: false,
         result_family: None,
         deferred_actual: false,
         placement: main
@@ -217,6 +235,14 @@ fn lower_bodies(
             declaration.span,
             [],
         );
+    }
+    if let Some(option) = lowerer.definitions.errors.get(functions::OPTION_FAMILY) {
+        let declaration = module
+            .functions
+            .iter()
+            .find(|function| function.result == functions::SCALAR_OPTION)
+            .expect("optional result metadata requires an optional function");
+        body.push(ir::Op::ErrorFamily(option.clone()), declaration.span, []);
     }
     // Each ordinary declaration is checked even when entry never calls it.
     // The definition counts as one entry operation for the source map.
@@ -315,9 +341,10 @@ fn terminates(body: &[ast::Statement]) -> bool {
             ast::StatementKind::WithRegion {
                 body, on_failure, ..
             } => (terminates(body) && terminates(on_failure)) || following,
-            // The verifier checks coverage. A falling-through construction arm
-            // can only terminate via the suffix after the construct statement.
-            ast::StatementKind::Construct { arms, .. } => {
+            // The verifier checks coverage. Falling-through arms can terminate
+            // through the suffix after their handler.
+            ast::StatementKind::Construct { arms, .. }
+            | ast::StatementKind::HandleResult { arms, .. } => {
                 arms.iter().all(|arm| terminates(&arm.body)) || following
             }
             // Counted loops can run zero times. Nonowner declarations and ordinary
@@ -451,13 +478,36 @@ impl Lowerer {
         }
     }
 
-    /// Require a bare batch binding, returning its IR identity and logical schema.
-    fn batch(&self, expr: &ast::Expr) -> Result<(String, String), Diagnostic> {
+    /// Resolve a named owner or view with the requested element access.
+    fn batch(&self, expr: &ast::Expr, access: ir::Access) -> Result<(String, String), Diagnostic> {
         let binding = self.named(expr)?;
-        // Only a batch owns initialized record count and append publication state.
+        let record = match binding.kind {
+            Kind::Batch { record } => record,
+            Kind::BatchView {
+                record,
+                access: available,
+            } if access == ir::Access::Readonly || access == available => record,
+            Kind::BatchView { .. } => {
+                return Err(Diagnostic::new(
+                    expr.span,
+                    "cannot get readwrite access through a readonly batch view",
+                ));
+            }
+            _ => return Err(Diagnostic::new(expr.span, "expected a batch binding")),
+        };
+        Ok((binding.ir_name, record))
+    }
+
+    /// Require an owning batch for operations that may change publication or storage.
+    fn owned_batch(&self, expr: &ast::Expr) -> Result<(String, String), Diagnostic> {
+        let binding = self.named(expr)?;
         match binding.kind {
             Kind::Batch { record } => Ok((binding.ir_name, record)),
-            _ => Err(Diagnostic::new(expr.span, "expected a batch binding")),
+            Kind::BatchView { .. } => Err(Diagnostic::new(
+                expr.span,
+                "cannot change publication through a borrowed batch view",
+            )),
+            _ => Err(Diagnostic::new(expr.span, "expected a batch owner binding")),
         }
     }
 

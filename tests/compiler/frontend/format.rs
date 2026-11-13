@@ -32,6 +32,22 @@ fn records_names_literals_and_expression_grouping_remain_intact() {
     );
 }
 
+#[test]
+fn boolean_operators_format_without_changing_contextual_calls() {
+    assert_format(
+        "func ready returns bool{return (not (false)and(true))or not(true)}",
+        "func ready\n    returns bool\n{\n    return (not (false) and (true)) or not(true)\n}\n",
+    );
+}
+
+#[test]
+fn byte_strings_preserve_the_prefix_and_exact_spelling() {
+    assert_format(
+        "func main returns u64{let bytes=b\"hi\\xFf\\0\";core.assert(bytes[2]==255);return 0}",
+        "func main\n    returns u64\n{\n    let bytes = b\"hi\\xFf\\0\";\n    core.assert(bytes[2] == 255);\n    return 0\n}\n",
+    );
+}
+
 /// Package records format with their visibility and declaration order intact.
 #[test]
 fn package_records_keep_visibility_and_source_order() {
@@ -69,12 +85,30 @@ fn tcp_owner_and_refill_keep_their_scope_and_operand() {
     assert_eq!(format(&output).unwrap(), output);
 }
 
+/// The access modifier and a same-spelled scalar name format distinctly.
+#[test]
+fn writable_byte_view_modifier_keeps_its_structure() {
+    assert_format(
+        "func main returns u64 {let readwrite=2;let readwrite view=core.prefix(bytes,readwrite);view[0]=5;return 0}",
+        "func main\n    returns u64\n{\n    let readwrite = 2;\n    let readwrite view = core.prefix(bytes, readwrite);\n    view[0] = 5;\n    return 0\n}\n",
+    );
+}
+
 /// Format a generic return and result-arm continuation without moving the arm boundary.
 #[test]
 fn error_declarations_and_result_arms_keep_their_structure() {
     assert_format(
         "namespace telemetry.frame\npublic error FrameError{BadMagic,Oversized(required u64)}\npublic func validate returns Result < u64 , FrameError > {return ok (1+2)}\nfunc handle returns u64 {\n return validate()\n   on ok(length) then length\n   on FrameError.Oversized(required) then required\n   on error then 1\n}",
         "namespace telemetry.frame\npublic error FrameError {\n    BadMagic,\n    Oversized(required u64)\n}\npublic func validate\n    returns Result<u64, FrameError>\n{\n    return ok (1 + 2)\n}\nfunc handle\n    returns u64\n{\n    return validate()\n        on ok(length) then length\n        on FrameError.Oversized(required) then required\n        on error then 1\n}\n",
+    );
+}
+
+/// Format an optional return and both of its patterns without changing their spelling.
+#[test]
+fn optional_return_and_arms_keep_their_structure() {
+    assert_format(
+        "namespace lookup.table\npublic func find returns Option < u64 > { if false { return Some(7) };return None }\nfunc use_index returns u64 {\n return find()\n   on Some(index) then index\n   on None then 0\n}",
+        "namespace lookup.table\npublic func find\n    returns Option<u64>\n{\n    if false {\n        return Some(7)\n    };\n    return None\n}\nfunc use_index\n    returns u64\n{\n    return find()\n        on Some(index) then index\n        on None then 0\n}\n",
     );
 }
 
@@ -90,9 +124,10 @@ fn error_unions_keep_child_aliases_and_paths() {
 /// Contextual propagation and an ordinary helper named try format distinctly.
 #[test]
 fn propagation_and_ordinary_try_call_keep_distinct_syntax() {
-    let source = "error Invalid { Empty }\nfunc verify returns Result<u64, Invalid> {let n=try check();return ok n}\nfunc plain returns u64 {let n=try();return n}";
+    let source = "error Invalid { Empty }\nfunc verify returns Result<u64, Invalid> {let n=try check();return ok n}\nfunc verify_saved returns Result<u64, Invalid> {let saved=check();let n=try saved;return ok n}\nfunc plain returns u64 {let n=try();return n}";
     let output = format(source).unwrap();
     assert!(output.contains("    let n = try check();"));
+    assert!(output.contains("    let n = try saved;"));
     assert!(output.contains("    let n = try();"));
     assert_eq!(format(&output).unwrap(), output);
 }
@@ -146,6 +181,24 @@ fn scoped_region_formats_with_its_recovery_and_construct_arms() {
     assert_format(
         "func main returns u64{with core . region (32) {\n core.construct(open_ticket(1))\n  on ok(ticket) then {core.print(ticket.id)}\n  on error then {return 0}\n}else {with(1002)}\nreturn 0}",
         "func main\n    returns u64\n{\n    with core.region(32) {\n        core.construct(open_ticket(1))\n            on ok(ticket) then {\n                core.print(ticket.id)\n            }\n            on error then {\n                return 0\n            }\n    } else {\n        with(1002)\n    }\n    return 0\n}\n",
+    );
+}
+
+/// A standalone result handler formats and reparses with scoped block arms.
+#[test]
+fn ordinary_result_blocks_keep_arm_indentation() {
+    assert_format(
+        "func main returns u64{\n read()\n  on ok(value) then {core.print(value)}\n  on error then {return 0}\nreturn 0}",
+        "func main\n    returns u64\n{\n    read()\n        on ok(value) then {\n            core.print(value)\n        }\n        on error then {\n            return 0\n        }\n    return 0\n}\n",
+    );
+}
+
+/// A qualified batch type keeps compact angle and member punctuation.
+#[test]
+fn batch_parameter_type_formats_as_one_qualified_type() {
+    assert_format(
+        "func scan arg entries Batch < store . Slot > as readonly reference returns u64{return core.len(entries)}",
+        "func scan\n    arg entries Batch<store.Slot> as readonly reference\n    returns u64\n{\n    return core.len(entries)\n}\n",
     );
 }
 

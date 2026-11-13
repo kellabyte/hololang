@@ -8,7 +8,7 @@ planner, but general columns, blocks, codecs, and relative-link structures remai
 design or research work. This note proposes experiments, not new approved syntax
 or a universal representation. Read the [research guide](README.md),
 [specification](../spec.md#9-layouts-encodings-and-collections), and
-[M2 scope](../implementation-plan.md#m2--improve-one-measured-bottleneck-next-native-campaign) first.
+[M2 scope](../implementation-plan.md#m2--first-finite-compiler-improvement-accepted) first.
 
 ## Why layout can matter more than arithmetic
 

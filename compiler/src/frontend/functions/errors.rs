@@ -22,7 +22,10 @@ pub(super) fn lower(
             declaration.span,
         )?;
         if records.contains(&declaration.name)
-            || matches!(declaration.name.as_str(), "u64" | "Bytes" | "Result")
+            || matches!(
+                declaration.name.as_str(),
+                "u64" | "bool" | "Bytes" | "Result"
+            )
             || declarations
                 .insert(declaration.name.as_str(), declaration)
                 .is_some()

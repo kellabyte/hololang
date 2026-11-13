@@ -33,9 +33,8 @@ The output archives exact tool commands, full compiler input/LLVM, source and
 binary identities, output streams, raw samples, and min/median/max. This is an
 experimental checked-IR measurement, not a C/Rust/Goose comparison or a source
 compiler benchmark. Run timing campaigns without concurrent tests/builds.
-Its default output is `build/examples/region-measurement`. Both example outputs
-are disposable build work until deliberately preserved under
-[evidence](../../evidence/README.md); neither command overwrites an existing run.
+Its default output is `build/examples/region-measurement`. Both examples write
+disposable build output and require a fresh output path for each run.
 
 Backing acquisition does not pre-touch every page. First-touch/page-fault costs
 can remain inside construction, and a warmup process does not prepare later
@@ -58,8 +57,8 @@ average, nearest-rank p50/p75/p90/p95/p99/p99.9, min/max, average-based MiB/s, a
 measured allocation/reallocation counts are emitted as JSON. The allocator observer
 delegates unchanged to Rust's system allocator and affects only this example.
 Checksums are black-boxed so token ranges and highlighting categories remain
-observable. Save working records under `build/benchmarks/`; deliberately preserved
-results belong in `evidence/` with exact source/tool identities.
+observable. Save working records under `build/` and retain exact source and
+tool identities with any results kept for comparison.
 
 This is warm resident lexical throughput on one replicated corpus, excluding
 terminal rendering/I/O, theme parsing, cold startup, strict parsing, LLVM, and

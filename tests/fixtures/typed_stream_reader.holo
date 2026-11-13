@@ -2,6 +2,8 @@
 // Two initialized slots hold the latest read and the pending frame. Completed
 // frames own their payloads in a separate bounded batch.
 
+using holo.buffer
+
 // The decoder either needs a larger prefix or rejects a complete bad header.
 error FrameError {
     Truncated(required u64)
@@ -36,35 +38,15 @@ func make_slot
     }
 }
 
-// Read the fresh extent supplied by the positive native refill.
-func extent
-    with noalloc, noblock
-    arg input Bytes as readonly reference
-    returns u64
-{
-    return core.len(input)
-}
-
-// Read one checked byte from a live received prefix.
-func octet
-    with noalloc, noblock
-    arg input Bytes as readonly reference
-    arg index u64 as readonly copy
-    returns u64
-{
-    return input[index]
-}
-
 // Decode only the bytes the caller assembled for this frame. The remainder of
 // the initialized slot can still contain the tail of an earlier frame.
 func decode_frame
     with noblock
     arg input Bytes as readonly reference
-    arg filled u64 as readonly copy
     returns Result<Frame, FrameError>
 {
     // Guard the header before reading its fields.
-    if filled < 3 {
+    if core.len(input) < 3 {
         return error FrameError.Truncated(3)
     }
     // A complete malformed header ends this session without publishing.
@@ -72,7 +54,7 @@ func decode_frame
         return error FrameError.BadMagic
     }
     // The payload length is one byte, so the total extent is at most 258.
-    if filled < core.add_wrapping(3, input[2]) {
+    if core.len(input) < core.add_wrapping(3, input[2]) {
         return error FrameError.Truncated(core.add_wrapping(3, input[2]))
     }
     return ok Frame:
@@ -85,12 +67,11 @@ func decode_frame
 func receive
     with noblock
     arg input Bytes as readonly reference
-    arg filled u64 as readonly copy
     returns Result<Received, FrameError>
 {
     return ok Received:
         channel = 1
-        frame = try decode_frame(input, filled)
+        frame = try decode_frame(input)
 }
 
 // Sum a published payload without retaining a reference beyond the call.
@@ -147,18 +128,14 @@ func main
             limit = remaining
         }
         refill incoming.wire, limit as chunk {
-            let received = extent(chunk)
-            // Copy only this read's fresh bytes into the initialized pending slot.
-            for index in core.range(received) {
-                pending.wire[core.add_wrapping(filled, index)] = octet(chunk, index)
-            }
-            filled = core.add_wrapping(filled, received)
+            // The helper appends exactly the fresh extent lent by this refill.
+            filled = buffer.append(pending.wire, filled, chunk)
 
             let count = core.len(frames)
             let marker = core.used(frame_memory)
             // A positive outcome through 258 is the exact extent needed next.
             // Terminal outcomes use larger values, disjoint from wire lengths.
-            let outcome = core.append(frames, receive(pending.wire, filled))
+            let outcome = core.append(frames, receive(core.prefix(pending.wire, filled)))
                 on ok then 0
                 on Rejected Truncated(needed) then needed
                 on Rejected BadMagic then core.add_wrapping(max_frame, 1)

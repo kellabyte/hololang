@@ -34,8 +34,9 @@ source is `<library-root>/<leaf>.holo` and exposes `public func` declarations. A
 optional `namespace holo.<leaf>` header precedes its functions and must match the
 requested namespace.
 Other helpers are private to that file. Imported files currently contain only
-functions with `u64` results and existing `u64` or readonly borrowed `Bytes`
-argument modes. They can call local functions and checked `core.*` operations.
+functions with `u64`, `bool`, or `Option<u64>` results and copied `u64` or `bool`
+or readonly borrowed `Bytes` arguments. They can call local functions and checked
+`core.*` operations.
 The resolver rejects duplicate `using` directives, bindings that shadow a
 qualifier, and non-regular leaves including symlinks. It assumes a stable trusted library root
 and its parent paths. Source resolution performs no ambient search or dependency
@@ -69,6 +70,25 @@ binds a success value and returns a failure under the enclosing result family.
 present. `on … then` checks all cases or an explicit fallback and evaluates
 just the selected arm. Public families can cross manifest package imports.
 [Runnable dashboard union](../../../tests/fixtures/error_unions/README.md)
+
+An ordinary function can return `Option<u64>` using `Some(value)` or `None`.
+Expression and block handlers cover both cases. [Optional scalar returns](../../../docs/spec.md#optional-scalar-returns)
+
+An ordinary function, including a public library function, can declare
+`returns bool`. A boolean call can be used directly in `if` or `core.assert`,
+captured with immutable `let`, or forwarded by another `returns bool` function.
+Boolean returns and bindings also accept literals and comparisons of `u64`
+values. Ordinary helpers can accept `arg flag bool as readonly copy` and use
+the copied value in conditions, forward it, or save it in an immutable local.
+`and` and `or` evaluate their right operand only when it can change the answer.
+`not` negates its operand. Comparisons bind tighter than `not`, then `and`,
+then `or`. Write `not (expression)` to negate a grouped expression.
+
+`b"..."` describes an exact readonly `Bytes` view over static data. A literal
+can initialize `let`, supply a readonly call argument or the source for
+`core.prefix` and `core.subrange`, and be read with `core.len` or indexing.
+Write printable ASCII directly and use `\\`, `\"`, `\n`, `\r`, `\t`, `\0`,
+or `\xHH` for escaped bytes.
 
 The typed append path also accepts a producer returning
 `Result<Record, E>`. A fresh `return ok Record:` initializes the destination
@@ -109,13 +129,20 @@ consumption and entry cleanup. [Hosted lowering](lower/README.md)
 The current subset admits `u64`, inline `Bytes`, acyclic named records, readonly
 copied scalar helper arguments, pure scalar returns, and fresh record returns into
 append and scoped-local destinations. Record producers additionally admit `Bytes as readonly
-reference` inputs from complete published byte-field projections, live refill
-data bindings, or forwarded producer parameters. `core.len(input)` and
+reference` inputs from published byte-field projections, live refill
+data bindings, local byte views, or forwarded producer parameters. A constructor argument can
+narrow any of these with `core.prefix` or `core.subrange`. `core.len(input)` and
 `input[index]` observe these bounded borrows. Explicit `core.bytes` construction
-initializes owned output. Ordinary
-borrowed functions return scalars and accept readonly byte inputs or writable
-fixed scalar-record state. `core.prefix(field, count)` forms a checked logical
-extent in a byte actual. Main has no arguments, declares `returns u64`, and uses
+initializes owned output. Ordinary borrowed functions return `u64`, `bool`,
+`Option<u64>`, or `Result<u64, E>` and accept readonly or writable byte views, writable fixed
+scalar-record state, and published batch views. `Batch<Record> as readonly reference`
+or `as readwrite reference` lends existing records for the duration of the call.
+Length, cursor iteration, and indexed element borrows use that published prefix.
+Append and reset require the owner. `core.prefix(field, count)` and
+`core.subrange(field, offset, count)` form checked logical views in byte
+arguments. A `let` initialized by either operation captures a readonly view for
+the enclosing block. Its length, indexed bytes, and readonly call arguments use
+the captured bounds. Main has no arguments, declares `returns u64`, and uses
 cleanup-aware `return 0`. Pure and ordinary helpers can satisfy `noalloc` and
 `noblock`. Destination producers acquire storage and can satisfy only `noblock`.
 Unknown calls and contracts reject. Main contracts remain outside this subset.
@@ -129,10 +156,9 @@ effects. Default infix arithmetic is rejected while
 numeric policy remains open. Byte initialization and writes explicitly use
 low-eight-bit narrowing. `let` prevents rebinding; `var` permits scalar or same-root
 reference rebinding. Neither changes path permissions or makes a reference unique.
-Same-batch published-prefix inputs are legal during suffix append. Standalone
-byte views, writable byte parameters, reference returns, and user-owned input
-handles remain outside this subset. Pure scalar templates still take copied
-scalars only.
+Same-batch published-prefix inputs are legal during suffix append. Reference
+returns and user-owned input handles remain outside this subset. Pure scalar
+templates still take copied scalars only.
 Scalar-helper calls in byte-bearing producers retain eager scalar actuals in a
 checked scoped expression, so ignored/repeated parameters preserve input-read
 bounds traps and once-only evaluation. This adds no runtime closure or payload

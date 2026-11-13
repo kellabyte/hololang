@@ -14,8 +14,8 @@ Run these commands from the repository root with matched LLVM tools installed.
 ```sh
 mkdir -p build/examples
 python3 -c 'import gzip; from pathlib import Path; Path("build/examples/hello.gz").write_bytes(gzip.compress(b"hello", compresslevel=9, mtime=42))'
-cargo run --offline -p holo -- build --library-root lib/holo --release \
-  tests/fixtures/gzip_header/main.holo -o build/examples/gzip-header
+cargo run --offline -p holo -- build --locked --release \
+  --package tests/fixtures/gzip_header/holo.toml -o build/examples/gzip-header
 build/examples/gzip-header file build/examples/hello.gz
 ```
 
@@ -53,15 +53,16 @@ Failure to acquire either bounded setup region traps before input is consumed.
 
 [main.holo](main.holo) owns the decoder and driver. Each native read is limited
 to the remaining prefix and writes into the same ten-byte slot. The decoder
-takes a checked readonly view and keeps only scalars across calls. It uses
-[`holo.bytes`](../../../lib/holo/bytes.holo) to join each half of the little-endian
-timestamp, including when a read ends between its octets. Decoding uses checked
-`noalloc` and `noblock` contracts. The driver handles interruption and readiness
-outside the decoder. There is no payload staging or decompression.
+borrows the received bytes and retains scalar fields plus the four timestamp
+octets across calls. Once the prefix is complete, it reads the timestamp with
+[`holo.bytes.read`](../../../lib/holo/bytes/read/integer.holo). Decoding uses
+checked `noalloc` and `noblock` contracts. The driver handles interruption and
+readiness outside the decoder. It reads only the fixed header.
 
 [verify.py](verify.py) compares native files and streams with a Python oracle.
-It also compares LLVM from the program using `holo.bytes` with the same helper compiled
-in the entry file. Pass a new output directory to retain the cases and results.
+It also compares the package's LLVM with a single-file version of the entry
+and its imported `holo.bytes.read` namespace. Pass a new output directory to
+retain the cases and results.
 
 ```sh
 cargo build --offline --release -p holo

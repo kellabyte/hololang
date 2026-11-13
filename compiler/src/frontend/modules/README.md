@@ -26,8 +26,15 @@ A `public struct` with `u64`, `Bytes`, or same-namespace inline record fields
 can be selected as `qualifier.Type` by the application's `core.batch`
 declaration. Each inline child of a public record must also be public.
 A public constructor can return only a public struct from its own namespace.
-Qualified type names in other positions and record-reference parameters remain
-outside this interface.
+An ordinary function can borrow fixed scalar state from a local record or
+an imported public record. Public functions expose only public state schemas.
+The binder uses the same nominal record identity for state, batches, and
+construction.
+
+Public functions may return `bool` or `Option<u64>` without declaring a package type.
+Ordinary public functions may also accept `bool as readonly copy` arguments.
+The binder preserves `Some(...)` in an option return and resolves calls inside
+its payload. Calls named `Some` in other positions follow ordinary lookup.
 
 The same type namespace indexes `error` families across contributors.
 `public error` makes the family available to imported `on` arms. A public

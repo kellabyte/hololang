@@ -3,7 +3,7 @@
 
 CARGO_TARGET_DIR := build/cargo
 
-.PHONY: build hello test clean
+.PHONY: build hello test check archive clean
 
 build:
 	cargo build --locked --release -p holo --target-dir "$(CARGO_TARGET_DIR)"
@@ -13,6 +13,12 @@ hello: build
 
 test:
 	cargo test --locked --workspace --target-dir "$(CARGO_TARGET_DIR)"
+
+check:
+	python3 -B tools/check.py
+
+archive:
+	python3 -B tools/archive.py
 
 # Clean the repository's generated output, even if Cargo uses an override.
 clean:

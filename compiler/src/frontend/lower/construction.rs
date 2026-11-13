@@ -118,7 +118,7 @@ impl Lowerer {
     pub(super) fn construct(
         &mut self,
         subject: &ast::Expr,
-        arms: &[ast::ConstructArm],
+        arms: &[ast::ResultBlockArm],
         span: Span,
         output: &mut Block,
     ) -> Result<(), Diagnostic> {
@@ -222,7 +222,7 @@ impl Lowerer {
     /// The block scope is restored on success and when lowering diagnoses an error.
     fn construct_arm(
         &mut self,
-        arm: &ast::ConstructArm,
+        arm: &ast::ResultBlockArm,
         record: &str,
         family: &str,
     ) -> Result<(ir::ConstructArm, Vec<Span>), Diagnostic> {

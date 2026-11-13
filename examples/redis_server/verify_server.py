@@ -3,7 +3,8 @@
 
 The connected cases use inherited Unix sockets and run without a TCP listener.
 An optional loopback run exercises the installed redis-cli and verifies that
-the Holo table survives successive clients. All generated inputs are bounded.
+the Holo table survives successive clients. Bounded inputs include the bulk
+reply's decimal width transitions.
 """
 
 import argparse
@@ -87,6 +88,13 @@ def fixtures() -> tuple[Case, ...]:
         (b"GET", limit_key),
     ]
     wire = b"".join(request(*command) for command in commands)
+    # Check every decimal digit-width boundary admitted by the value limit.
+    widths = [
+        command
+        for length in (0, 9, 10, 99, 100, VALUE_LIMIT)
+        for command in ((b"SET", b"width", bytes(range(length))), (b"GET", b"width"))
+    ]
+    widths_wire = b"".join(request(*command) for command in widths)
     # The full pipeline exceeds one pending buffer. Responses also distinguish
     # overwritten long, empty, and missing values after input reuse.
     pipeline = commands + [(b"GET", limit_key)] * 20
@@ -110,6 +118,7 @@ def fixtures() -> tuple[Case, ...]:
         Case("empty-stream", (), b""),
         Case("pipeline", (pipeline_wire,), command_replies(pipeline)),
         Case("one-byte-writes", tuple(bytes((byte,)) for byte in wire), command_replies(commands)),
+        Case("decimal-widths", (widths_wire,), command_replies(widths)),
         Case(
             "full-and-overwrite",
             (b"".join(request(*command) for command in full),),

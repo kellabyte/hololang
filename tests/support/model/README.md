@@ -60,9 +60,15 @@ the oracle's temporary argument vector says nothing about native allocations.
 
 Ordinary call inputs capture a record identity or logical byte prefix before
 callee entry. The callee sees only its own bindings. Mutations through state
-handles update the caller's existing model records and survive scalar return.
+handles update the caller's existing model records and survive return. Boolean
+calls and locals retain a Rust `bool` through copied parameters, returns, and conditions.
+Logical operations evaluate the left operand first and skip the right when
+the left determines the result.
 Forwarding preserves the current prefix limit, and the input is unavailable
 once its call frame ends.
+
+A literal borrow retains shared immutable bytes and its narrowed range.
+It needs no live batch and cannot become a write destination.
 
 The model represents typed failures by family and case names and evaluates only
 the selected result arm in a fresh binding scope. It uses no native ordinal or
@@ -73,8 +79,12 @@ adds the initialized record before selecting the Unit arm. Typed byte fields
 reuse the same independent size arithmetic, width checks, and element-by-element
 model as numeric append. The numeric control
 maps independently represented construction failures to its documented statuses.
-`TryLet` binds the semantic success or returns a failure from the ordinary
-model frame before executing subsequent operations. Ordinary and nested
+`BindResult` invokes the helper once and saves its semantic outcome in the
+current lexical scope. Later handlers select an arm from that saved outcome,
+including named cases and scalar error payloads.
+`TryLet` and `TrySaved` bind the semantic success or return a failure from the
+ordinary model frame before executing subsequent operations. The saved form
+reuses the previously evaluated outcome. Ordinary and nested
 construction propagation preserve same-family cases and prepend the declared
 child alias when lifting to an enclosing error union. Construction storage
 failures retain their original identities and reach the append's rollback.

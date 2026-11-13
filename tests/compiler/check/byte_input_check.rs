@@ -197,8 +197,10 @@ fn received_prefix_is_a_lexical_producer_actual() {
         )
     };
     entry(&mut input)[2] = Op::Refill(Refill {
-        reference: "source".into(),
-        path: vec!["data".into()],
+        destination: BytesSource::Field {
+            reference: "source".into(),
+            path: vec!["data".into()],
+        },
         limit: Expr::Const(3),
         data_name: "chunk".into(),
         data_body: vec![copy_received()],

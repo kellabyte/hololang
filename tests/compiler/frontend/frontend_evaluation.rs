@@ -146,6 +146,25 @@ fn static_empty_sum_preserves_an_unused_bounds_failure() {
 }
 
 #[test]
+fn byte_string_index_traps_even_in_an_unused_scalar_argument() {
+    let source = format!(
+        "{HELPERS}\n{}",
+        r#"
+func read arg index u64 as readonly copy returns u64 { return b"abc"[index] }
+func unused arg index u64 as readonly copy returns u64 { return ignore(read(index)) }
+func main returns u64 {
+    core.print(unused(3))
+    return 0
+}
+"#
+    );
+    execute_modes(&source, "", |output, mode| {
+        assert!(!output.status.success(), "{mode}: {output:?}");
+        assert!(output.stdout.is_empty(), "{mode}: {output:?}");
+    });
+}
+
+#[test]
 /// Arguments execute once in written order even when duplicated or ignored by a helper.
 fn helper_arguments_are_ordered_once_and_not_elided() {
     let source = format!(
@@ -422,6 +441,207 @@ fn ordinary_forwarding_does_not_widen_a_prefix() {
             assert!(output.stderr.is_empty(), "{mode}: {output:?}");
         },
     );
+}
+
+#[test]
+/// Nested windows rebase the source and evaluate each bound once in order.
+fn ordinary_subrange_preserves_window_and_actual_order() {
+    let entry = byte_fixture(
+        "core.print(forward(core.subrange(core.subrange(item.data, core.now(), core.now()), 1, 1)))\ncore.print(observe(core.subrange(item.data, 5, 0), ignore(core.now())))\ncore.print(core.now())",
+    )
+    .replace("core.bytes(1, 7)", "core.bytes(5, core.index())");
+    let source = format!("{BORROWED_HELPERS}\n{entry}");
+    for layout in [
+        LayoutMode::Wide,
+        LayoutMode::Derived64,
+        LayoutMode::Compact32,
+    ] {
+        execute_layout(&source, COUNTING_TICK, layout, |output, mode| {
+            assert!(output.status.success(), "{layout:?}/{mode}: {output:?}");
+            assert_eq!(output.stdout, b"2\n7\n4\n", "{layout:?}/{mode}");
+        });
+    }
+}
+
+#[test]
+/// A nested window must fit its input extent, even if the backing is larger.
+fn ordinary_subrange_cannot_escape_parent_window() {
+    let entry = byte_fixture(
+        "core.print(observe(core.prefix(core.subrange(core.prefix(item.data, 0), 0, 1), core.now()), ignore(core.now())))",
+    );
+    execute_modes(
+        &format!("{BORROWED_HELPERS}\n{entry}"),
+        EXITING_TICK,
+        |output, mode| {
+            assert!(!output.status.success(), "{mode}: {output:?}");
+            assert_ne!(output.status.code(), Some(99), "{mode}: {output:?}");
+            assert!(output.stdout.is_empty(), "{mode}: {output:?}");
+        },
+    );
+}
+
+/// A named view evaluates its bounds at binding time, once even when unused.
+#[test]
+fn named_byte_view_checks_its_bounds_before_the_next_statement() {
+    let valid = byte_fixture(
+        "let view = core.prefix(item.data, core.now())\ncore.print(core.len(view))\ncore.print(view[0])\ncore.print(core.now())",
+    );
+    execute_modes(&valid, COUNTING_TICK, |output, mode| {
+        assert!(output.status.success(), "{mode}: {output:?}");
+        assert_eq!(output.stdout, b"1\n7\n2\n", "{mode}");
+    });
+    bounds_first("let view = core.prefix(item.data, 2)\ncore.print(core.now())");
+}
+
+/// A failed writable index traps before the replacement's clock call.
+/// A valid write evaluates its index and eager replacement argument once each.
+#[test]
+fn writable_view_checks_destination_before_replacement() {
+    bounds_first("let readwrite view = core.prefix(item.data, 0)\nview[0] = ignore(core.now())");
+    let valid = byte_fixture(
+        "let readwrite view = core.prefix(item.data, 1)\nview[core.sub_wrapping(core.now(), 1)] = duplicate(core.now())\ncore.print(view[0])\ncore.print(core.now())",
+    );
+    execute_modes(&valid, COUNTING_TICK, |output, mode| {
+        assert!(output.status.success(), "{mode}: {output:?}");
+        assert_eq!(output.stdout, b"0\n3\n", "{mode}");
+    });
+}
+
+#[test]
+/// A wrapped mathematical end is invalid before later actuals or pointer use.
+fn ordinary_subrange_rejects_overflowing_end() {
+    let entry = byte_fixture(
+        "core.print(observe(core.subrange(item.data, 18446744073709551615, 1), ignore(core.now())))",
+    );
+    execute_modes(
+        &format!("{BORROWED_HELPERS}\n{entry}"),
+        EXITING_TICK,
+        |output, mode| {
+            assert!(!output.status.success(), "{mode}: {output:?}");
+            assert_ne!(output.status.code(), Some(99), "{mode}: {output:?}");
+            assert!(output.stdout.is_empty(), "{mode}: {output:?}");
+        },
+    );
+}
+
+/// A writable byte window keeps its bounds when forwarded into a typed helper.
+/// A write through it remains visible after the helper returns a typed failure.
+#[test]
+fn writable_subrange_stores_at_forwarded_offset_on_typed_failure() {
+    let entry = byte_fixture(
+        "let outcome = forward_write(core.subrange(item.data, 1, 2))\n        on ok then 0\n        on Stop then 1\ncore.print(outcome)\ncore.print(item.data[1])\ncore.print(item.data[2])\ncore.print(item.data[3])",
+    )
+    .replace("core.bytes(1, 7)", "core.bytes(4, core.index())");
+    let helpers = r#"
+error WriteError { Stop }
+func write_then_fail arg view Bytes as readwrite reference returns Result<u64, WriteError> {
+    view[0] = 257
+    return error WriteError.Stop
+}
+
+func forward_write arg view Bytes as readwrite reference returns Result<u64, WriteError> {
+    return write_then_fail(core.subrange(view, 1, 1))
+}
+"#;
+    execute_modes(&format!("{helpers}\n{entry}"), "", |output, mode| {
+        assert!(output.status.success(), "{mode}: {output:?}");
+        assert_eq!(output.stdout, b"1\n1\n1\n3\n", "{mode}");
+    });
+}
+
+/// Constructor windows keep the logical extent through nested destination calls.
+/// Tick values also prove scalar actuals and range operands execute in order.
+#[test]
+fn producer_view_preserves_range_and_actual_order() {
+    let source = r#"
+struct Wire { data Bytes }
+struct Frame { first u64; extent u64; data Bytes }
+struct Event { frame Frame }
+error FrameError { Empty }
+
+func wire returns Wire {
+    return Wire { data: core.bytes(6, core.index()) }
+}
+
+func decode arg prefix Bytes as readonly reference arg first u64 as readonly copy
+    returns Result<Frame, FrameError> {
+    if core.len(prefix) == 0 { return error FrameError.Empty }
+    return ok Frame:
+        first = first
+        extent = core.len(prefix)
+        data = core.bytes(core.len(prefix), prefix[core.index()])
+}
+
+func event arg first u64 as readonly copy arg input Bytes as readonly reference
+    arg keep u64 as readonly copy returns Result<Event, FrameError> {
+    return ok Event:
+        frame = try decode(core.prefix(input, keep), first)
+}
+
+func main returns u64 {
+    let source_memory = core.region(256) else { return 0 }
+    let wires = core.batch(source_memory, Wire)
+    let initialized = core.append(wires, wire())
+    core.assert(initialized == 0)
+    let source = core.borrow_readonly(wires, 0)
+    let destination = core.region(256) else { return 0 }
+    let events = core.batch(destination, Event)
+    let status = core.append(events, event(core.now(), core.subrange(source.data, core.now(), core.now()), @keep))
+        on ok then 0
+        on error then 1
+    @observe
+    return 0
+}
+"#;
+    // Ticks 1, 2 and 3 supply the copied value and input window; tick 4
+    // supplies an invalid nested prefix, so the selected error is a trap.
+    let invalid = source
+        .replace("@keep", "core.now()")
+        .replace("@observe", "core.print(status)");
+    execute_modes(&invalid, COUNTING_TICK, |output, mode| {
+        assert!(!output.status.success(), "{mode}: {output:?}");
+        assert!(output.stdout.is_empty(), "{mode}: {output:?}");
+    });
+    let success = source.replace("@keep", "core.sub_wrapping(core.now(), 2)").replace(
+        "@observe",
+        "core.assert(status == 0)\n    let published = core.borrow_readonly(events, 0)\n    core.print(published.frame.first)\n    core.print(published.frame.extent)\n    core.print(published.frame.data[0])\n    core.print(published.frame.data[1])\n    core.print(core.now())",
+    );
+    execute_modes(&success, COUNTING_TICK, |output, mode| {
+        assert!(output.status.success(), "{mode}: {output:?}");
+        assert_eq!(output.stdout, b"1\n2\n2\n3\n5\n", "{mode}");
+    });
+}
+
+/// A trapped view prevents later scalar actuals and destination reservation.
+#[test]
+fn producer_view_rejects_bounds_before_later_actual_and_full_destination() {
+    let source = r#"
+struct Wire { data Bytes }
+struct Frame { value u64 }
+
+func wire returns Wire { return Wire { data: core.bytes(1, 7) } }
+func frame arg input Bytes as readonly reference arg later u64 as readonly copy returns Frame {
+    return Frame { value: later }
+}
+
+func main returns u64 {
+    let source_memory = core.region(64) else { return 0 }
+    let wires = core.batch(source_memory, Wire)
+    let initialized = core.append(wires, wire())
+    core.assert(initialized == 0)
+    let source = core.borrow_readonly(wires, 0)
+    let destination = core.region(0) else { return 0 }
+    let frames = core.batch(destination, Frame)
+    let status = core.append(frames, frame(core.prefix(source.data, 2), core.now()))
+    core.print(status)
+    return 0
+}
+"#;
+    execute_modes(source, EXITING_TICK, |output, mode| {
+        assert!(!output.status.success(), "{mode}: {output:?}");
+        assert_ne!(output.status.code(), Some(99), "{mode}: {output:?}");
+        assert!(output.stdout.is_empty(), "{mode}: {output:?}");
+    });
 }
 
 /// Build one source-owned one-byte payload, then execute the supplied main-body statement.

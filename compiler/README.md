@@ -37,7 +37,6 @@ examples require matched LLVM tools and an OS linker. No legacy code or generate
 artifacts are an implicit build input.
 
 The workspace's [Cargo configuration](../.cargo/config.toml) places Rust build
-output in `build/cargo/`. Example output belongs in `build/examples/`; preserved
-validation and measurement records are indexed separately in
-[evidence](../evidence/README.md). These locations change output organization,
-not the supported language or native code generation.
+output in `build/cargo/`. Example output belongs in `build/examples/`. The
+[implementation plan](../docs/implementation-plan.md) records historical
+validation and measurement results.

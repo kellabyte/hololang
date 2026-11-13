@@ -11,6 +11,9 @@ use crate::frontend::ast::{BinaryOp, Expr, ExprKind, FieldInit, ResultArm, Resul
 use crate::lex::TokenKind;
 use crate::source::{Diagnostic, Span};
 
+/// Comparisons bind tighter than negation, and conjunction binds more loosely.
+const NOT_PRECEDENCE: u8 = 3;
+
 impl Parser<'_> {
     /// Parse one expression, optionally admitting an unparenthesized record literal.
     /// Returns owned syntax or a source-local diagnostic without performing effects.
@@ -21,7 +24,7 @@ impl Parser<'_> {
     }
 
     /// Parse a binding operand with an optional contextual propagation prefix.
-    /// An adjacent identifier starts the direct-call operand; `try(...)`
+    /// An adjacent identifier starts a call or saved-result operand. `try(...)`
     /// remains an ordinary call to preserve existing source.
     pub(super) fn binding_operand(&mut self) -> Result<Expr, Diagnostic> {
         // Only a binding can introduce the finite propagation form.
@@ -56,10 +59,12 @@ impl Parser<'_> {
         // That preserves ordinary calls written with a space in legacy scalar bodies.
         let success_prefix = self.at_word("ok")
             && following.is_some_and(|token| {
-                matches!(token.kind, TokenKind::Ident(_) | TokenKind::Number(_))
-                    || (self.typed_return
-                        && token.kind == TokenKind::Symbol('(')
-                        && keyword.end < token.span.start)
+                matches!(
+                    token.kind,
+                    TokenKind::Ident(_) | TokenKind::Number(_) | TokenKind::Bytes(_)
+                ) || (self.typed_return
+                    && token.kind == TokenKind::Symbol('(')
+                    && keyword.end < token.span.start)
             });
         let error_prefix = self.at_word("error")
             && following.is_some_and(|token| matches!(token.kind, TokenKind::Ident(_)));
@@ -342,7 +347,7 @@ impl Parser<'_> {
     /// Parse left-associative infix operators using precedence climbing.
     /// Each recursive right operand has higher minimum precedence, preserving order.
     fn binary(&mut self, minimum: u8, allow_record: bool) -> Result<Expr, Diagnostic> {
-        let mut left = self.postfix(allow_record)?;
+        let mut left = self.prefix(allow_record)?;
         let mut count = 0;
         // Each iteration consumes an operator/right operand; a line ends a complete expression.
         while let Some((operator, precedence)) = infix(&self.current().kind) {
@@ -357,7 +362,7 @@ impl Parser<'_> {
                     "expression chain exceeds the experimental parser limit",
                 ));
             }
-            self.advance();
+            let operator_span = self.advance().span;
             self.newlines();
             let right = self.nested(|parser| parser.binary(precedence + 1, allow_record))?;
             let span = Span {
@@ -367,6 +372,7 @@ impl Parser<'_> {
             left = Expr {
                 kind: ExprKind::Binary {
                     op: operator,
+                    operator: operator_span,
                     left: Box::new(left),
                     right: Box::new(right),
                 },
@@ -374,6 +380,38 @@ impl Parser<'_> {
             };
         }
         Ok(left)
+    }
+
+    /// Parse contextual negation. An adjacent `not(...)` is still a named call.
+    fn prefix(&mut self, allow_record: bool) -> Result<Expr, Diagnostic> {
+        if !self.at_word("not") {
+            return self.postfix(allow_record);
+        }
+        let operator = self.span();
+        let next = &self.tokens[self.position + 1];
+        let starts_operand = match &next.kind {
+            // `not and ...` and `not or ...` can still start with a local named
+            // `not`. To negate a local named `and` or `or`, group the operand.
+            TokenKind::Ident(name) => !matches!(name.as_str(), "and" | "or" | "else"),
+            TokenKind::Number(_) | TokenKind::Bytes(_) => true,
+            TokenKind::Symbol('(') => operator.end < next.span.start,
+            _ => false,
+        };
+        if !starts_operand {
+            return self.postfix(allow_record);
+        }
+        self.advance();
+        let value = self.nested(|parser| parser.binary(NOT_PRECEDENCE, allow_record))?;
+        Ok(Expr {
+            span: Span {
+                start: operator.start,
+                end: value.span.end,
+            },
+            kind: ExprKind::Not {
+                operator,
+                value: Box::new(value),
+            },
+        })
     }
 
     /// Parse a primary followed by calls, field projections, indexing, or record fields.
@@ -458,6 +496,10 @@ impl Parser<'_> {
         match token.kind {
             TokenKind::Number(value) => Ok(Expr {
                 kind: ExprKind::Number(value),
+                span: token.span,
+            }),
+            TokenKind::Bytes(value) => Ok(Expr {
+                kind: ExprKind::Bytes(value),
                 span: token.span,
             }),
             TokenKind::Ident(name) if name == "true" || name == "false" => Ok(Expr {
@@ -546,18 +588,20 @@ impl Parser<'_> {
 fn infix(kind: &TokenKind) -> Option<(BinaryOp, u8)> {
     // Comparisons bind below bitwise/arithmetic forms; numeric semantics are not selected here.
     Some(match kind {
-        TokenKind::EqualEqual => (BinaryOp::Eq, 1),
-        TokenKind::NotEqual => (BinaryOp::Ne, 1),
-        TokenKind::Symbol('<') => (BinaryOp::Lt, 1),
-        TokenKind::LessEqual => (BinaryOp::Le, 1),
-        TokenKind::Symbol('>') => (BinaryOp::Gt, 1),
-        TokenKind::GreaterEqual => (BinaryOp::Ge, 1),
-        TokenKind::Symbol('^') => (BinaryOp::Xor, 2),
-        TokenKind::Symbol('&') => (BinaryOp::And, 3),
-        TokenKind::Symbol('+') => (BinaryOp::Add, 4),
-        TokenKind::Symbol('-') => (BinaryOp::Sub, 4),
-        TokenKind::Symbol('*') => (BinaryOp::Mul, 5),
-        TokenKind::Symbol('/') => (BinaryOp::Div, 5),
+        TokenKind::Ident(name) if name == "or" => (BinaryOp::LogicalOr, 1),
+        TokenKind::Ident(name) if name == "and" => (BinaryOp::LogicalAnd, 2),
+        TokenKind::EqualEqual => (BinaryOp::Eq, 4),
+        TokenKind::NotEqual => (BinaryOp::Ne, 4),
+        TokenKind::Symbol('<') => (BinaryOp::Lt, 4),
+        TokenKind::LessEqual => (BinaryOp::Le, 4),
+        TokenKind::Symbol('>') => (BinaryOp::Gt, 4),
+        TokenKind::GreaterEqual => (BinaryOp::Ge, 4),
+        TokenKind::Symbol('^') => (BinaryOp::Xor, 5),
+        TokenKind::Symbol('&') => (BinaryOp::And, 6),
+        TokenKind::Symbol('+') => (BinaryOp::Add, 7),
+        TokenKind::Symbol('-') => (BinaryOp::Sub, 7),
+        TokenKind::Symbol('*') => (BinaryOp::Mul, 8),
+        TokenKind::Symbol('/') => (BinaryOp::Div, 8),
         _ => return None,
     })
 }
@@ -591,7 +635,7 @@ fn validate_shape(expression: &Expr) -> Result<(), Diagnostic> {
                 pending.push((left, depth + 1));
                 pending.push((right, depth + 1));
             }
-            ExprKind::Ok(value) | ExprKind::Try(value) => {
+            ExprKind::Not { value, .. } | ExprKind::Ok(value) | ExprKind::Try(value) => {
                 pending.push((value, depth + 1));
             }
             ExprKind::Error { case, payload } => {
@@ -612,6 +656,7 @@ fn validate_shape(expression: &Expr) -> Result<(), Diagnostic> {
                 }
             }
             ExprKind::Number(_)
+            | ExprKind::Bytes(_)
             | ExprKind::Bool(_)
             | ExprKind::Name(_)
             | ExprKind::ErrorFamilyRoot { .. } => {}

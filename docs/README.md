@@ -8,10 +8,12 @@ status reports, or copied conversations.
 |---|---|
 | [spec.md](spec.md) | Language purpose, syntax, identifier naming and diagnostic policy, semantics, decision statuses, and open questions. |
 | [error-handling.md](error-handling.md) | Typed results, `on … then` handling, and `return ok Frame:` construction, including checked append rollback, lowering, and acceptance gates. |
+| [effects.md](effects.md) | Working proposal for scoped operation providers, inferred typed failures, and the rules needed for suspension. |
 | [packages.md](packages.md) | Selected `holo` standard-library prefix, file-scoped `using` directives, and open package design. The specification records decision statuses. |
 | [compiler.md](compiler.md) | Compiler architecture, checked representation, backend boundaries, optimization, and staged testing strategy. |
 | [implementation-plan.md](implementation-plan.md) | Immediate scope, executable milestones, testing/measurement gates, and evidence links. |
 | [milestone-0.1.md](milestone-0.1.md) | Public preview target, bounded RESP2 GET/SET server, and staged acceptance checks. |
+| [releases/unreleased.md](releases/unreleased.md) | Preview release notes, source export, and reproducible verification. |
 | [research.md](research.md) | Primary sources, applicability, limitations, and research directions. |
 | [research/](research/README.md) | Six hardware research notes with worked explanations, Holo applicability, and future prototype plans; these do not define additional language rules. |
 
@@ -50,9 +52,9 @@ compiler.
 Disposable generated output belongs in [build](../README.md#build-output). Cargo's cache is
 under `build/cargo/`, API-example output under `build/examples/`, benchmark work
 under `build/benchmarks/`, and retained failing test inputs under `build/failures/`.
-Preserved runs live separately in [evidence](../evidence/README.md), whose index
-groups the existing campaigns, correctness records, and exploratory probes.
-Cleaning build output must not erase those records.
+The research notes summarize historical measurements. The included tests and
+example verifiers reproduce the current correctness checks.
+[Preview verification](releases/unreleased.md#verification)
 
 ## Boundaries and tradeoffs
 
@@ -62,8 +64,8 @@ Update these together when an approved decision crosses their boundaries. Keep
 implementation status and measured evidence distinct from intended guarantees.
 
 Use the [current source guide](../compiler/src/README.md) for supported features.
-Link archived evidence with its actual labels and conditions, and preserve the
-recorded inputs and results.
+When citing a historical measurement, include the workload and conditions
+needed to interpret it.
 
 Before completing documentation changes, validate local links and anchors,
 balanced code fences, current commands/paths, and consistency of status claims.

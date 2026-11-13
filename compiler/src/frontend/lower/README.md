@@ -12,15 +12,28 @@ bounds check precedes all later actuals. Pure helper calls nested in an actual
 use an eager scalar expression frame. The existing entry and producer paths keep
 their direct captures.
 
+Boolean calls, immutable `let` bindings, and returns use typed boolean IR.
+`if` and `core.assert` test boolean locals and calls directly. Comparisons
+capture the left operand before evaluating the right. Boolean calls reuse the
+same ordered actuals and byte-borrow checks as other ordinary calls.
+Copied boolean parameters use immutable bindings, with each boolean actual
+evaluated in written argument order.
+Operands of `and` and `or` keep comparison and call-argument evaluation within
+the boolean expression so an unselected operand cannot run or trap.
+
 `hosted.rs` lowers send, readiness, next session, and explicit close to
 entry operations with immutable scalar statuses. Send holds offset and
-count inside the operation so the byte projection is captured before
+count inside the operation so the field or named byte view is captured before
 their evaluation. A lexical TCP binding resolves to a distinct checked
 owner identity. Explicit refill, send, and readiness wrap the existing
 operation with that identity and keep the wrapper and underlying attempt
 at one source position. Refill outcomes retain their separate scope
 positions. The checker controls where the host owner can bind and whether
 each attempt or consuming close uses a live binding.
+
+`results.rs` resolves ordinary typed calls and checks the same nominal outcome
+partition for expression and block arms. A standalone block handler lowers
+each arm into a fresh scope with its own active payload and operation spans.
 
 `construction.rs` lowers entry's `core.construct(region, producer(...))`
 into one checked operation with ordered outcome blocks. Each block has its
@@ -42,12 +55,23 @@ declared case. `on ok` discards the success value, `on ok(value)` binds it
 immutably, and `on ok(_)` explicitly discards it. Named error arms can bind
 their payload or discard it with `_`. Actual arguments and arm expressions
 stay inside the checked result node, so selecting an arm cannot execute
-another arm's prelude. Boolean literal arms can initialize a condition with
-`let`.
+another arm's prelude. Boolean literal arms can initialize a boolean with
+`let` or form the return value of an ordinary boolean function.
+
+Optional scalar returns use the same checked tag and payload representation.
+Source lowering checks `Some` and `None` exhaustiveness and keeps optional
+returns distinct from named error families and `try`.
+An immutable `let` captures a direct `Result<u64, E>` or `Option<u64>` call.
+Expression and statement handlers on that local use its original nominal
+outcome identity and the same coverage rules as immediate handlers.
+Returning the local forwards the captured outcome when its nominal identity
+matches the enclosing function's return type.
+
 An immutable `let value = try call(...)` in a scalar-result function lowers to
-one ordered call with a success binding and an ordinary failure return. The
-actuals resolve before the binding is visible. Entry and plain scalar helpers
-have no propagation exit. Typed record constructors support a separate
+one ordered call with a success binding and an ordinary failure return.
+`let value = try saved` reuses the outcome captured by an earlier binding.
+Both resolve their operand before introducing the success binding.
+Typed record constructors support a separate
 `try` in nested destination fields, including declared direct child families.
 
 A typed destination append uses the existing named batch and ordered actuals.
@@ -59,18 +83,20 @@ Entry can bind a `u64` or boolean-literal decision with `let`. Direct entry
 `return core.append(...)` permits literal zero in every arm and uses the same
 cleanup as `return 0`.
 
-Destination-producer calls use typed scalar and readonly-byte arguments. Byte
-actuals can name complete payload projections through live record references.
-A refill data branch can also lend its received name directly to a readonly
-`Bytes` parameter in a synchronous ordinary call, append, or scoped
-construction. The received
-binding cannot escape as a local value. Source-order scalar captures precede
-the emitted append. Published field descriptor metadata loads can occur inside
-append because allowed argument effects cannot rebind caller roots/projections
-or resize payloads, and validated descriptor resolution cannot fail. This
-preserves source observations without adding a runtime descriptor-binding layer.
-The checker independently validates the originating live root and field kind
-or verifies the fresh refill capability in its lexical scope.
+Destination-producer calls use typed scalar and readonly byte arguments. A
+live published field, received prefix, local byte view, or forwarded readonly
+parameter supplies the input. `core.prefix` and `core.subrange` narrow its
+initialized extent. An append with a range expression keeps all actuals in the
+call so a bounds trap precedes later argument work and destination reservation.
+The receiving slot is selected before deferred actuals are evaluated, as in
+scoped construction.
+
+An explicit range expression can initialize a readonly `let` view or a writable
+`let readwrite` view in entry or an ordinary helper. Lowering records the source
+and range operands in one binding operation. Later indexing, length queries,
+and call arguments use that captured extent. Stores through a writable view
+check the destination before evaluating the replacement. The checker retains
+the original storage root and enforces the view's lexical lifetime and access.
 
 The output is ordinary unchecked construction IR; `SourceProgram::check` invokes
 the existing access/lifetime checker. No second memory model or runtime ownership

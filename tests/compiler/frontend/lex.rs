@@ -47,6 +47,35 @@ fn crlf_and_line_comments_preserve_newlines() {
     assert_eq!(tokens[1].span.end - tokens[1].span.start, 2);
 }
 
+#[test]
+fn byte_strings_decode_explicit_bytes_and_preserve_source_ranges() {
+    let source = r#"b"A\"\\\n\r\t\0\xFF\x80F" b"" "é""#;
+    let tokens = lex(source).unwrap();
+    assert_eq!(
+        tokens[0].kind,
+        TokenKind::Bytes((&b"A\"\\\n\r\t\x00\xff\x80F"[..]).into())
+    );
+    assert_eq!(tokens[1].kind, TokenKind::Bytes([].into()));
+    assert_eq!(tokens[2].kind, TokenKind::Text("é".into()));
+    assert_eq!(
+        &source[tokens[0].span.start..tokens[0].span.end],
+        r#"b"A\"\\\n\r\t\0\xFF\x80F""#
+    );
+    for (literal, message) in [
+        (r#"b"\xA""#, "two hexadecimal digits"),
+        (r#"b"\xG1""#, "two hexadecimal digits"),
+        (r#"b"\a""#, "unsupported byte string literal escape"),
+        ("b\"é\"", "printable ASCII"),
+        ("b\"\u{7f}\"", "printable ASCII"),
+        ("b\"\t\"", "printable ASCII"),
+        ("b\"missing", "unterminated byte string literal"),
+    ] {
+        let error = lex(literal).unwrap_err();
+        assert!(error.message.contains(message), "{error:?}");
+        assert_eq!(&literal[error.span.start..error.span.end], literal);
+    }
+}
+
 /// Nested comments are iterative and preserve boundaries needed for statement parsing.
 #[test]
 fn nested_block_comments_keep_internal_boundaries() {

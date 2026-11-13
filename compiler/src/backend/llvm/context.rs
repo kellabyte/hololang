@@ -14,8 +14,15 @@ use crate::layout::LayoutPlan;
 
 use super::{
     byte_sum, cursor_proof, cursor_staging, function::Function, input::Input,
-    staging_slots::StableStaging, storage, uniform_batch,
+    literal::ByteLiterals, staging_slots::StableStaging, storage, uniform_batch,
 };
+
+/// Checked input, physical layout, and literal pool shared during module emission.
+pub(super) struct Module<'a> {
+    pub(super) program: &'a Program,
+    pub(super) layout: &'a LayoutPlan,
+    pub(super) byte_literals: ByteLiterals,
+}
 
 /// Native storage associated with a checked lexical binding.
 #[derive(Clone)]
@@ -24,11 +31,27 @@ pub(super) enum Binding {
     Scalar(String),
     /// Immutable scalar selected from a result's success arm, already in SSA.
     ScalarValue(String),
+    /// Immutable boolean in its native i1 representation.
+    Boolean(String),
+    /// Immutable result with its payload and tag captured in SSA.
+    SavedResult {
+        /// Captured tag and payload.
+        value: String,
+        /// Checked family used for explicit propagation.
+        family: String,
+    },
     /// Pointer and exact native count of the current lexical received view.
     Received {
         /// Start of the checked destination byte field.
         contents: String,
         /// Positive native byte count already checked against the request.
+        len: String,
+    },
+    /// Byte view captured by a lexical declaration. Access is checked before lowering.
+    ByteView {
+        /// Address captured after evaluating the view's bounds.
+        contents: String,
+        /// Logical byte extent captured at the declaration.
         len: String,
     },
     /// Initialized region metadata stored in a fixed entry slot.
@@ -43,6 +66,13 @@ pub(super) enum Binding {
         region: String,
         /// Optional extent proof for all records this lexical batch publishes.
         shape: Option<uniform_batch::Shape>,
+    },
+    /// A synchronous view of the owner's published records.
+    BorrowedBatch {
+        /// Captured publication boundary, with no metadata or owner pointer.
+        prefix: BatchPrefix,
+        /// Checked logical record name.
+        record: String,
     },
     /// Rebindable element reference and its established record schema.
     Reference {
@@ -62,6 +92,17 @@ pub(super) enum Binding {
         /// Checked logical record name.
         record: String,
     },
+}
+
+/// Native operands describing one captured published batch prefix.
+#[derive(Clone)]
+pub(super) struct BatchPrefix {
+    /// First byte of the prefix, or its undereferenced empty boundary.
+    pub(super) contents: String,
+    /// Byte distance to the captured end of the prefix.
+    pub(super) extent: String,
+    /// Published record count at capture.
+    pub(super) count: String,
 }
 
 /// One active lexical cleanup, with operands captured at scope acquisition.
@@ -96,6 +137,8 @@ pub(super) struct Lowering<'a> {
     pub(super) f: Function,
     /// Module constants collected from entry-only text output, in emission order.
     pub(super) text_literals: Vec<String>,
+    /// Module-wide deduplicated storage for readonly byte literals.
+    pub(super) byte_literals: &'a ByteLiterals,
     /// Native operands in the current producer, ordinary call, or pure scalar frame.
     pub(super) params: Vec<Input>,
     /// Declared error family of the ordinary function receiving a `try` failure.
@@ -136,17 +179,13 @@ impl<'a> Lowering<'a> {
     ///
     /// `params` contains the function's typed LLVM operands. The returned context
     /// starts with one empty lexical scope and owns compiler-only maps.
-    pub(super) fn new(
-        program: &'a Program,
-        layout: &'a LayoutPlan,
-        header: String,
-        params: Vec<Input>,
-    ) -> Self {
+    pub(super) fn new(module: &'a Module<'a>, header: String, params: Vec<Input>) -> Self {
         Self {
-            program,
-            layout,
+            program: module.program,
+            layout: module.layout,
             f: Function::new(header),
             text_literals: Vec::new(),
+            byte_literals: &module.byte_literals,
             params,
             result_family: None,
             byte_index: None,
@@ -219,6 +258,46 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Snapshot the published boundary before evaluating the next call actual.
+    /// Forwarding a borrowed view reuses its original three native operands.
+    pub(super) fn capture_batch(&mut self, name: &str) -> BatchPrefix {
+        match self.binding(name) {
+            Binding::Batch { slot, .. } => {
+                let region_slot = storage::member(&mut self.f, "%holo.batch", &slot, 0);
+                let region = self.f.value(format!("load ptr, ptr {region_slot}"));
+                let start_slot = storage::member(&mut self.f, "%holo.batch", &slot, 1);
+                let start = self.f.value(format!("load i64, ptr {start_slot}"));
+                let end_slot = storage::member(&mut self.f, "%holo.batch", &slot, 2);
+                let end = self.f.value(format!("load i64, ptr {end_slot}"));
+                let contents = storage::address_at(&mut self.f, &region, &start);
+                let extent = self.f.value(format!("sub i64 {end}, {start}"));
+                let count = self.load_batch_count(&slot);
+                BatchPrefix {
+                    contents,
+                    extent,
+                    count,
+                }
+            }
+            Binding::BorrowedBatch { prefix, .. } => prefix,
+            _ => unreachable!("checked borrowed batch actual must name a batch"),
+        }
+    }
+
+    /// Return the published count of an owner or the captured count of a view.
+    pub(super) fn batch_count(&mut self, name: &str) -> String {
+        match self.binding(name) {
+            Binding::Batch { slot, .. } => self.load_batch_count(&slot),
+            Binding::BorrowedBatch { prefix, .. } => prefix.count,
+            _ => unreachable!("checked batch length requires a batch"),
+        }
+    }
+
+    /// Read a live owner's current count from compiler-owned metadata.
+    fn load_batch_count(&mut self, batch: &str) -> String {
+        let slot = storage::member(&mut self.f, "%holo.batch", batch, 3);
+        self.f.value(format!("load i64, ptr {slot}"))
+    }
+
     /// Bind a checked record slot, recording only origins the trial can keep stable.
     /// A possible rebind removes the fact conservatively for that name.
     pub(super) fn bind_reference(
@@ -252,10 +331,11 @@ impl<'a> Lowering<'a> {
         if !self.uniform_batch_extents {
             return None;
         }
-        let Binding::Batch { shape, .. } = self.binding(name) else {
-            unreachable!("checked cursor requires a batch");
-        };
-        shape
+        match self.binding(name) {
+            Binding::Batch { shape, .. } => shape,
+            Binding::BorrowedBatch { .. } => None,
+            _ => unreachable!("checked cursor requires a batch"),
+        }
     }
 
     /// Get the constant bound of a checked byte projection through a proved cursor.
@@ -281,6 +361,7 @@ impl<'a> Lowering<'a> {
         // A checked borrow always names a batch.
         match self.binding(name) {
             Binding::Batch { region, .. } => Some(region),
+            Binding::BorrowedBatch { .. } => None,
             _ => unreachable!("checked reference requires a batch"),
         }
     }

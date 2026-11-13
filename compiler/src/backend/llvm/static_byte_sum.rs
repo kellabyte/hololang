@@ -6,7 +6,9 @@
 //! loads and large widths use an outlined helper. Other widths keep their
 //! ordinary call. The selection adds no runtime width dispatch or storage.
 
-use crate::ir::{BytesSource, Expr, Function, FunctionArgument, FunctionParameterKind, Op};
+use crate::ir::{
+    ByteRange, BytesSource, Expr, Function, FunctionArgument, FunctionParameterKind, Op,
+};
 
 use super::{byte_sum, function::Function as NativeFunction};
 
@@ -57,10 +59,15 @@ pub(super) fn select(
     }
     // The literal denotes the logical span, independent of the backing field's
     // published extent. The caller still checks it before evaluating later args.
-    let FunctionArgument::Bytes {
-        prefix: Some(Expr::Const(width)),
-        ..
-    } = args.get(input)?
+    let FunctionArgument::Bytes { ranges, .. } = args.get(input)? else {
+        return None;
+    };
+    let [
+        ByteRange {
+            offset: None,
+            length: Expr::Const(width),
+        },
+    ] = ranges.as_slice()
     else {
         return None;
     };

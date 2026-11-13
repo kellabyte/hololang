@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Compare the maintained Holo request parser with a Python RESP2 oracle.
 
-The generated entry uses the parser declarations from the server source. It
-stages at most 512 initialized bytes, retries after actual bounded file reads,
+The generated package uses the parser declarations from the server source and
+imports the maintained byte and decimal libraries. Its entry stages at most
+512 initialized bytes, retries after actual bounded file reads,
 and prints exact metadata and payload octets. Python owns only fixtures and
 verification. Each invocation retains wire input, commands, and observations.
 """
 
 import argparse
 import json
+import os
 from pathlib import Path
 import random
 import re
@@ -16,6 +18,7 @@ import subprocess
 
 
 SOURCE = Path(__file__).resolve().parent / "src" / "main.holo"
+STDLIB = SOURCE.parents[3] / "lib" / "holo"
 PARSER_BEGIN = "// Parse a bounded RESP2"
 PARSER_END = "// The parser declarations above"
 CAPACITY = 512
@@ -110,7 +113,7 @@ func main
                 return 0
             }
         } else {
-            result = parse_request(request, core.prefix(staged.data, filled), cursor)
+            result = parse_request_status(request, core.prefix(staged.data, filled), cursor)
             // Complete or terminal outcomes can be reported immediately.
             // A short prefix is reported only when its source has ended.
             if result <= 512 {
@@ -310,6 +313,8 @@ def fixtures():
     invalid = {
         "wrong-arity": b"*4\r\n",
         "wrong-command": b"*2\r\n$3\r\nset\r\n",
+        "non-ascii-command": encode_request(b"\xc7ET", b"key"),
+        "nul-in-command": encode_request(b"G\x00T", b"key"),
         "wrong-command-length": b"*2\r\n$4\r\nGETX\r\n",
         "leading-zero": b"*02\r\n",
         "no-digits": b"*\r\n",
@@ -320,7 +325,11 @@ def fixtures():
         "oversized-key": command + b"$33\r\n",
         "oversized-value": b"*3\r\n$3\r\nSET\r\n$0\r\n\r\n$129\r\n",
         "max-length": command + b"$18446744073709551615\r\n",
+        "max-length-awaiting-cr": command + b"$18446744073709551615",
+        "max-length-awaiting-lf": command + b"$18446744073709551615\r",
         "overflow-length": command + b"$18446744073709551616\r\n",
+        "overflow-before-late-cr": command + b"$184467440737095516150X\r\n",
+        "malformed-before-late-cr": command + b"$18446744073709551615X0\r\n",
         "overflow-array": b"*18446744073709551616\r\n",
         "negative-length": command + b"$-1\r\n",
         "pipeline-before-error": valid[3] + command + b"$1\r\naX",
@@ -333,14 +342,14 @@ def fixtures():
     return cases
 
 
-def build_driver(holo, output, driver, layout, mode):
+def build_driver(holo, output, manifest, layout, mode):
     """Build the checked fixture and save the complete compiler observation."""
     directory = output / layout / mode
     directory.mkdir(parents=True)
     executable = directory / "parser"
     command = [
-        str(holo), "build", "--strict-names", "--layout", layout,
-        "-o", str(executable), str(driver),
+        str(holo), "build", "--locked", "--strict-names", "--layout", layout,
+        "-o", str(executable), "--package", str(manifest),
     ]
     # Keep the exact production compiler and switch only its optimization level.
     if mode == "o3":
@@ -363,8 +372,20 @@ def verify(holo, output):
     start, end = source.index(PARSER_BEGIN), source.index(PARSER_END)
     if start >= end:
         raise ValueError(f"{SOURCE}: parser extraction markers are out of order")
-    driver = output / "driver.holo"
-    driver.write_text(source[start:end] + ENTRY)
+    package = output / "driver"
+    sources = package / "src"
+    sources.mkdir(parents=True)
+    (sources / "main.holo").write_text(
+        "using holo.bytes\nusing holo.decimal\n\n" + source[start:end] + ENTRY
+    )
+    manifest = package / "holo.toml"
+    stdlib = json.dumps(os.path.relpath(STDLIB, package), ensure_ascii=False)
+    manifest.write_text(
+        '[package]\nname = "resp_parser_replay"\nversion = "0.1.0"\n'
+        'source = "src"\nentry = "main.holo"\n\n[dependencies]\n'
+        f'holo = {{ path = {stdlib}, version = "^0.1" }}\n'
+    )
+    subprocess.run([str(holo), "lock", "--package", str(manifest)], check=True, timeout=60)
     wires = output / "inputs"
     wires.mkdir()
     cases = {}
@@ -377,7 +398,7 @@ def verify(holo, output):
     # Replay the identical corpus with all supported physical layouts and levels.
     for layout in LAYOUTS:
         for mode in ("o0", "o3"):
-            executable = build_driver(holo, output, driver, layout, mode)
+            executable = build_driver(holo, output, manifest, layout, mode)
             with (executable.parent / "observations.jsonl").open("w") as log:
                 # Record raw stdout/stderr before rejecting any differing result.
                 for name, (tape, expected) in cases.items():

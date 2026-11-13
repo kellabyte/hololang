@@ -129,6 +129,23 @@ impl<'a> Inventory<'a> {
                     }
                     (None, &[])
                 }
+                Op::HandleResult { arms, .. } | Op::HandleSavedResult { arms, .. } => {
+                    // Shadowed payload names and assignments still belong to
+                    // the inventory, even when an arm is unreachable.
+                    for arm in arms {
+                        let local = match &arm.pattern {
+                            crate::ir::ResultPattern::Ok(binding)
+                            | crate::ir::ResultPattern::Fallback(binding)
+                            | crate::ir::ResultPattern::Error { binding, .. } => binding.as_deref(),
+                        };
+                        if local.is_some_and(|name| !self.names.insert(name))
+                            || !self.gather(&arm.body, Some((block, offset)))
+                        {
+                            return false;
+                        }
+                    }
+                    (None, &[])
+                }
                 Op::Scope(body) | Op::Loop(body) => (None, &[body]),
                 Op::If {
                     then_body,
@@ -142,9 +159,13 @@ impl<'a> Inventory<'a> {
                 | Op::WaitOutput { result }
                 | Op::TcpClose { result, .. }
                 | Op::NextSession { result } => (Some(result), &[]),
-                Op::Borrow { name, .. } | Op::Alias { name, .. } | Op::TryLet { name, .. } => {
-                    (Some(name), &[])
-                }
+                Op::Borrow { name, .. }
+                | Op::Alias { name, .. }
+                | Op::LetBool { name, .. }
+                | Op::TryLet { name, .. }
+                | Op::TrySaved { name, .. }
+                | Op::BindResult { name, .. }
+                | Op::BindBytes { name, .. } => (Some(name), &[]),
                 _ => (None, &[]),
             };
             // Unique names rule out a cross-scope alias between proof atoms.
@@ -487,7 +508,7 @@ fn proves_le(
         Compare::Lt | Compare::Le => terms_match(inventory, condition, lhs, rhs, prefix),
         Compare::Gt | Compare::Ge => terms_match(inventory, condition, rhs, lhs, prefix),
         Compare::Eq => equal(inventory, condition, lhs, rhs, prefix),
-        Compare::Ne => false,
+        Compare::Ne | Compare::Truth => false,
     }
 }
 

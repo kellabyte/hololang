@@ -36,14 +36,16 @@ adapter targets macOS and Linux. This example was verified on macOS arm64.
 | 2–3 | Payload length | An unsigned, little-endian length. This worker accepts 0–4,096 bytes. |
 | 4 onward | Payload | Exactly the declared number of octets. |
 
-Read boundaries may occur inside any field. The decoder stores copied header
-octets, the number of body bytes left, and a provisional checksum. It publishes
-a frame only after consuming the full body. Rejected complete frames increment
-one counter, in priority order of oversized body, invalid magic, and unknown
-kind. The worker drains a rejected frame's declared body and resumes at the next
-header. At EOF an incomplete suffix records one truncation and contributes
-neither a frame nor a checksum. The counters and sums use unsigned 64-bit
-wrapping arithmetic.
+Read boundaries may occur inside any field. The decoder reads a contiguous
+length through an exact two-byte view. When a read splits the length, it
+retains the low octet and combines it with the high octet on the next read.
+The decoder stores copied header octets, the number of body bytes left, and a
+provisional checksum. It publishes a frame only after consuming the full body.
+Rejected complete frames increment one counter, in priority order of oversized
+body, invalid magic, and unknown kind. The worker drains a rejected frame's
+declared body and resumes at the next header. At EOF an incomplete suffix
+records one truncation and contributes neither a frame nor a checksum. The
+counters and sums use unsigned 64-bit wrapping arithmetic.
 
 ## Output
 
@@ -65,8 +67,8 @@ The program prints one unsigned decimal value per line, in this order.
 
 The process exits successfully after reporting a terminal outcome. Check line 1
 for input errors and line 11 for EOF truncation. Host admission errors use stderr
-and a nonzero exit status. A failure to obtain the example's two initial bounded
-regions traps before the worker reads input.
+and a nonzero exit status. A failure to obtain any initial bounded region traps
+before the worker reads input.
 
 ## Package layout
 
@@ -74,7 +76,8 @@ The [manifest](holo.toml) selects [`src/main.holo`](src/main.holo) and declares
 the local `holo` dependency. [`telemetry.frame`](src/frame/README.md) spans
 two files. Its validator calls a namespace-private signature helper from
 the decoding file. The decoder selects [`telemetry.wire`](src/wire.holo) with
-`using`. That namespace uses [`holo.bytes`](../../../lib/holo/bytes.holo).
+`using` to combine the octets of a split length. The entry selects
+[`holo.bytes.read`](../../../lib/holo/bytes/read/cursor.holo) for its cursor.
 
 `--locked` verifies the selected dependency version and source content
 against [`holo.lock`](holo.lock). Refresh the lock after reviewing an intended
@@ -89,12 +92,15 @@ cargo run --offline -p holo -- lock \
 
 `main.holo` owns the decoder state and retry policy. `decode_chunk` takes a
 checked readonly reference to the current prefix and an explicit writable
-reference to parser state. The decoder and its byte helper
-carry checked `noalloc` and `noblock` contracts. The host read is an external
-effect in `main`. Interruption is retried explicitly. A nonblocking stream that
-reports would-block takes the explicit readiness wait, then retries the read.
-There is one native read attempt per refill. No user-space staging buffer,
-payload copy, or per-frame allocation is needed in this example.
+reference to parser state. It resets a reusable cursor for each prefix.
+`read.take_u16_le` advances by two bytes when the length field fits. If one
+byte remains, `Short(2)` leaves the cursor at the low octet. The decoder
+copies that octet and completes the field with the first byte of the next
+refill. The decoder and its byte helper carry checked `noalloc` and `noblock`
+contracts. `main` retries interruptions and waits for readiness after
+would-block. Each refill makes one native read attempt and reuses its input
+slot. The worker reads accepted payload bytes in place and drains rejected
+bodies by their extents.
 
 `verify.py` compares the executable with an independent whole-wire oracle. It
 exercises files, fragmented nonblocking socketpairs, EOF, rejection precedence,

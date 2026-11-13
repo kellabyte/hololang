@@ -87,8 +87,10 @@ pub struct Function {
 pub struct Argument {
     /// Local parameter name.
     pub name: String,
-    /// Declared type identifier.
+    /// Declared type identifier or canonical `Batch<Record>` spelling.
     pub ty: String,
+    /// Complete type span, including brackets and the qualified record if present.
+    pub type_span: Span,
     /// Access spelling, currently readonly or readwrite.
     pub access: String,
     /// Passing spelling, currently copy or reference.
@@ -115,6 +117,8 @@ pub enum StatementKind {
         name: String,
         /// Whether source reassignment is permitted.
         mutable: bool,
+        /// Whether the binding explicitly requests a writable byte view.
+        writable_view: bool,
         /// Initializer evaluated once.
         value: Expr,
         /// Explicit acquisition recovery, when supported by the initializer.
@@ -136,7 +140,14 @@ pub enum StatementKind {
         /// Written core call containing the constructor and any explicit region.
         subject: Expr,
         /// Outcome arms in source order.
-        arms: Vec<ConstructArm>,
+        arms: Vec<ResultBlockArm>,
+    },
+    /// Call one ordinary fallible function and execute its selected outcome block.
+    HandleResult {
+        /// The written call, evaluated before any arm bindings exist.
+        subject: Expr,
+        /// Outcome arms in source order.
+        arms: Vec<ResultBlockArm>,
     },
     /// Body return; supported roles are checked by lowering.
     Return(Expr),
@@ -213,8 +224,17 @@ pub struct Expr {
 pub enum ExprKind {
     /// Exact unsigned integer literal.
     Number(u64),
-    /// Boolean literal for conditions.
+    /// Readonly byte string with its decoded contents.
+    Bytes(std::sync::Arc<[u8]>),
+    /// Boolean literal.
     Bool(bool),
+    /// Boolean negation with the original prefix location for formatting.
+    Not {
+        /// The contextual `not` word.
+        operator: Span,
+        /// Operand evaluated once.
+        value: Box<Expr>,
+    },
     /// Lexical or declared name.
     Name(String),
     /// Namespace-local family spelling in a bound error case path.
@@ -276,6 +296,8 @@ pub enum ExprKind {
     Binary {
         /// Parsed operator.
         op: BinaryOp,
+        /// Written operator token span.
+        operator: Span,
         /// First operand.
         left: Box<Expr>,
         /// Second operand.
@@ -294,9 +316,9 @@ pub struct ResultArm {
     pub span: Span,
 }
 
-/// One construction outcome and its lexical block.
+/// One statement handler outcome and its lexical block.
 #[derive(Clone, Debug)]
-pub struct ConstructArm {
+pub struct ResultBlockArm {
     /// Active alternative selected by the arm.
     pub pattern: ResultPattern,
     /// Statements that run only on this alternative.
@@ -342,6 +364,10 @@ pub struct FieldInit {
 /// Parsed infix operators; presence here does not choose source arithmetic policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BinaryOp {
+    /// Short-circuit boolean disjunction.
+    LogicalOr,
+    /// Short-circuit boolean conjunction.
+    LogicalAnd,
     /// Equality.
     Eq,
     /// Inequality.

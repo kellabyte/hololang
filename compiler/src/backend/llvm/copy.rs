@@ -7,10 +7,13 @@
 
 use std::collections::HashMap;
 
+use super::{
+    context::{Lowering, Module},
+    function::Function,
+    input::Input,
+    storage,
+};
 use crate::ir::{Binary, Build, Expr, Program};
-use crate::layout::LayoutPlan;
-
-use super::{context::Lowering, function::Function, input::Input, storage};
 
 /// Maximum byte count in the initial macOS arm64 code generation policy.
 ///
@@ -234,16 +237,15 @@ pub(super) fn dispatch(
 
 /// Generate the shared original checked loop for a rejected contiguous range.
 ///
-/// `program` and `layout` are the active checked context. The helper receives the
-/// same destination, length, input descriptor and offset as the original byte
+/// The helper receives the same destination, length, input descriptor and offset
+/// as the original byte
 /// initializer. It uses that emitter's wrapping index, per-byte check and store
 /// sequence. A late invalid index still traps after the valid preceding writes.
 /// The cold, non-inlined function avoids duplicating this failure path in the
 /// surrounding producer and introduces no region allocation or foreign calls.
-pub(super) fn checked_loop(program: &Program, layout: &LayoutPlan) -> String {
+pub(super) fn checked_loop(module: &Module<'_>) -> String {
     let mut lowering = Lowering::new(
-        program,
-        layout,
+        module,
         "define internal void @holo.copy.checked(ptr %dst, ptr %input, i64 %extent, i64 %length, i64 %offset) cold noinline"
             .to_owned(),
         vec![

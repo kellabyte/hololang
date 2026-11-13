@@ -1,0 +1,8 @@
+[package]
+name = "gzip_header"
+version = "0.1.0"
+source = "."
+entry = "main.holo"
+
+[dependencies]
+holo = { path = "../../../lib/holo", version = "^0.1" }

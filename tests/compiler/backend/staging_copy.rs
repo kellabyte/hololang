@@ -264,7 +264,8 @@ fn stable_staging_slots_preserve_tiny_copy_and_empty_outer_loop() {
 }
 
 /// A cursor shadow or reference assignment can select a different source.
-/// The stable-slot mode must retain the established guarded loop in either case.
+/// The stable-slot mode must retain the guarded loop when a saved error
+/// selects the assignment.
 #[test]
 fn stable_staging_slots_reject_cursor_shadow_and_rebind() {
     let cursor = fixture(
@@ -300,8 +301,16 @@ fn stable_staging_slots_reject_cursor_shadow_and_rebind() {
 "#,
     )
     .replace("let src =", "var src =");
+    let saved_error = format!(
+        "error LookupError {{ Changed(seed u64) }}\n\
+         func selected returns Result<u64, LookupError> {{ return error LookupError.Changed(40) }}\n{}",
+        rebound.replace(
+            "src = next",
+            "let choice = selected()\n        choice\n            on ok then {}\n            on Changed(seed) then { if seed == 40 { src = next } }",
+        )
+    );
     // Each case uses the existing per-transfer fallback, even on the trial's target.
-    for (source, expected) in [(&cursor, 100), (&rebound, 45)] {
+    for (source, expected) in [(&cursor, 100), (&rebound, 45), (&saved_error, 45)] {
         let parsed = parse_experimental(source).unwrap();
         let checked = parsed.check().unwrap();
         assert_eq!(model::run(parsed.program()).unwrap(), [expected]);

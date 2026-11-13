@@ -42,23 +42,32 @@ These commands return `OK`, `Holo`, and a nil reply, respectively.
 ## Implementation
 
 The Holo entry parses one command at a time from a 512-byte pending buffer.
-It reads again only when the current command needs more data. A complete
-request records its consumed extent and the offsets of its key and value.
+It handles the parser's named outcomes directly and reads again when the
+current command needs more data. A complete request records its consumed
+extent and the offsets of its key and value.
 The input buffer can be reused after `SET` copies into a fixed slot.
-Overwrites reuse the selected slot. A reply owns its bytes until the send
-cursor reaches its end.
+Overwrites reuse the selected slot. Each send attempt uses a readonly view of
+the finished reply and starts at the number of bytes already sent. The output
+slot stays live until the reply is complete or the session ends.
 
-The entry requests 2,048 bytes for input and output buffers, 64 for the request
-record, and 4,096 for the table. These are logical backing capacities.
-Refill copies the received bytes into the pending slot. A successful `SET`
+The entry requests 1,024 bytes for input and output buffers, 16 for the byte
+writer cursor, 64 for the request record, and 4,096 for the table. These are
+logical backing capacities.
+`holo.buffer` compacts unread bytes before a refill when necessary. Each refill
+writes directly into a writable view of the pending buffer's free tail and
+advances its live length by the received count. A successful `SET`
 copies into a table slot and `GET` copies the live value into the reply slot.
 The entry reuses those allocations across requests and connections. The
 native host supplies the socket operations. Holo implements parsing, table
-storage, and reply formatting. [Milestone scope](../../docs/milestone-0.1.md)
+storage, and reply formatting. Request lengths use `holo.decimal` and bulk
+replies use the bounded cursor in `holo.bytes.write`. The session loop handles
+send progress, readiness, and session changes through typed `holo.net` results.
+[Milestone scope](../../docs/milestone-0.1.md)
 
 `SET` replies `+OK`. A successful `GET` sends the logical value as a bulk
-string, including a zero-length bulk for an empty stored value. A missing key
-returns a nil bulk string. Simple error replies have the form `-ERR n` with
+string, including a zero-length bulk for an empty stored value. The lookup
+returns `None` for a missing key, which the handler sends as a nil bulk string.
+Simple error replies have the form `-ERR n` with
 the standard CRLF terminator.
 
 | Code | Meaning | Session behavior |

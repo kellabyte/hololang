@@ -1,0 +1,12 @@
+format = 1
+root = "gzip_header"
+
+[root_dependencies.holo]
+path = "../../../lib/holo"
+version = "^0.1"
+
+[[package]]
+name = "holo"
+version = "0.1.0"
+source = "../../../lib/holo/holo.toml"
+sha256 = "4fcc3646a7eabe502a1a96d85cc39644aa2bad78c96b99f0df0217645deebb31"

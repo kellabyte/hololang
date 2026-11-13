@@ -7,7 +7,7 @@
 
 use crate::ir::{
     ErrorFamily, Expr, Function, FunctionArgument, FunctionParameterKind, Op, ResultArm,
-    ResultPattern, ResultValue,
+    ResultBlockArm, ResultPattern, ResultValue,
 };
 
 use super::{
@@ -91,7 +91,7 @@ fn direct_branch(body: &[Op]) -> Option<(&[Op], &ResultValue)> {
 
 /// Charge only the active scalar of a return with a statically known alternative.
 ///
-/// A forwarding call needs a runtime discriminant and remains on the normal ABI.
+/// Forwarded outcomes have a runtime discriminant and use the normal ABI.
 fn direct_result_cost(outcome: &ResultValue, budget: &mut usize) -> Option<()> {
     match outcome {
         ResultValue::Ok(value)
@@ -100,7 +100,7 @@ fn direct_result_cost(outcome: &ResultValue, budget: &mut usize) -> Option<()> {
             ..
         } => direct_scalar_cost(value, budget),
         ResultValue::Error { payload: None, .. } => Some(()),
-        ResultValue::Call { .. } => None,
+        ResultValue::Call { .. } | ResultValue::Saved(_) => None,
     }
 }
 
@@ -159,6 +159,7 @@ impl Lowering<'_> {
                 }
             }
             ResultValue::Call { function, args } => self.ordinary_call(function, args),
+            ResultValue::Saved(name) => self.saved_result(name),
         };
         self.f.line(format!("ret {RESULT_TYPE} {result}"));
         let continuation = self.f.fresh_label();
@@ -179,62 +180,27 @@ impl Lowering<'_> {
         if let Some((steps, tail)) = direct_shape(function) {
             return self.handle_direct(function, args, arms, steps, tail);
         }
-        self.handle_tagged(index, function, args, arms)
+        let result = self.ordinary_call_resolved(index, function, args);
+        self.handle_tagged(&result, arms)
     }
 
-    /// Call through the ordinary result ABI, then dispatch on the returned tag.
+    /// Dispatch on the tag already captured by an immutable result binding.
+    pub(super) fn handle_saved_result(&mut self, name: &str, arms: &[ResultArm]) -> String {
+        let result = self.saved_result(name);
+        self.handle_tagged(&result, arms)
+    }
+
+    /// Dispatch on the tag of an evaluated result.
     ///
     /// The selected arm's i64 is an SSA merge, with no extra scalar slot.
-    fn handle_tagged(
-        &mut self,
-        index: usize,
-        function: &Function,
-        args: &[FunctionArgument],
-        arms: &[ResultArm],
-    ) -> String {
-        let result = self.ordinary_call_resolved(index, function, args);
-        let tag = self
-            .f
-            .value(format!("extractvalue {RESULT_TYPE} {result}, 1"));
-        let join = self.f.fresh_label();
-        let labels: Vec<_> = arms.iter().map(|_| self.f.fresh_label()).collect();
-        // A fallback covers residual errors; without one the checked tags are complete.
-        let fallback = arms
-            .last()
-            .is_some_and(|arm| matches!(arm.pattern, ResultPattern::Fallback(_)));
-        let default = if fallback {
-            labels.last().expect("fallback has a block").clone()
-        } else {
-            self.f.fresh_label()
-        };
-        self.f.line(format!("switch i8 {tag}, label %{default} ["));
-        // Only explicitly selected alternatives appear as switch cases.
-        for (arm, label) in arms.iter().zip(&labels) {
-            let case = match &arm.pattern {
-                ResultPattern::Ok(_) => 0,
-                ResultPattern::Error { family, case, .. } => self.error_tag(family, case),
-                ResultPattern::Fallback(_) => continue,
-            };
-            self.f.line(format!("  i8 {case}, label %{label}"));
-        }
-        self.f.line("]");
-        // An unrecognized tag cannot enter a checked exhaustive handler.
-        if !fallback {
-            self.f.label(&default);
-            self.f.line("unreachable");
-        }
+    fn handle_tagged(&mut self, result: &str, arms: &[ResultArm]) -> String {
+        let (labels, join) = self.result_dispatch(result, arms.iter().map(|arm| &arm.pattern));
         let mut incoming = Vec::with_capacity(arms.len());
         // Each arm has independent bindings and only its selected payload is available.
         for (arm, label) in arms.iter().zip(&labels) {
             self.f.label(label);
             self.push_scope();
-            // A discarded payload needs no extraction, including on a fallback edge.
-            if let Some(name) = payload_binding(&arm.pattern) {
-                let value = self
-                    .f
-                    .value(format!("extractvalue {RESULT_TYPE} {result}, 0"));
-                self.bind(name, Binding::ScalarValue(value));
-            }
+            self.bind_result_payload(result, &arm.pattern);
             let value = self.expression(&arm.value);
             self.pop_scope();
             // A nested handler can finish in its own join rather than this arm's first block.
@@ -243,6 +209,94 @@ impl Lowering<'_> {
         }
         self.f.label(&join);
         self.f.value(format!("phi i64 {}", incoming.join(", ")))
+    }
+
+    /// Run the active statement arm in its own scope, then continue at the join.
+    /// Returns inside an arm use the enclosing function's normal cleanup path.
+    pub(super) fn handle_result_blocks(
+        &mut self,
+        function: &str,
+        args: &[FunctionArgument],
+        arms: &[ResultBlockArm],
+    ) {
+        let (index, function) = self.ordinary_definition(function);
+        let result = self.ordinary_call_resolved(index, function, args);
+        self.handle_tagged_blocks(&result, arms);
+    }
+
+    /// Run the selected block from a saved result.
+    pub(super) fn handle_saved_result_blocks(&mut self, name: &str, arms: &[ResultBlockArm]) {
+        let result = self.saved_result(name);
+        self.handle_tagged_blocks(&result, arms);
+    }
+
+    /// Reuse the captured result without reading mutable storage or calling again.
+    fn saved_result(&self, name: &str) -> String {
+        let Binding::SavedResult { value, .. } = self.binding(name) else {
+            unreachable!("checked result local has wrong lowering kind");
+        };
+        value
+    }
+
+    /// Run the selected block using the existing result and lexical cleanup.
+    fn handle_tagged_blocks(&mut self, result: &str, arms: &[ResultBlockArm]) {
+        let (labels, join) = self.result_dispatch(result, arms.iter().map(|arm| &arm.pattern));
+        for (arm, label) in arms.iter().zip(&labels) {
+            self.f.label(label);
+            self.push_scope();
+            self.bind_result_payload(result, &arm.pattern);
+            self.operations(&arm.body);
+            self.pop_scope();
+            self.f.line(format!("br label %{join}"));
+        }
+        self.f.label(&join);
+    }
+
+    /// Emit the common switch for both arm forms after the subject evaluates.
+    fn result_dispatch<'a>(
+        &mut self,
+        result: &str,
+        patterns: impl ExactSizeIterator<Item = &'a ResultPattern> + DoubleEndedIterator + Clone,
+    ) -> (Vec<String>, String) {
+        let tag = self
+            .f
+            .value(format!("extractvalue {RESULT_TYPE} {result}, 1"));
+        let join = self.f.fresh_label();
+        let labels: Vec<_> = (0..patterns.len()).map(|_| self.f.fresh_label()).collect();
+        let fallback = patterns
+            .clone()
+            .next_back()
+            .is_some_and(|pattern| matches!(pattern, ResultPattern::Fallback(_)));
+        let default = if fallback {
+            labels.last().expect("fallback has a block").clone()
+        } else {
+            self.f.fresh_label()
+        };
+        self.f.line(format!("switch i8 {tag}, label %{default} ["));
+        for (pattern, label) in patterns.zip(&labels) {
+            let case = match pattern {
+                ResultPattern::Ok(_) => 0,
+                ResultPattern::Error { family, case, .. } => self.error_tag(family, case),
+                ResultPattern::Fallback(_) => continue,
+            };
+            self.f.line(format!("  i8 {case}, label %{label}"));
+        }
+        self.f.line("]");
+        if !fallback {
+            self.f.label(&default);
+            self.f.line("unreachable");
+        }
+        (labels, join)
+    }
+
+    /// Expose only the active copied payload in the arm where it is named.
+    fn bind_result_payload(&mut self, result: &str, pattern: &ResultPattern) {
+        if let Some(name) = payload_binding(pattern) {
+            let value = self
+                .f
+                .value(format!("extractvalue {RESULT_TYPE} {result}, 0"));
+            self.bind(name, Binding::ScalarValue(value));
+        }
     }
 
     /// Emit a recognized guarded callee into its immediate handler.
@@ -381,7 +435,9 @@ impl Lowering<'_> {
                 ..
             } => Some(self.expression(value)),
             ResultValue::Error { payload: None, .. } => None,
-            ResultValue::Call { .. } => unreachable!("forwarded results use the tagged path"),
+            ResultValue::Call { .. } | ResultValue::Saved(_) => {
+                unreachable!("forwarded results use the tagged path")
+            }
         };
         returns[target].push(DirectReturn {
             block: self.f.current_label().to_owned(),
@@ -418,11 +474,24 @@ impl Lowering<'_> {
             .result
             .as_deref()
             .expect("checked try calls a result function");
+        let result = self.ordinary_call_resolved(index, callee, args);
+        self.try_result(name, source, &result);
+    }
+
+    /// Propagate the captured tag and payload of a checked lexical result.
+    pub(super) fn try_saved_binding(&mut self, name: &str, source: &str) {
+        let Binding::SavedResult { value, family } = self.binding(source) else {
+            unreachable!("checked try operand is a saved result");
+        };
+        self.try_result(name, &family, &value);
+    }
+
+    /// Split success from failure and apply a checked child lift when needed.
+    fn try_result(&mut self, name: &str, source: &str, result: &str) {
         let target = self
             .result_family
             .expect("checked try returns a typed result");
         let offset = self.try_error_offset(source, target);
-        let result = self.ordinary_call_resolved(index, callee, args);
         let tag = self
             .f
             .value(format!("extractvalue {RESULT_TYPE} {result}, 1"));
@@ -441,7 +510,7 @@ impl Lowering<'_> {
                 "insertvalue {RESULT_TYPE} {result}, i8 {lifted}, 1"
             ))
         });
-        let failed = adjusted.as_deref().unwrap_or(&result);
+        let failed = adjusted.as_deref().unwrap_or(result);
         self.f.line(format!("ret {RESULT_TYPE} {failed}"));
         self.f.label(&success);
         let value = self

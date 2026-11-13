@@ -9,9 +9,9 @@
 //! borrowed and partial failed values stay unpublished.
 
 use super::ModelError;
-use super::state::{ByteInput, Input, State};
+use super::state::{ByteInput, ByteOrigin, Input, State};
 use super::value::{Field, Record, Value};
-use holo::ir::{Argument, Build, BytesSource, FieldKind, Parameter};
+use holo::ir::{Access, Argument, Build, ByteRange, BytesSource, FieldKind, Parameter};
 
 /// A recoverable construction failure represented without backend tag numbers.
 #[derive(Debug)]
@@ -315,32 +315,16 @@ impl State<'_> {
                 Argument::Scalar(expression) => {
                     Input::Scalar(self.expression(expression, params, None)?)
                 }
-                Argument::Bytes(BytesSource::Param(position)) => {
-                    let input = self.byte_input(params, *position)?.clone();
-                    self.input_bytes(&input)?;
+                Argument::Bytes(source) => {
+                    let mut input = self.capture_byte_source(source, params)?;
+                    input.access = Access::Readonly;
                     Input::Bytes(input)
                 }
-                Argument::Bytes(BytesSource::Field { reference, path }) => {
-                    // A producer sees only its explicit typed formals. Allowing
-                    // lexical entry names here would bypass its closed effect boundary.
-                    if !self.construction_stack.is_empty() {
-                        return Err(ModelError::new(
-                            "producer byte source must forward an input parameter",
-                        ));
-                    }
-                    let identity = self.reference(reference)?;
-                    let len = match self.projection(reference, path)?.0 {
-                        Value::Bytes(bytes) => bytes.len() as u64,
-                        _ => {
-                            return Err(ModelError::new("byte argument projects a non-byte field"));
-                        }
-                    };
-                    Input::Bytes(ByteInput {
-                        batch: identity.batch,
-                        index: identity.index,
-                        path: path.clone(),
-                        len,
-                    })
+                Argument::ByteView { source, ranges } => {
+                    let mut input = self.capture_byte_source(source, params)?;
+                    input.access = Access::Readonly;
+                    self.narrow_byte_input(&mut input, ranges, params)?;
+                    Input::Bytes(input)
                 }
                 // The memory oracle never executes hosted input, so it cannot
                 // create a fresh native prefix or infer one from backing bytes.
@@ -353,5 +337,82 @@ impl State<'_> {
             values.push(value);
         }
         Ok(values)
+    }
+
+    /// Capture the live root, projection, and initialized extent without reading bytes.
+    pub(super) fn capture_byte_source(
+        &self,
+        source: &BytesSource,
+        params: &[Input],
+    ) -> Result<ByteInput, ModelError> {
+        match source {
+            BytesSource::Literal(bytes) => Ok(ByteInput {
+                origin: ByteOrigin::Literal(bytes.clone()),
+                offset: 0,
+                len: bytes.len() as u64,
+                access: Access::Readonly,
+            }),
+            BytesSource::Param(position) => {
+                let input = self.byte_input(params, *position)?.clone();
+                self.input_bytes(&input)?;
+                Ok(input)
+            }
+            BytesSource::Local(name) => {
+                if !self.construction_stack.is_empty() {
+                    return Err(ModelError::new(
+                        "producer byte source must forward an input parameter",
+                    ));
+                }
+                self.byte_view(name)
+            }
+            BytesSource::Field { reference, path } => {
+                if !self.construction_stack.is_empty() {
+                    return Err(ModelError::new(
+                        "producer byte source must forward an input parameter",
+                    ));
+                }
+                let identity = self.reference(reference)?;
+                let Value::Bytes(bytes) = self.projection(reference, path)?.0 else {
+                    return Err(ModelError::new("byte argument projects a non-byte field"));
+                };
+                Ok(ByteInput {
+                    origin: ByteOrigin::Field {
+                        batch: identity.batch,
+                        index: identity.index,
+                        path: path.clone(),
+                    },
+                    offset: 0,
+                    len: bytes.len() as u64,
+                    access: identity.access,
+                })
+            }
+            BytesSource::Received(_) => Err(ModelError::new(
+                "received view is outside the hosted-free memory model",
+            )),
+        }
+    }
+
+    /// Narrow a captured input using mathematical sums independent of native guards.
+    pub(super) fn narrow_byte_input(
+        &mut self,
+        input: &mut ByteInput,
+        ranges: &[ByteRange],
+        params: &[Input],
+    ) -> Result<(), ModelError> {
+        for range in ranges {
+            let offset = range
+                .offset
+                .as_ref()
+                .map(|offset| self.expression(offset, params, None))
+                .transpose()?
+                .unwrap_or(0);
+            let length = self.expression(&range.length, params, None)?;
+            if u128::from(offset) + u128::from(length) > u128::from(input.len) {
+                return Err(ModelError::new("byte argument bounds trap"));
+            }
+            input.offset += offset;
+            input.len = length;
+        }
+        Ok(())
     }
 }

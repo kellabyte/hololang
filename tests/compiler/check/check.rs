@@ -9,9 +9,10 @@
 
 use holo::check::check;
 use holo::ir::{
-    Access, AppendArm, AppendPattern, Build, Compare, Condition, ConstructArm, ErrorCase,
-    ErrorChild, ErrorFamily, Expr, Field, FieldKind, Function, FunctionArgument, FunctionParameter,
-    FunctionParameterKind, Op, Producer, Program, Record, ResultArm, ResultPattern, ResultValue,
+    Access, AppendArm, AppendPattern, BoolExpr, Build, ByteRange, BytesSource, Compare, Condition,
+    ConstructArm, ErrorCase, ErrorChild, ErrorFamily, Expr, Field, FieldKind, Function,
+    FunctionArgument, FunctionParameter, FunctionParameterKind, Op, Producer, Program, Record,
+    Refill, ResultArm, ResultBlockArm, ResultPattern, ResultValue,
 };
 use holo::ir::{Argument, Parameter};
 use holo::placement::{PlacementError, ScopedPlacement, place_scoped_aggregate};
@@ -136,6 +137,7 @@ fn text_output_rejects_interior_nul_and_helper_effects() {
     helper.body.insert(
         0,
         Op::Function(Function {
+            returns_bool: false,
             name: "write_text".into(),
             params: vec![],
             result: None,
@@ -372,6 +374,361 @@ fn sequential_scan_allows_suffix_append() {
         },
     ]);
     assert!(check(&input).is_ok());
+}
+
+/// A named view pins its root after the scalar bounds have been checked.
+/// Reset succeeds after the reference and all of its views leave their scope.
+#[test]
+fn byte_view_roots_prevent_reset_until_the_scope_ends() {
+    let view = Op::BindBytes {
+        name: "view".into(),
+        source: BytesSource::Field {
+            reference: "item".into(),
+            path: vec!["payload".into()],
+        },
+        access: Access::Readwrite,
+        ranges: vec![ByteRange {
+            offset: None,
+            length: Expr::Const(0),
+        }],
+    };
+    let reset = Op::Reset {
+        batch: "items".into(),
+    };
+    let open_view = vec![borrow("item", Access::Readwrite), view];
+    let mut rejected_body = open_view.clone();
+    rejected_body.push(reset.clone());
+    rejects(&program(rejected_body), "while a reference is live");
+
+    assert!(check(&program(vec![Op::Scope(open_view), reset])).is_ok());
+}
+
+/// Named writable byte views preserve authority through another writable
+/// narrowing, and a readonly narrowing cannot recover that authority.
+#[test]
+fn named_byte_view_access_is_checked_at_each_use() {
+    let view = |name: &str, source, access| Op::BindBytes {
+        name: name.into(),
+        source,
+        access,
+        ranges: vec![ByteRange {
+            offset: None,
+            length: Expr::Const(1),
+        }],
+    };
+    let field = || BytesSource::Field {
+        reference: "item".into(),
+        path: vec!["payload".into()],
+    };
+    let local = |name: &str| BytesSource::Local(name.into());
+    let write = |name: &str| Op::WriteViewByte {
+        name: name.into(),
+        index: Expr::Const(0),
+        value: Expr::Const(255),
+    };
+    let forward = |name: &str| {
+        Op::Print(call(
+            "edit",
+            vec![FunctionArgument::Bytes {
+                source: local(name),
+                ranges: vec![],
+            }],
+        ))
+    };
+    let edit = |kind| {
+        ordinary(
+            "edit",
+            vec![FunctionParameter {
+                name: "bytes".into(),
+                kind,
+            }],
+            vec![
+                view("parameter_view", BytesSource::Param(0), Access::Readwrite),
+                write("parameter_view"),
+                Op::Return(Expr::Const(0)),
+            ],
+        )
+    };
+    let mut writable = program(vec![
+        append("initial"),
+        borrow("item", Access::Readwrite),
+        view("writable", field(), Access::Readwrite),
+        view("nested", local("writable"), Access::Readwrite),
+        write("nested"),
+        forward("nested"),
+    ]);
+    writable
+        .body
+        .insert(0, edit(FunctionParameterKind::WritableBytes));
+    assert!(check(&writable).is_ok());
+    writable.body[0] = edit(FunctionParameterKind::Bytes);
+    rejects(&writable, "Bytes parameter is readonly");
+
+    for use_readonly in [
+        write("readonly"),
+        forward("readonly"),
+        view("upgrade", local("readonly"), Access::Readwrite),
+    ] {
+        let mut input = program(vec![
+            append("initial"),
+            borrow("item", Access::Readwrite),
+            view("writable", field(), Access::Readwrite),
+            view("readonly", local("writable"), Access::Readonly),
+            use_readonly,
+        ]);
+        input
+            .body
+            .insert(0, edit(FunctionParameterKind::WritableBytes));
+        rejects(&input, "local byte view readonly is readonly");
+    }
+
+    let readonly_field = program(vec![
+        append("initial"),
+        borrow("item", Access::Readonly),
+        view("upgrade", field(), Access::Readwrite),
+    ]);
+    rejects(&readonly_field, "reference item is readonly");
+
+    let received = program(vec![
+        append("initial"),
+        borrow("item", Access::Readwrite),
+        Op::Refill(Refill {
+            destination: field(),
+            limit: Expr::Const(1),
+            data_name: "received".into(),
+            data_body: vec![view(
+                "upgrade",
+                BytesSource::Received("received".into()),
+                Access::Readwrite,
+            )],
+            result_name: "status".into(),
+            other_body: vec![],
+        }),
+    ]);
+    rejects(&received, "received view is readonly");
+}
+
+/// Named destinations keep the field identity captured before further narrowing.
+#[test]
+fn hosted_refill_tracks_the_original_field_of_named_views() {
+    let field = |name: &str| BytesSource::Field {
+        reference: "item".into(),
+        path: vec![name.into()],
+    };
+    let local = |name: &str| BytesSource::Local(name.into());
+    let view = |name: &str, source, access| Op::BindBytes {
+        name: name.into(),
+        source,
+        access,
+        ranges: vec![ByteRange {
+            offset: None,
+            length: Expr::Const(1),
+        }],
+    };
+    let refill = |destination, data_body| {
+        Op::Refill(Refill {
+            destination,
+            limit: Expr::Const(1),
+            data_name: "received".into(),
+            data_body,
+            result_name: "status".into(),
+            other_body: vec![],
+        })
+    };
+    let with_destination = |access, destination| {
+        program(vec![
+            append("initial"),
+            borrow("item", Access::Readwrite),
+            view("window", field("payload"), access),
+            refill(destination, vec![]),
+        ])
+    };
+    assert!(check(&with_destination(Access::Readwrite, local("window"))).is_ok());
+    rejects(
+        &with_destination(Access::Readonly, local("window")),
+        "local byte view window is readonly",
+    );
+    rejects(
+        &with_destination(Access::Readwrite, BytesSource::Param(0)),
+        "refill requires a writable Bytes field or a named writable byte view",
+    );
+
+    // Inner refills cannot overwrite a still-live received prefix. Test both
+    // ways of crossing between a field destination and a captured view.
+    for (first, second) in [
+        (field("payload"), local("nested")),
+        (local("nested"), field("payload")),
+        (local("nested"), local("window")),
+    ] {
+        let input = program(vec![
+            append("initial"),
+            borrow("item", Access::Readwrite),
+            view("window", field("payload"), Access::Readwrite),
+            view("nested", local("window"), Access::Readwrite),
+            refill(first, vec![refill(second, vec![])]),
+        ]);
+        rejects(
+            &input,
+            "cannot refill a byte field while its received view is live",
+        );
+    }
+
+    // A captured view keeps its field origin after the source reference is
+    // rebound, and hiding a received name does not end that arm's borrow.
+    let captured = program(vec![
+        append("initial"),
+        borrow("item", Access::Readwrite),
+        borrow("alias", Access::Readwrite),
+        view("window", field("payload"), Access::Readwrite),
+        refill(
+            local("window"),
+            vec![Op::Scope(vec![
+                Op::Let {
+                    name: "received".into(),
+                    value: Expr::Const(0),
+                },
+                Op::AssignRef {
+                    name: "item".into(),
+                    source: "alias".into(),
+                },
+                refill(field("payload"), vec![]),
+            ])],
+        ),
+    ]);
+    rejects(
+        &captured,
+        "cannot refill a byte field while its received view is live",
+    );
+
+    // Two fields of one record are disjoint, including through named views.
+    let mut disjoint = program(vec![
+        append("initial"),
+        borrow("item", Access::Readwrite),
+        view("window", field("payload"), Access::Readwrite),
+        view("sibling", field("other"), Access::Readwrite),
+        refill(local("window"), vec![refill(local("sibling"), vec![])]),
+    ]);
+    disjoint.records[0].fields.push(Field {
+        name: "other".into(),
+        kind: FieldKind::Bytes,
+    });
+    disjoint.producers[0].body.push(Build::Bytes {
+        field: "other".into(),
+        len: Expr::Const(1),
+        value: Expr::Index,
+    });
+    assert!(check(&disjoint).is_ok());
+}
+
+/// A send accepts a live local view with either access mode, and uses its scope.
+#[test]
+fn hosted_send_checks_named_view_lifetime_and_source_kind() {
+    let send = |source| Op::Send {
+        source,
+        offset: Expr::Const(0),
+        count: Expr::Const(1),
+        result: "sent".into(),
+    };
+    let view = |access| Op::BindBytes {
+        name: "view".into(),
+        source: BytesSource::Field {
+            reference: "item".into(),
+            path: vec!["payload".into()],
+        },
+        access,
+        ranges: vec![ByteRange {
+            offset: None,
+            length: Expr::Const(1),
+        }],
+    };
+    for access in [Access::Readonly, Access::Readwrite] {
+        let input = program(vec![
+            append("initial"),
+            borrow("item", access),
+            view(access),
+            send(BytesSource::Local("view".into())),
+        ]);
+        assert!(check(&input).is_ok());
+    }
+
+    let expired = program(vec![
+        append("initial"),
+        borrow("item", Access::Readonly),
+        Op::Scope(vec![view(Access::Readonly)]),
+        send(BytesSource::Local("view".into())),
+    ]);
+    rejects(&expired, "unknown or out-of-scope binding view");
+
+    let wrong_kind = program(vec![
+        Op::Let {
+            name: "view".into(),
+            value: Expr::Const(1),
+        },
+        send(BytesSource::Local("view".into())),
+    ]);
+    rejects(&wrong_kind, "view is not a local byte view");
+
+    let raw_param = program(vec![send(BytesSource::Param(0))]);
+    rejects(
+        &raw_param,
+        "send requires an initialized Bytes field, a named byte view, or a byte literal",
+    );
+}
+
+/// The checked IR must independently stop a readonly prefix from granting a
+/// writable element reference or being forwarded to a writable parameter.
+#[test]
+fn ordinary_batch_views_check_access_without_the_frontend() {
+    let batch_param = |access| FunctionParameter {
+        name: "view".into(),
+        kind: FunctionParameterKind::Batch {
+            record: "Item".into(),
+            access,
+        },
+    };
+    let function = |name: &str, access, body| {
+        Op::Function(Function {
+            returns_bool: false,
+            name: name.into(),
+            params: vec![batch_param(access)],
+            result: None,
+            body,
+        })
+    };
+    let direct = Op::Borrow {
+        name: "element".into(),
+        batch: "view".into(),
+        index: Expr::Const(0),
+        access: Access::Readwrite,
+    };
+    let mut input = program(vec![]);
+    input.body.insert(
+        0,
+        function(
+            "read",
+            Access::Readonly,
+            vec![direct, Op::Return(Expr::Const(0))],
+        ),
+    );
+    rejects(&input, "batch view is readonly");
+
+    input.body[0] = function(
+        "read",
+        Access::Readonly,
+        vec![Op::Return(Expr::Call {
+            function: "update".into(),
+            args: vec![FunctionArgument::Batch("view".into())],
+        })],
+    );
+    input.body.insert(
+        0,
+        function(
+            "update",
+            Access::Readwrite,
+            vec![Op::Return(Expr::Const(0))],
+        ),
+    );
+    rejects(&input, "batch view is readonly");
 }
 
 /// A live sequential cursor blocks reset and enforces its requested access mode.
@@ -674,6 +1031,7 @@ fn measurement_operations_require_live_execution_storage() {
 /// Declare an ordinary helper with explicit parameter bindings and structured body.
 fn ordinary(name: &str, params: Vec<FunctionParameter>, body: Vec<Op>) -> Op {
     Op::Function(Function {
+        returns_bool: false,
         name: name.into(),
         params,
         result: None,
@@ -687,6 +1045,184 @@ fn call(name: &str, args: Vec<FunctionArgument>) -> Expr {
         function: name.into(),
         args,
     }
+}
+
+/// Boolean calls and saved values stay separate from the scalar and result paths.
+#[test]
+fn ordinary_booleans_have_checked_returns_and_conditions() {
+    let predicate = |body| {
+        Op::Function(Function {
+            name: "predicate".into(),
+            params: vec![],
+            result: None,
+            returns_bool: true,
+            body,
+        })
+    };
+    let boolean_call = BoolExpr::Call {
+        function: "predicate".into(),
+        args: vec![],
+    };
+    let mut input = Program {
+        body: vec![
+            predicate(vec![Op::ReturnBool(BoolExpr::Compare(Condition {
+                op: Compare::Lt,
+                left: Expr::Const(1),
+                right: Expr::Const(2),
+            }))]),
+            Op::LetBool {
+                name: "decision".into(),
+                value: boolean_call.clone(),
+            },
+            Op::Assert(Condition::truth(BoolExpr::Local("decision".into()))),
+            Op::Assert(Condition::truth(boolean_call.clone())),
+        ],
+        ..Program::default()
+    };
+    assert!(check(&input).is_ok());
+    let direct = input.body.pop().unwrap();
+    for (operation, diagnostic) in [
+        (
+            Op::Print(call("predicate", vec![])),
+            "cannot be used as an unsigned scalar",
+        ),
+        (
+            Op::Print(Expr::Local("decision".into())),
+            "not a scalar local",
+        ),
+        (
+            Op::BindResult {
+                name: "outcome".into(),
+                function: "predicate".into(),
+                args: vec![],
+            },
+            "must return a typed result",
+        ),
+        (
+            Op::Assert(Condition {
+                op: Compare::Truth,
+                left: Expr::Const(1),
+                right: Expr::Const(0),
+            }),
+            "requires a boolean operand",
+        ),
+        (
+            Op::Assert(Condition::truth(BoolExpr::And(
+                Box::new(BoolExpr::Const(false)),
+                Box::new(BoolExpr::Compare(Condition::truth(BoolExpr::Const(true)))),
+            ))),
+            "expected an unsigned scalar comparison",
+        ),
+    ] {
+        input.body.push(operation);
+        rejects(&input, diagnostic);
+        input.body.pop();
+    }
+    input.body.push(direct);
+    input.body[0] = ordinary("predicate", vec![], vec![Op::Return(Expr::Const(1))]);
+    rejects(&input, "predicate does not return bool");
+    input.body[0] = predicate(vec![Op::Return(Expr::Const(1))]);
+    rejects(&input, "boolean function cannot return an unsigned scalar");
+    input.body[0] = predicate(vec![Op::ReturnBool(BoolExpr::Or(
+        Box::new(BoolExpr::Const(true)),
+        Box::new(boolean_call.clone()),
+    ))]);
+    rejects(&input, "recursive ordinary call graph");
+
+    let mut constructor = program(vec![]);
+    constructor.producers[0].body.insert(
+        0,
+        Build::FailIf(Condition::truth(BoolExpr::Or(
+            Box::new(BoolExpr::Const(true)),
+            Box::new(boolean_call),
+        ))),
+    );
+    rejects(&constructor, "ordinary calls require an execution context");
+}
+
+/// A copied boolean formal consumes a checked boolean value in the caller frame.
+#[test]
+fn ordinary_boolean_arguments_require_boolean_operands() {
+    let definition = ordinary(
+        "inspect",
+        vec![FunctionParameter {
+            name: "enabled".into(),
+            kind: FunctionParameterKind::Bool,
+        }],
+        vec![
+            Op::Assert(Condition::truth(BoolExpr::Local("enabled".into()))),
+            Op::Return(Expr::Const(1)),
+        ],
+    );
+    let mut input = Program {
+        body: vec![
+            definition,
+            Op::Print(call(
+                "inspect",
+                vec![FunctionArgument::Bool(BoolExpr::Const(true))],
+            )),
+        ],
+        ..Program::default()
+    };
+    assert!(check(&input).is_ok());
+    input.body[1] = Op::Print(call(
+        "inspect",
+        vec![FunctionArgument::Scalar(Expr::Const(1))],
+    ));
+    rejects(&input, "ordinary call argument has incompatible type");
+    input.body[1] = Op::Print(call(
+        "inspect",
+        vec![FunctionArgument::Bool(BoolExpr::Local("undefined".into()))],
+    ));
+    rejects(&input, "undefined");
+}
+
+/// A literal has no mutable source authority, even through a captured view.
+#[test]
+fn byte_literals_are_readonly_in_checked_ir() {
+    let literal = BytesSource::Literal(vec![0, 255].into());
+    let mut input = Program {
+        body: vec![
+            ordinary(
+                "write",
+                vec![FunctionParameter {
+                    name: "destination".into(),
+                    kind: FunctionParameterKind::WritableBytes,
+                }],
+                vec![Op::Return(Expr::Const(0))],
+            ),
+            Op::BindBytes {
+                name: "source".into(),
+                access: Access::Readonly,
+                source: literal.clone(),
+                ranges: vec![],
+            },
+        ],
+        ..Program::default()
+    };
+    assert!(check(&input).is_ok());
+    input.body.push(Op::WriteViewByte {
+        name: "source".into(),
+        index: Expr::Const(0),
+        value: Expr::Const(1),
+    });
+    rejects(&input, "readonly");
+    input.body.pop();
+    input.body.push(Op::Print(call(
+        "write",
+        vec![FunctionArgument::Bytes {
+            source: literal.clone(),
+            ranges: vec![],
+        }],
+    )));
+    rejects(&input, "byte literal is readonly");
+    input.body[2] = Op::BindBytes {
+        name: "writable".into(),
+        access: Access::Readwrite,
+        source: literal,
+        ranges: vec![],
+    };
+    rejects(&input, "byte literal is readonly");
 }
 
 /// Forward ordinary calls can resolve statically, while cycles have no checked frame.
@@ -735,6 +1271,7 @@ fn typed_result_ir_rejects_forged_cases_and_payloads() {
                 }],
             }),
             Op::Function(Function {
+                returns_bool: false,
                 name: "make".into(),
                 params: vec![],
                 result: Some("First".into()),
@@ -766,6 +1303,34 @@ fn typed_result_ir_rejects_forged_cases_and_payloads() {
         ..Program::default()
     };
     assert!(check(&input).is_ok());
+    let mut forwarded = input.clone();
+    forwarded.body.insert(
+        3,
+        Op::Function(Function {
+            returns_bool: false,
+            name: "forward".into(),
+            params: vec![],
+            result: Some("First".into()),
+            body: vec![
+                Op::BindResult {
+                    name: "outcome".into(),
+                    function: "make".into(),
+                    args: vec![],
+                },
+                Op::ReturnResult(ResultValue::Saved("outcome".into())),
+            ],
+        }),
+    );
+    assert!(check(&forwarded).is_ok());
+    let Op::Function(function) = &mut forwarded.body[3] else {
+        unreachable!("test forwarder is an ordinary function");
+    };
+    function.result = Some("Other".into());
+    rejects(
+        &forwarded,
+        "saved result outcome must have the exact return family Other",
+    );
+
     // The fallback must never let its nominal binding appear as a scalar tag.
     let mut rejected = input.clone();
     let Op::Print(Expr::Handle { arms, .. }) = &mut rejected.body[3] else {
@@ -783,6 +1348,54 @@ fn typed_result_ir_rejects_forged_cases_and_payloads() {
     };
     *binding = Some("forged".into());
     rejects(&rejected, "has no payload to bind");
+    // Saved dispatch uses the callee's family even when another family
+    // declares a case with the same spelling.
+    let mut saved = input.clone();
+    let Op::Print(Expr::Handle {
+        function,
+        args,
+        arms,
+    }) = saved.body.pop().unwrap()
+    else {
+        unreachable!("test input has a result handler");
+    };
+    saved.body.push(Op::BindResult {
+        name: "saved".into(),
+        function,
+        args,
+    });
+    saved.body.push(Op::HandleSavedResult {
+        name: "saved".into(),
+        arms: arms
+            .iter()
+            .map(|arm| ResultBlockArm {
+                pattern: arm.pattern.clone(),
+                body: vec![Op::Print(arm.value.clone())],
+            })
+            .collect(),
+    });
+    saved.body.push(Op::Print(Expr::HandleSavedResult {
+        name: "saved".into(),
+        arms,
+    }));
+    assert!(check(&saved).is_ok());
+
+    let mut rejected = saved.clone();
+    let Op::HandleSavedResult { arms, .. } = &mut rejected.body[4] else {
+        unreachable!("test input has a saved result block handler");
+    };
+    let ResultPattern::Error { family, .. } = &mut arms[1].pattern else {
+        unreachable!("test has a named error arm");
+    };
+    *family = "Other".into();
+    rejects(&rejected, "expected error family First, found Other");
+
+    let Op::Print(Expr::HandleSavedResult { arms, .. }) = &mut saved.body[5] else {
+        unreachable!("test input has a saved result expression handler");
+    };
+    arms[2].value = Expr::Local("reason".into());
+    rejects(&saved, "reason is an error of family First");
+
     // A same-spelling case from another family cannot supply a native tag.
     let Op::Function(function) = &mut input.body[2] else {
         unreachable!()
@@ -802,6 +1415,108 @@ fn typed_result_ir_rejects_forged_cases_and_payloads() {
         payload: None,
     });
     rejects(&input, "expected error family First, found Other");
+}
+
+/// Saved options must come from a checked option call. The option tag stays
+/// separate from scalars and only the matching arm can use the payload.
+#[test]
+fn saved_option_ir_rejects_forged_values_and_arms() {
+    // This intentionally fabricates raw IR using the compiler's private identity.
+    let option_family = "$option.u64";
+    let none = ResultPattern::Error {
+        family: option_family.into(),
+        case: "None".into(),
+        binding: None,
+    };
+    let mut program = Program {
+        body: vec![
+            Op::ErrorFamily(ErrorFamily {
+                name: option_family.into(),
+                children: vec![],
+                cases: vec![ErrorCase {
+                    name: "None".into(),
+                    payload: false,
+                }],
+            }),
+            Op::Function(Function {
+                returns_bool: false,
+                name: "optional".into(),
+                params: vec![],
+                result: Some(option_family.into()),
+                body: vec![Op::ReturnResult(ResultValue::Ok(Expr::Const(u64::MAX)))],
+            }),
+            ordinary("scalar", vec![], vec![Op::Return(Expr::Const(0))]),
+            Op::BindResult {
+                name: "saved".into(),
+                function: "optional".into(),
+                args: vec![],
+            },
+            Op::HandleSavedResult {
+                name: "saved".into(),
+                arms: vec![
+                    ResultBlockArm {
+                        pattern: ResultPattern::Ok(Some("payload".into())),
+                        body: vec![Op::Print(Expr::Local("payload".into()))],
+                    },
+                    ResultBlockArm {
+                        pattern: none.clone(),
+                        body: vec![],
+                    },
+                ],
+            },
+            Op::Print(Expr::HandleSavedResult {
+                name: "saved".into(),
+                arms: vec![
+                    ResultArm {
+                        pattern: ResultPattern::Ok(Some("payload".into())),
+                        value: Expr::Local("payload".into()),
+                    },
+                    ResultArm {
+                        pattern: none,
+                        value: Expr::Const(0),
+                    },
+                ],
+            }),
+        ],
+        ..Program::default()
+    };
+    assert!(check(&program).is_ok());
+
+    let mut invalid = program.clone();
+    let Op::ErrorFamily(family) = &mut invalid.body[0] else {
+        unreachable!()
+    };
+    family.cases[0].payload = true;
+    rejects(&invalid, "single tag-only None case");
+
+    let mut invalid = program.clone();
+    let Op::BindResult { function, .. } = &mut invalid.body[3] else {
+        unreachable!()
+    };
+    *function = "scalar".into();
+    rejects(&invalid, "must return a typed result");
+
+    let mut invalid = program.clone();
+    let Op::HandleSavedResult { arms, .. } = &mut invalid.body[4] else {
+        unreachable!()
+    };
+    arms[1].pattern = ResultPattern::Fallback(None);
+    rejects(&invalid, "requires Some and None arms");
+
+    let mut invalid = program.clone();
+    let Op::Print(Expr::HandleSavedResult { arms, .. }) = &mut invalid.body[5] else {
+        unreachable!()
+    };
+    arms[1].value = Expr::Local("payload".into());
+    rejects(&invalid, "unknown or out-of-scope binding payload");
+
+    let mut invalid = program.clone();
+    invalid.body.push(Op::Print(Expr::Local("saved".into())));
+    rejects(&invalid, "saved is not a scalar local");
+
+    let binding = program.body.remove(3);
+    program.body.insert(3, Op::Scope(vec![binding]));
+    rejects(&program, "unknown or out-of-scope binding saved");
 }
 
 /// Build unchecked fixed-record append IR with one payload case and one tag-only
@@ -1669,12 +2384,14 @@ fn try_ir_requires_its_ordinary_frame_and_a_success_return() {
                 }],
             }),
             Op::Function(Function {
+                returns_bool: false,
                 name: "decode".into(),
                 params: vec![],
                 result: Some("First".into()),
                 body: vec![Op::ReturnResult(ResultValue::Ok(Expr::Const(u64::MAX)))],
             }),
             Op::Function(Function {
+                returns_bool: false,
                 name: "relay".into(),
                 params: vec![],
                 result: Some("First".into()),
@@ -1691,6 +2408,32 @@ fn try_ir_requires_its_ordinary_frame_and_a_success_return() {
     let mut entry = program.clone();
     entry.body.push(declaration);
     rejects(&entry, "try requires a scalar typed-result function");
+
+    let mut saved = program.clone();
+    let Op::Function(relay) = &mut saved.body[3] else {
+        unreachable!("test relay is a function");
+    };
+    relay.body.splice(
+        ..1,
+        [
+            Op::BindResult {
+                name: "saved".into(),
+                function: "decode".into(),
+                args: vec![],
+            },
+            Op::TrySaved {
+                name: "value".into(),
+                source: "saved".into(),
+            },
+        ],
+    );
+    assert!(check(&saved).is_ok());
+    let Op::Function(relay) = &mut saved.body[3] else {
+        unreachable!("test relay is a function");
+    };
+    relay.result = Some("Other".into());
+    rejects(&saved, "try result from saved must have error family Other");
+
     // Same-spelling cases do not authorize forwarding another family's ordinal.
     let mut wrong_family = program.clone();
     let Op::Function(relay) = &mut wrong_family.body[3] else {

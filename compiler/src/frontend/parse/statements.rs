@@ -6,7 +6,7 @@
 //! authority for lifetime and memory safety. Parser recursion is bounded.
 
 use super::{NameKind, Parser};
-use crate::frontend::ast::{ConstructArm, Expr, ExprKind, Statement, StatementKind};
+use crate::frontend::ast::{Expr, ExprKind, ResultBlockArm, Statement, StatementKind};
 use crate::lex::{Token, TokenKind};
 use crate::source::{Diagnostic, Span};
 
@@ -98,11 +98,8 @@ impl Parser<'_> {
                 let value = self.expression(true)?;
                 let end = value.span.end;
                 (StatementKind::Assign { target, value }, end)
-            } else if is_construct(&target) {
-                self.construct(target)?
             } else {
-                let end = target.span.end;
-                (StatementKind::Expr(target), end)
+                self.block_handler(target)?
             };
             self.end_statement()?;
             Ok(Statement {
@@ -226,9 +223,9 @@ impl Parser<'_> {
         })
     }
 
-    /// Parse the mandatory outcome blocks following a construction statement.
+    /// Parse outcome blocks following a standalone expression.
     /// Nested blocks use the same depth and separator rules as other statements.
-    fn construct(&mut self, subject: Expr) -> Result<(StatementKind, usize), Diagnostic> {
+    fn block_handler(&mut self, subject: Expr) -> Result<(StatementKind, usize), Diagnostic> {
         let mut arms = Vec::new();
         let mut column = None;
         // Each written arm contributes one lexical block and its own source range.
@@ -237,16 +234,29 @@ impl Parser<'_> {
         {
             self.newlines();
             let (body, end) = self.block()?;
-            arms.push(ConstructArm {
+            arms.push(ResultBlockArm {
                 pattern,
                 body,
                 span: Span { start, end },
             });
         }
-        let end = arms.last().map(|arm| arm.span.end).ok_or_else(|| {
-            Diagnostic::new(subject.span, "core.construct requires `on` outcome blocks")
-        })?;
-        Ok((StatementKind::Construct { subject, arms }, end))
+        let constructor = is_construct(&subject);
+        if let Some(end) = arms.last().map(|arm| arm.span.end) {
+            let kind = if constructor {
+                StatementKind::Construct { subject, arms }
+            } else {
+                StatementKind::HandleResult { subject, arms }
+            };
+            Ok((kind, end))
+        } else if constructor {
+            Err(Diagnostic::new(
+                subject.span,
+                "core.construct requires `on` outcome blocks",
+            ))
+        } else {
+            let end = subject.span.end;
+            Ok((StatementKind::Expr(subject), end))
+        }
     }
 
     /// Parse one attempt followed by two mandatory, separately bound outcomes.
@@ -296,6 +306,15 @@ impl Parser<'_> {
         if !mutable {
             self.expect_word("let")?;
         }
+        // Keep `readwrite` available as a local name when followed by `=`.
+        let writable_view = self.at_word("readwrite")
+            && matches!(
+                self.tokens.get(self.position + 1).map(|token| &token.kind),
+                Some(TokenKind::Ident(_))
+            );
+        if writable_view {
+            self.expect_word("readwrite")?;
+        }
         let (name, _) = self.declared_identifier(NameKind::Binding)?;
         self.expect_symbol('=')?;
         self.newlines();
@@ -315,6 +334,7 @@ impl Parser<'_> {
             kind: StatementKind::Let {
                 name,
                 mutable,
+                writable_view,
                 value,
                 otherwise,
             },

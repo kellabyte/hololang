@@ -1,26 +1,27 @@
 //! Independent semantics for synchronous ordinary calls over caller storage.
 //!
-//! Model borrows retain batch/record/path identities and checked prefix lengths.
+//! Model borrows retain batch/record/path identities and checked byte windows.
 //! Each call receives a fresh lexical frame while updating the same owned model
 //! records as its caller. Host allocations here are never part of native timing.
 
 use std::collections::BTreeMap;
 
 use holo::ir::{
-    Access, BytesSource, FunctionArgument, FunctionParameterKind, Op, ResultArm, ResultPattern,
+    Access, FunctionArgument, FunctionParameterKind, Op, ResultArm, ResultBlockArm, ResultPattern,
 };
 
 use super::{
     ModelError,
-    state::{Binding, ByteInput, State},
-    value::Value,
+    state::{Binding, State},
 };
 
 /// Independent ordinary-call outcomes, distinguished without machine tags.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) enum Outcome {
     /// Result of a plain scalar helper.
     Scalar(u64),
+    /// Result of a plain boolean helper.
+    Boolean(bool),
     /// Success of a typed helper with the entire unsigned range available.
     Success(u64),
     /// Typed failure represented by its declared names, independently of LLVM tags.
@@ -44,7 +45,21 @@ impl State<'_> {
         match self.invoke(name, arguments)? {
             Outcome::Scalar(value) => Ok(value),
             _ => Err(ModelError::new(
-                "typed model call requires handling or forwarding",
+                "model scalar call requires a scalar result",
+            )),
+        }
+    }
+
+    /// Invoke a boolean helper, preserving the result's boolean kind.
+    pub(super) fn boolean_call(
+        &mut self,
+        name: &str,
+        arguments: &[FunctionArgument],
+    ) -> Result<bool, ModelError> {
+        match self.invoke(name, arguments)? {
+            Outcome::Boolean(value) => Ok(value),
+            _ => Err(ModelError::new(
+                "model boolean call requires a boolean result",
             )),
         }
     }
@@ -85,11 +100,14 @@ impl State<'_> {
         let mut bindings = BTreeMap::new();
         let mut bytes = vec![None; arguments.len()];
         // Retain caller authority until every typed capture, including each
-        // prefix check, completes in written argument order.
+        // range check, completes in written argument order.
         for (index, (argument, parameter)) in arguments.iter().zip(&function.params).enumerate() {
             let binding = match (argument, &parameter.kind) {
                 (FunctionArgument::Scalar(expression), FunctionParameterKind::U64) => {
                     Binding::Scalar(self.expression(expression, &[], None)?)
+                }
+                (FunctionArgument::Bool(expression), FunctionParameterKind::Bool) => {
+                    Binding::Boolean(self.boolean(expression)?)
                 }
                 (FunctionArgument::State(name), FunctionParameterKind::State(schema)) => {
                     let reference = self.reference(name)?;
@@ -102,33 +120,31 @@ impl State<'_> {
                     }
                     Binding::Reference(reference)
                 }
-                (FunctionArgument::Bytes { source, prefix }, FunctionParameterKind::Bytes) => {
-                    let mut input = match source {
-                        BytesSource::Param(index) => self.byte_input(&[], *index)?.clone(),
-                        BytesSource::Field { reference, path } => {
-                            let identity = self.reference(reference)?;
-                            let Value::Bytes(payload) = self.projection(reference, path)?.0 else {
-                                return Err(ModelError::new(
-                                    "ordinary byte argument projects a non-byte field",
-                                ));
-                            };
-                            ByteInput {
-                                batch: identity.batch,
-                                index: identity.index,
-                                path: path.clone(),
-                                len: payload.len() as u64,
-                            }
-                        }
-                    };
-                    // The captured logical length, which may already be a
-                    // prefix, is the limit for a nested narrower borrow.
-                    if let Some(prefix) = prefix {
-                        let length = self.expression(prefix, &[], None)?;
-                        if length > input.len {
-                            return Err(ModelError::new("byte prefix bounds trap"));
-                        }
-                        input.len = length;
+                (
+                    FunctionArgument::Batch(name),
+                    FunctionParameterKind::Batch { record, access },
+                ) => {
+                    let view = self.batch_view(name, *access)?;
+                    if self.batches[view.batch].schema != *record {
+                        return Err(ModelError::new(
+                            "ordinary batch model argument has wrong schema",
+                        ));
                     }
+                    Binding::BorrowedBatch(view)
+                }
+                (
+                    FunctionArgument::Bytes { source, ranges },
+                    FunctionParameterKind::Bytes | FunctionParameterKind::WritableBytes,
+                ) => {
+                    let mut input = self.capture_byte_source(source, &[])?;
+                    if parameter.kind == FunctionParameterKind::Bytes {
+                        input.access = Access::Readonly;
+                    } else if input.access != Access::Readwrite {
+                        return Err(ModelError::new(
+                            "ordinary byte argument has insufficient permission",
+                        ));
+                    }
+                    self.narrow_byte_input(&mut input, ranges, &[])?;
                     bytes[index] = Some(input);
                     continue;
                 }
@@ -157,9 +173,11 @@ impl State<'_> {
         let outcome = returned
             .ok_or_else(|| ModelError::new("ordinary model function completed without a return"))?;
         // The outcome must agree with the declared signature, including family identity.
-        match (&function.result, &outcome) {
-            (None, Outcome::Scalar(_)) | (Some(_), Outcome::Success(_)) => Ok(outcome),
-            (Some(expected), Outcome::Failure { family, case, payload }) if expected == family
+        match (function.returns_bool, &function.result, &outcome) {
+            (true, None, Outcome::Boolean(_))
+            | (false, None, Outcome::Scalar(_))
+            | (false, Some(_), Outcome::Success(_)) => Ok(outcome),
+            (false, Some(expected), Outcome::Failure { family, case, payload }) if expected == family
                 && program.body.iter().any(|operation| matches!(operation,
                     Op::ErrorFamily(declared) if declared.name == *family
                         && declared.cases.iter().any(|item| item.name == *case && item.payload == payload.is_some()))) => Ok(outcome),
@@ -175,38 +193,93 @@ impl State<'_> {
         arms: &[ResultArm],
     ) -> Result<u64, ModelError> {
         let outcome = self.invoke(name, arguments)?;
-        // Match the names of the active outcome; the model never uses native ordinals.
-        let (arm, binding) = arms
-            .iter()
-            .find_map(|arm| match (&outcome, &arm.pattern) {
-                (Outcome::Success(value), ResultPattern::Ok(name)) => Some((
-                    arm,
-                    name.as_ref().map(|name| (name, Binding::Scalar(*value))),
-                )),
-                (
-                    Outcome::Failure {
-                        family,
-                        case,
-                        payload,
-                    },
-                    ResultPattern::Error {
-                        family: wanted_family,
-                        case: wanted_case,
-                        binding,
-                    },
-                ) if family == wanted_family && case == wanted_case => Some((
-                    arm,
-                    binding
-                        .as_ref()
-                        .zip(*payload)
-                        .map(|(name, value)| (name, Binding::Scalar(value))),
-                )),
-                (Outcome::Failure { .. }, ResultPattern::Fallback(name)) => {
-                    Some((arm, name.as_ref().map(|name| (name, Binding::Error))))
-                }
-                _ => None,
-            })
-            .ok_or_else(|| ModelError::new("model handler has no arm for the active outcome"))?;
+        self.evaluate_result_arm(&outcome, arms)
+    }
+
+    /// Read an outcome saved in the current caller's lexical scope.
+    pub(super) fn saved_result(&self, name: &str) -> Result<Outcome, ModelError> {
+        let Binding::SavedResult(value) = self.binding(name)? else {
+            return Err(ModelError::new(format!("{name} is not a saved result")));
+        };
+        Ok(value)
+    }
+
+    /// Select an expression arm from an already evaluated semantic outcome.
+    pub(super) fn evaluate_result_arm(
+        &mut self,
+        outcome: &Outcome,
+        arms: &[ResultArm],
+    ) -> Result<u64, ModelError> {
+        let (arm, binding) =
+            select_result_arm(outcome, arms.iter().map(|arm| (&arm.pattern, arm)))?;
         self.evaluate_arm(&arm.value, binding)
     }
+
+    /// Execute one statement arm with the original result's active local.
+    pub(super) fn handle_result_blocks(
+        &mut self,
+        name: &str,
+        arguments: &[FunctionArgument],
+        arms: &[ResultBlockArm],
+    ) -> Result<(), ModelError> {
+        let outcome = self.invoke(name, arguments)?;
+        self.execute_result_arm(&outcome, arms)
+    }
+
+    /// Execute a selected block from a semantic outcome without invoking its source.
+    pub(super) fn execute_result_arm(
+        &mut self,
+        outcome: &Outcome,
+        arms: &[ResultBlockArm],
+    ) -> Result<(), ModelError> {
+        let (arm, binding) =
+            select_result_arm(outcome, arms.iter().map(|arm| (&arm.pattern, arm)))?;
+        let mut scope = BTreeMap::new();
+        if let Some((name, binding)) = binding {
+            scope.insert(name.clone(), binding);
+        }
+        self.scopes.push(scope);
+        let result = self.execute_ops(&arm.body);
+        self.scopes.pop();
+        result
+    }
 }
+
+/// Select by the names of the active outcome rather than native ordinals.
+fn select_result_arm<'a, A>(
+    outcome: &Outcome,
+    mut arms: impl Iterator<Item = (&'a ResultPattern, &'a A)>,
+) -> Result<(&'a A, ArmBinding<'a>), ModelError> {
+    arms.find_map(|(pattern, arm)| match (outcome, pattern) {
+        (Outcome::Success(value), ResultPattern::Ok(name)) => Some((
+            arm,
+            name.as_ref().map(|name| (name, Binding::Scalar(*value))),
+        )),
+        (
+            Outcome::Failure {
+                family,
+                case,
+                payload,
+            },
+            ResultPattern::Error {
+                family: wanted_family,
+                case: wanted_case,
+                binding,
+            },
+        ) if family == wanted_family && case == wanted_case => Some((
+            arm,
+            binding
+                .as_ref()
+                .zip(*payload)
+                .map(|(name, value)| (name, Binding::Scalar(value))),
+        )),
+        (Outcome::Failure { .. }, ResultPattern::Fallback(name)) => {
+            Some((arm, name.as_ref().map(|name| (name, Binding::Error))))
+        }
+        _ => None,
+    })
+    .ok_or_else(|| ModelError::new("model handler has no arm for the active outcome"))
+}
+
+/// Optional arm-local name with the active scalar or opaque failure.
+type ArmBinding<'a> = Option<(&'a String, Binding)>;

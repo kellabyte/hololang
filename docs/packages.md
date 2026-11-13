@@ -355,9 +355,12 @@ the caller's schema selection. Resolve both uses to the same checked schema
 identity before ordinary lowering. This experiment uses record declarations in
 manifest-driven namespaces, own-namespace public constructor result types, and
 qualified schema selection at the caller. Constructors accept the existing
-copied `u64` and readonly `Bytes` inputs. Qualified literals, imported field
-types, public borrowed record signatures, and general aggregate values remain
-later steps. The existing direct leaf profile has a function interface.
+copied `u64` and readonly `Bytes` inputs. Ordinary helpers can borrow fixed
+scalar state by writable reference. Use `qualifier.Type` in an argument to
+name imported public state. A public helper's state parameter must expose a
+public record. Qualified literals, imported field types, and general aggregate
+values remain later steps. The existing direct leaf profile has a function
+interface.
 
 A provider can also export a forwarding constructor whose body is one
 `return make_header(...)`. The checker requires the same nominal record and
@@ -511,8 +514,8 @@ aggregate values remain outside this experiment.
   the result family. Child leaves use `on Alias.Case`, and nested children
   extend the path. Explicit package qualifications use the qualifier bound
   by `using`, as in `on parser.ParseError.Input.BadHeader`.
-  The result signature uses the existing
-  copied `u64` and readonly `Bytes` argument modes.
+  Ordinary result functions can take copied `u64` and `bool` arguments
+  and use the existing borrowed argument modes.
 - The function header declares the exact result type. A returning branch uses
   `return ok value` for a `u64`, `return error Family.Case` for a declared
   case, or `return call(...)` to forward an identical checked result. Forwarding
@@ -527,6 +530,10 @@ aggregate values remain outside this experiment.
   failure explicitly. `on ok(value)` binds the immutable copied scalar in
   its arm. `on ok` and `on ok(_)` handle success without binding it. Each
   arm's value must agree with the type of the handling expression.
+- An ordinary result call can also be handled as a statement with an
+  `on … then { ... }` block for every arm. The selected block may act on
+  caller state and return from its enclosing function. Its payload binding
+  stays within the arm. The same coverage and package visibility rules apply.
 - The experiment permits direct `on` handling, exact-result forwarding, and
   `let value = try call(...)` for the same error family or a declared direct
   child. Defer
@@ -591,10 +598,8 @@ ordinals are private to a compiled build.
 | Native return path | Compare package and flat typed source at O0 and O3, including an outlined call and an inlined control. Compare against a matched numeric tag-and-scalar implementation with an independent oracle. Report register moves, stack traffic, branches, backing and helper calls, and copied bytes separately. Include ASan cases where relevant. |
 | Existing destination path | Replay the fixed-record append and rollback controls for unchanged record layout, publication, capacity, traps, and retained references. Include existing scalar and worker controls to detect changes outside the result path. |
 
-The [scalar result tests](../tests/compiler/frontend/frontend_evaluation.rs) exercise these forms
-through the checked frontend and native backend. The earlier
-[design evidence](../evidence/typed-error-design-20261111/README.md) preserves
-the numeric Holo control and standalone LLVM feasibility witness.
+These forms are exercised through the checked frontend and native backend.
+[Scalar result tests](../tests/compiler/frontend/frontend_evaluation.rs)
 
 ### Acceptance for the experiments
 
@@ -611,13 +616,11 @@ the numeric Holo control and standalone LLVM feasibility witness.
 | Public package constructor declares `Result<Record, E>` | Resolve both local nominal types. Reject private leaks in unused exports and equal-shape mismatches. Compare package and same-file LLVM and observe typed rejection, partial capacity failure, retry, and stable published references in all layouts. |
 | Byte-bearing public record exposes an inline child in a later contributor | Resolve both declarations. Reject private child exposure and unresolved foreign field names. Replay nested typed rejection and byte capacity failure after private writes, then verify owned bytes and exact-slot retry at O0, O3, and under ASan. |
 
-The [design controls](../evidence/public-type-design-20261111/README.md)
-cover app-local records that call a scalar helper in another namespace. The
-[prototype record](../evidence/public-records-20261111/README.md) covers the
-fixed-record cases, including equal-shape mismatches, library visibility,
-rollback, and emitted-code parity. Package tests additionally check fixed-record
-typed append with the same storage and failure boundaries. The diamond-dependency
-type check needs foreign public types in signatures.
+Earlier design controls used app-local records that called a scalar helper in
+another namespace. The package tests cover fixed-record type mismatches,
+library visibility, rollback, and emitted-code parity. They also check typed
+append with the same storage and failure boundaries. The diamond-dependency type
+check needs foreign public types in signatures. [Package conformance tests](../tests/compiler/packages/packages.rs)
 
 The [Goose performance checklist](spec.md#goose-performance-compatibility-checklist)
 sets the cost boundaries for these experiments.
@@ -639,7 +642,8 @@ interpret the experimental hosted socket statuses as typed results. This
 uses the existing public error and scalar result representation.
 
 ```holo
-let raw = core.send(reply.bytes, sent, remaining)
+let ready = core.prefix(reply.bytes, reply_length)
+let raw = core.send(ready, sent, remaining)
 let progress = net.send_result(raw)
     on ok(count) then count
     on net.SocketError.Interrupted then 0
@@ -654,7 +658,10 @@ from an interrupted retry can assign separate handler results. Send progress
 is the accepted count, which can be shorter than the request. Receive
 status zero means EOF for a positive-size request. Readiness status zero
 permits another attempt. A native errno preserves its positive numeric value
-on its own platform. The pure adapters acquire no descriptor, storage, or
+on its own platform. `net.next_session_result` decodes a host-owned session
+transition. Success admits a client, `End` marks the end of a file or
+inherited stream, and `Interrupted` permits another accept attempt. The
+pure adapters acquire no descriptor, storage, or
 event queue. The existing [hosted runtime](../runtime/refill/README.md) owns
 descriptors and checks each actual byte range.
 
@@ -862,14 +869,12 @@ The ordinary interface uses the smaller event record on the measured
 ABI and is the lead candidate for the checked host integration.
 Backend setup failures stay visible. Owned-stream, close, and stale-event
 checks now cover successive checked owners on a persistent Darwin queue.
-The checked benchmark's warm tail result reversed on repeat, so poll
+The earlier checked benchmark's warm tail result reversed on repeat, so poll
 remains the default while kqueue stays available for explicit use.
 Throughput through the bounded concurrent host was within 1% of
 parity with eight active clients and with 24 additional idle clients.
-[Initial qualification](../evidence/socket-library-20261112/README.md) ·
-[TCP and batch qualification](../evidence/socket-tcp-qualification-20261112/README.md) ·
-[Checked successive-client measurements](../evidence/socket-many-20261112/README.md) ·
-[Checked concurrent measurements](../evidence/socket-concurrent-20261112/README.md)
+The maintained tests check TCP owner lifetimes and routing across successive
+and concurrent clients. [Hosted TCP tests](../tests/runtime/hosted_tcp.rs)
 
 ## Dependency, effect and performance boundaries
 
@@ -947,11 +952,22 @@ cases to compare. [Go monotonic clocks](https://pkg.go.dev/time#hdr-Monotonic_Cl
 
 ## Implementation boundary and remaining decisions
 
-The experimental `holo.bytes` module lives at `lib/holo/bytes.holo`.
-The telemetry worker uses `bytes.join_low_octets_le` to decode frame lengths.
-The gzip header inspector uses the same function twice to assemble an unsigned
-32-bit timestamp from two halfwords. Each parser owns its format validation.
-[Module source](../lib/holo/bytes.holo) ·
+The experimental `holo.bytes` module searches, compares, and moves borrowed
+byte views. `bytes.find` returns the first matching offset as `Option<u64>`.
+The packaged `holo.bytes.read` namespace reads unsigned integers from those
+views and returns `Short(required)` if the field is incomplete. Its cursor
+helpers advance the caller's position only after a complete field. The
+telemetry worker uses `read.take_u16_le` for length fields and saves the low
+octet when `Short` reports a field split by a refill. The gzip inspector
+assembles the four timestamp bytes across reads and calls `read.u32_le`.
+Each parser owns its format validation.
+The `holo.bytes.write` namespace provides a cursor that appends complete
+octets, byte views, and unsigned ASCII decimal fields. A short destination
+preserves its bytes and cursor position.
+[Byte operations](../lib/holo/bytes.holo) ·
+[Integer readers](../lib/holo/bytes/read/integer.holo) ·
+[Binary cursor](../lib/holo/bytes/read/cursor.holo) ·
+[Byte writer](../lib/holo/bytes/write/cursor.holo) ·
 [Telemetry worker](../tests/fixtures/telemetry_worker/README.md) ·
 [Gzip header inspector](../tests/fixtures/gzip_header/README.md)
 
@@ -965,10 +981,13 @@ are trusted, stable build inputs. The compiler resolves calls before checked
 lowering, with no generated lookup, initialization, or allocation.
 
 Manifest-driven package mode uses the multi-file visibility and resolution
-rules above. It admits scalar results, copied scalars, readonly byte arguments,
-and the [fixed-record experiment](#fixed-record-experiment). Package declarations
-live in `holo.toml`. Package loading and namespace binding end before the existing
-checked pipeline and native backend.
+rules above. It admits scalar results, copied scalars, borrowed byte arguments,
+and the [fixed-record experiment](#fixed-record-experiment). `Batch<Record>`
+parameters resolve their element record by the same namespace and visibility
+rules as other signature types. A public function can expose a batch of a
+public record. [Batch borrowing](spec.md#synchronous-borrowed-batches)
+Package declarations live in `holo.toml`. Package loading and namespace binding
+end before the existing checked pipeline and native backend.
 
 The experimental `core.*` operations still belong to the
 [frontend](../compiler/src/frontend/README.md) and lower through checked IR.

@@ -144,8 +144,8 @@ destination bounds without introducing floating-point questions.
    set size. Include cache-resident and memory-bandwidth-limited inputs.
 4. Only after native results justify it, prototype one operation through Holo's
    existing checked/backend path. Host-language kernels remain controls, never
-   Holo-new results. Keep experiments under `build/benchmarks/` and seal useful
-   evidence under `evidence/`.
+   Holo-new results. Use `build/benchmarks/` for working output and record
+   the results and their limitations.
 
 ### Follow-on prototypes
 
